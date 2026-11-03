@@ -541,6 +541,104 @@ mod tests {
         assert_eq!(quoted("a\\b.pdf"), dir);
     }
 
+    fn cleaned_sample() -> Vec<CleanResult> {
+        use doc_sanitize::report::{Change, Recheck, Removed};
+        let copy = FileResult::checked(
+            "b.clean.xlsx".into(),
+            Format::Xlsx,
+            "xlsx",
+            &[CheckId::Comments, CheckId::HiddenSheets],
+            vec![],
+            &[],
+            vec![],
+        );
+        let removed = |check, count, unit| Removed {
+            check,
+            count,
+            unit,
+            detail: String::new(),
+        };
+        vec![
+            CleanResult {
+                path: "b.xlsm".into(),
+                format: Some(Format::Xlsx),
+                variant: Some("xlsm"),
+                output: Some("b.clean.xlsx".into()),
+                status: CleanStatus::Cleaned,
+                removed: vec![
+                    removed(CheckId::Metadata, 3, "fields"),
+                    removed(CheckId::Metadata, 1, "ids"),
+                    removed(CheckId::HiddenSheets, 1, "sheets"),
+                    removed(CheckId::Comments, 1, "people"),
+                ],
+                kept: vec![CheckId::Comments],
+                changes: vec![
+                    Change::counted(
+                        "formulas_to_values",
+                        40,
+                        "40 formulas were replaced by their saved results.",
+                    ),
+                    Change::new(
+                        "extension_changed",
+                        "Macros were removed, so the copy is .xlsx.",
+                    ),
+                ],
+                recheck: Some(Recheck::of(copy, &[CheckId::Comments])),
+                warnings: vec![],
+                error: None,
+            },
+            CleanResult::failed(
+                FileResult::failed("p.xlsx".into(), Error::not_found()),
+                Error::cannot_clean(&[(
+                    CheckId::PivotCaches,
+                    "its pivot table has slicers".into(),
+                    "Remove the slicers in Excel, or run clean again with --keep pivot-caches."
+                        .into(),
+                )]),
+            ),
+        ]
+    }
+
+    fn printed_clean(look: Look) -> (String, String) {
+        let files = cleaned_sample();
+        let (mut out, mut err) = (Out::new(vec![], look), Out::new(vec![], look));
+        for (i, f) in files.iter().enumerate() {
+            cleaned(&mut out, &mut err, f, i == 0).unwrap();
+        }
+        clean_summary(&mut out, &files).unwrap();
+        let text = |w: Vec<u8>| String::from_utf8(w).unwrap();
+        (text(out.w), text(err.w))
+    }
+
+    #[test]
+    fn clean_text_follows_the_design() {
+        let (out, err) = printed_clean(Look::default());
+        assert_eq!(
+            out,
+            "b.xlsm → b.clean.xlsx\n\
+             \x20 removed  metadata (3 fields, 1 id), hidden-sheets (1 sheet), comments (1 person)\n\
+             \x20 kept     comments\n\
+             \x20 changed  40 formulas were replaced by their saved results.\n\
+             \x20          Macros were removed, so the copy is .xlsx.\n\
+             \x20 ✓ re-checked: 2 checks, nothing left (1 kept)\n\
+             \n\
+             1 of 2 cleaned · 1 not cleaned\n"
+        );
+        assert_eq!(
+            err,
+            "\n✗ Can't remove pivot-caches from p.xlsx: its pivot table has slicers.\n  Remove the slicers in Excel, or run clean again with --keep pivot-caches.\n"
+        );
+        let (out, _) = printed_clean(COLOUR);
+        assert!(out.starts_with(
+            "\x1b[1mb.xlsm\x1b[0m → \x1b[1mb.clean.xlsx\x1b[0m\n  \x1b[2mremoved\x1b[0m  metadata"
+        ));
+        assert!(out.contains("  \x1b[32m✓\x1b[0m re-checked"));
+        let (out, err) = printed_clean(ASCII);
+        assert!(out.starts_with("b.xlsm -> b.clean.xlsx\n"));
+        assert!(out.contains("  ok re-checked") && out.ends_with("cleaned - 1 not cleaned\n"));
+        assert!(err.starts_with("\nx Can't remove"));
+    }
+
     #[test]
     fn the_spinner_shows_only_after_a_while_and_erases_itself() {
         let (stop, stopped) = mpsc::channel::<()>();

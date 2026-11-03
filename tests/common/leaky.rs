@@ -8,6 +8,117 @@ const SML: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml";
 const PML: &str = "application/vnd.openxmlformats-officedocument.presentationml";
 const MS: &str = "http://schemas.microsoft.com/office";
 
+/// A bar chart with one series (`series`: its values) and what follows the chart (`after`).
+fn bar_chart(series: &str, after: &str) -> String {
+    let axis = |kind: &str, id: u32, cross: u32, pos: &str| {
+        format!(
+            "<c:{kind}><c:axId val=\"{id}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"0\"/><c:axPos val=\"{pos}\"/><c:crossAx val=\"{cross}\"/></c:{kind}>"
+        )
+    };
+    format!(
+        "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:chart><c:plotArea><c:layout/><c:barChart><c:barDir val=\"col\"/><c:grouping val=\"clustered\"/><c:varyColors val=\"0\"/><c:ser><c:idx val=\"0\"/><c:order val=\"0\"/>{series}</c:ser><c:axId val=\"1\"/><c:axId val=\"2\"/></c:barChart>{}{}</c:plotArea></c:chart>{after}</c:chartSpace>",
+        axis("catAx", 1, 2, "b"),
+        axis("valAx", 2, 1, "l")
+    )
+}
+
+/// A deck's slide master, layout and theme, and the notes master when `notes`, linked as
+/// PowerPoint links them; `slides` and `notes_slides` get their layout and master.
+fn masters(mut p: Pkg, slides: &[&str], notes_slides: &[&str]) -> Pkg {
+    let tree = "<p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld>";
+    let map = "<p:clrMap bg1=\"lt1\" tx1=\"dk1\" bg2=\"lt2\" tx2=\"dk2\" accent1=\"accent1\" accent2=\"accent2\" accent3=\"accent3\" accent4=\"accent4\" accent5=\"accent5\" accent6=\"accent6\" hlink=\"hlink\" folHlink=\"folHlink\"/>";
+    let ns = format!(
+        "xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"{R}\""
+    );
+    let master = format!(
+        "<p:sldMaster {ns}>{tree}{map}<p:sldLayoutIdLst><p:sldLayoutId id=\"2147483649\" r:id=\"rId1\"/></p:sldLayoutIdLst></p:sldMaster>"
+    );
+    let layout = format!(
+        "<p:sldLayout {ns}>{tree}<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>"
+    );
+    let notes_master = format!("<p:notesMaster {ns}>{tree}{map}</p:notesMaster>");
+    let pr = "ppt/presentation.xml";
+    let m = "ppt/slideMasters/slideMaster1.xml";
+    let l = "ppt/slideLayouts/slideLayout1.xml";
+    p = p
+        .part(
+            pr,
+            "rId90",
+            "slideMaster",
+            m,
+            &pml("slideMaster"),
+            master.as_bytes(),
+        )
+        .part(
+            m,
+            "rId1",
+            "slideLayout",
+            l,
+            &pml("slideLayout"),
+            layout.as_bytes(),
+        )
+        .part(
+            m,
+            "rId2",
+            "theme",
+            "ppt/theme/theme1.xml",
+            THEME_TYPE,
+            theme_xml().as_bytes(),
+        )
+        .link(
+            l,
+            rel("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"),
+        )
+        .link(pr, rel("rId92", "theme", "theme/theme1.xml"));
+    for s in slides {
+        p = p.link(
+            s,
+            rel("rId99", "slideLayout", "../slideLayouts/slideLayout1.xml"),
+        );
+    }
+    if !notes_slides.is_empty() {
+        let n = "ppt/notesMasters/notesMaster1.xml";
+        p = p
+            .part(
+                pr,
+                "rId91",
+                "notesMaster",
+                n,
+                &pml("notesMaster"),
+                notes_master.as_bytes(),
+            )
+            .part(
+                n,
+                "rId1",
+                "theme",
+                "ppt/theme/theme2.xml",
+                THEME_TYPE,
+                theme_xml().as_bytes(),
+            );
+        for s in notes_slides {
+            p = p.link(
+                s,
+                rel("rId98", "notesMaster", "../notesMasters/notesMaster1.xml"),
+            );
+        }
+    }
+    p
+}
+
+/// The master lists a presentation needs, put first in its XML.
+fn with_masters(presentation: &str, notes: bool) -> String {
+    let at = presentation.find('>').unwrap() + 1;
+    let notes = match notes {
+        true => "<p:notesMasterIdLst><p:notesMasterId r:id=\"rId91\"/></p:notesMasterIdLst>",
+        false => "",
+    };
+    format!(
+        "{}<p:sldMasterIdLst><p:sldMasterId id=\"2147483648\" r:id=\"rId90\"/></p:sldMasterIdLst>{notes}{}",
+        &presentation[..at],
+        &presentation[at..]
+    )
+}
+
 /// A `w × h` RGB PNG of one colour.
 pub fn png(w: u32, h: u32) -> Vec<u8> {
     use std::io::Write;
@@ -381,7 +492,10 @@ pub fn leaky_xlsx(variant: &str) -> Vec<u8> {
     let connections = format!(
         "<connections xmlns=\"{S}\"><connection id=\"1\" name=\"Clients\" type=\"1\" refreshedVersion=\"8\"><dbPr connection=\"DSN=SECRET-xlsx-dsn-1\" command=\"SELECT 1\"/></connection></connections>"
     );
-    let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><c:chart><c:plotArea><c:barChart><c:ser><c:idx val=\"0\"/><c:order val=\"0\"/><c:val><c:numRef><c:f>Data!$A$1:$A$3</c:f><c:numCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>";
+    let chart = bar_chart(
+        "<c:val><c:numRef><c:f>Data!$A$1:$A$3</c:f><c:numCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>1</c:v></c:pt><c:pt idx=\"1\"><c:v>2</c:v></c:pt><c:pt idx=\"2\"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val>",
+        "",
+    );
     let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><xdr:twoCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>15</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart 1\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>";
     let macro_sheet = format!(
         "<xm:macrosheet xmlns=\"{S}\" xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"str\"><f>EXEC(\"calc\")</f><v>0</v></c></row></sheetData></xm:macrosheet>"
@@ -662,14 +776,18 @@ pub fn leaky_pptx(variant: &str) -> Vec<u8> {
     );
     let modern = "<p188:cmLst xmlns:p188=\"http://schemas.microsoft.com/office/powerpoint/2018/8/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p188:cm id=\"{33333333-3333-3333-3333-333333333333}\" authorId=\"{44444444-4444-4444-4444-444444444444}\" created=\"2026-01-01T00:00:00.000\"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>SECRET-pptx-comment-2</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>";
     let modern_authors = "<p188:authorLst xmlns:p188=\"http://schemas.microsoft.com/office/powerpoint/2018/8/main\"><p188:author id=\"{44444444-4444-4444-4444-444444444444}\" name=\"Sam Sample\" initials=\"SS\" userId=\"sam\" providerId=\"None\"/></p188:authorLst>";
-    let chart_part = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:chart><c:plotArea/></c:chart><c:externalData r:id=\"rId1\"><c:autoUpdate val=\"0\"/></c:externalData></c:chartSpace>";
+    let chart_part = bar_chart(
+        "<c:val><c:numLit><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>5</c:v></c:pt></c:numLit></c:val>",
+        "<c:externalData r:id=\"rId1\"><c:autoUpdate val=\"0\"/></c:externalData>",
+    );
     let sections = "<p:extLst><p:ext uri=\"{521415D9-36F7-43E2-AB2F-B90AF26B5E84}\"><p14:sectionLst xmlns:p14=\"http://schemas.microsoft.com/office/powerpoint/2010/main\"><p14:section name=\"Main\" id=\"{55555555-5555-5555-5555-555555555555}\"><p14:sldIdLst><p14:sldId id=\"256\"/><p14:sldId id=\"257\"/><p14:sldId id=\"258\"/></p14:sldIdLst></p14:section></p14:sectionLst></p:ext></p:extLst>";
     let pres = format!(
         "<p:presentation xmlns:p=\"{P}\" xmlns:r=\"{R}\"><p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/><p:sldId id=\"257\" r:id=\"rId2\"/><p:sldId id=\"258\" r:id=\"rId3\"/></p:sldIdLst><p:sldSz cx=\"9144000\" cy=\"6858000\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/><p:custShowLst><p:custShow name=\"Short\" id=\"0\"><p:sldLst><p:sld r:id=\"rId2\"/></p:sldLst></p:custShow></p:custShowLst>{sections}</p:presentation>"
     );
     let pr = "ppt/presentation.xml";
     let s1 = "ppt/slides/slide1.xml";
-    let mut p = props(Pkg::new(variant), "Avery Example", "Example Corp").body(&pres);
+    let mut p =
+        props(Pkg::new(variant), "Avery Example", "Example Corp").body(&with_masters(&pres, true));
     p = p
         .part(pr, "rId1", "slide", s1, SLIDE_TYPE, slide1.as_bytes())
         .part(pr, "rId2", "slide", "ppt/slides/slide2.xml", SLIDE_TYPE, slide2.as_bytes())
@@ -686,7 +804,13 @@ pub fn leaky_pptx(variant: &str) -> Vec<u8> {
         .part(s1, "rId8", "chart", "ppt/charts/chart1.xml", &format!("{OX}.drawingml.chart+xml"), chart_part.as_bytes())
         .part("ppt/charts/chart1.xml", "rId1", "package", "ppt/embeddings/Microsoft_Excel_Worksheet1.xlsx", &format!("{SML}.sheet"), b"PK\x03\x04SECRET-pptx-chart-1")
         .part(s1, "rId9", "tags", "ppt/tags/tag1.xml", &pml("tags"), format!("<p:tagLst xmlns:p=\"{P}\"><p:tag name=\"MATTER\" val=\"SECRET-pptx-tag-1\"/></p:tagLst>").as_bytes())
-        .part("ppt/slides/slide3.xml", "rId1", &format!("{MS}/2018/10/relationships/comments"), "ppt/comments/modernComment_1.xml", "application/vnd.ms-powerpoint.comments+xml", modern.as_bytes());
+        .part("ppt/slides/slide3.xml", "rId1", &format!("{MS}/2018/10/relationships/comments"), "ppt/comments/modernComment_1.xml", "application/vnd.ms-powerpoint.comments+xml", modern.as_bytes())
+        .link("ppt/notesSlides/notesSlide1.xml", rel("rId1", "slide", "../slides/slide1.xml"));
+    p = masters(
+        p,
+        &[s1, "ppt/slides/slide2.xml", "ppt/slides/slide3.xml"],
+        &["ppt/notesSlides/notesSlide1.xml"],
+    );
     if variant.ends_with('m') {
         p = p.part(
             pr,
@@ -715,10 +839,17 @@ pub fn twin_pptx() -> Vec<u8> {
     ]
     .concat();
     let notes = format!(
-        "<p:notes xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"n\"/><p:cNvSpPr/><p:nvPr><p:ph type=\"sldNum\"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:fld id=\"{{1}}\" type=\"slidenum\"><a:t>1</a:t></a:fld></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"
+        "<p:notes xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"n\"/><p:cNvSpPr/><p:nvPr><p:ph type=\"sldNum\"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:fld id=\"{{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}}\" type=\"slidenum\"><a:t>1</a:t></a:fld></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"
     );
     let s1 = "ppt/slides/slide1.xml";
-    presentation(&[&slide_xml(&shapes), &slide_xml("")])
+    let pres = format!(
+        "<p:presentation xmlns:p=\"{P}\" xmlns:r=\"{R}\"><p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/><p:sldId id=\"257\" r:id=\"rId2\"/></p:sldIdLst><p:sldSz cx=\"12192000\" cy=\"6858000\"/><p:notesSz cx=\"6858000\" cy=\"9144000\"/></p:presentation>"
+    );
+    let notes_slide = "ppt/notesSlides/notesSlide1.xml";
+    let deck = presentation(&[&slide_xml(&shapes), &slide_xml("")])
+        .body(&with_masters(&pres, true))
+        .link(notes_slide, rel("rId1", "slide", "../slides/slide1.xml"));
+    masters(deck, &[s1, "ppt/slides/slide2.xml"], &[notes_slide])
         .part(
             s1,
             "rId2",
