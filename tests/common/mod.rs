@@ -478,9 +478,10 @@ pub fn found(kind: &str, part: &str, count: u64, detail: &str) -> (String, Strin
 }
 
 /// The checks a PDF lists, in order.
-pub const PDF_CHECKS: [&str; 10] = [
+pub const PDF_CHECKS: [&str; 11] = [
     "metadata",
     "comments",
+    "hidden-layers",
     "embedded-files",
     "macros",
     "external-links",

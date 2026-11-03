@@ -1,6 +1,7 @@
 //! PDF files: opening them with lopdf under limits on objects, pages and decoded streams.
 
 mod bytes;
+mod layers;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -188,9 +189,10 @@ pub fn name(dict: &Dictionary, key: &[u8]) -> Option<String> {
 }
 
 /// The checks every PDF gets, in report order.
-pub const CHECKS: [CheckId; 10] = [
+pub const CHECKS: [CheckId; 11] = [
     CheckId::Metadata,
     CheckId::Comments,
+    CheckId::HiddenLayers,
     CheckId::EmbeddedFiles,
     CheckId::Macros,
     CheckId::ExternalLinks,
@@ -214,6 +216,7 @@ pub fn check(pdf: &Pdf, bytes: &[u8], values: bool) -> Found {
     let mut found = Found::default();
     found.findings.extend(metadata(&c));
     found.findings.extend(comments(&c));
+    found.findings.extend(layers::check(&c));
     found.findings.extend(embedded_files(&c));
     found.findings.extend(actions(&c));
     found.findings.extend(fields(&c));
@@ -1018,4 +1021,14 @@ fn xobjects<'a>(c: &Ctx<'a>, r: &'a Dictionary) -> Vec<(*const Dictionary, Vec<u
         .dict(r, b"XObject")
         .map(|x| x.iter().map(|(k, _)| (key, k.clone())));
     names.into_iter().flatten().collect()
+}
+
+/// `page 3`, `pages 1 and 4`, `pages 1, 4 and 9`.
+fn pages_text(numbers: &[usize]) -> String {
+    let shown: Vec<_> = numbers.iter().map(ToString::to_string).collect();
+    let shown: Vec<_> = shown.iter().map(String::as_str).collect();
+    match shown.as_slice() {
+        [one] => format!("page {one}"),
+        _ => format!("pages {}", pictures::joined(&shown)),
+    }
 }

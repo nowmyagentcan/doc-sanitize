@@ -524,3 +524,58 @@ fn leftovers_are_found_in_the_bytes_and_the_objects() {
         ]
     );
 }
+
+/// Three pages with content in layer A (switched off unless `on`) through marked content, a
+/// form and a membership dictionary, and layer B (on) everywhere.
+fn layered(on: bool) -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let a = b.add(dictionary! { "Type" => "OCG", "Name" => lopdf::Object::string_literal("SECRET-pdf-layer-1") });
+    let lb = b.add(
+        dictionary! { "Type" => "OCG", "Name" => lopdf::Object::string_literal("Visible layer") },
+    );
+    let both = b
+        .add(dictionary! { "Type" => "OCMD", "OCGs" => vec![a.into(), lb.into()], "P" => "AllOn" });
+    let form = b.stream(
+        dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()], "OC" => a },
+        b"0 0 10 10 re f",
+    );
+    let props = dictionary! { "Properties" => dictionary! { "a" => a, "b" => lb, "ab" => both } };
+    let marked = |tag: &str, text: &str| format!("/OC /{tag} BDC\n{}EMC\n", text_at(72, 700, text));
+    let mut with = props.clone();
+    with.set("XObject", dictionary! { "Fm1" => form });
+    b.page_with(
+        &(marked("a", "Draft wording") + &marked("b", "Shown")),
+        dictionary! { "Resources" => props.clone() },
+    );
+    b.page_with("/Fm1 Do\n", dictionary! { "Resources" => with });
+    b.page_with(
+        &marked("ab", "Both layers"),
+        dictionary! { "Resources" => props },
+    );
+    let off: Vec<lopdf::Object> = if on { vec![] } else { vec![a.into()] };
+    b.catalog = dictionary! {
+        "OCProperties" => dictionary! {
+            "OCGs" => vec![a.into(), lb.into()],
+            "D" => dictionary! { "ON" => vec![lb.into()], "OFF" => off },
+        },
+    };
+    b.bytes()
+}
+
+#[test]
+fn content_in_layers_that_are_off_is_found_with_its_pages() {
+    let f = check_pdf("layers.pdf", &layered(false), &[]);
+    assert_eq!(
+        pdf_kinds(&f, "hidden-layers"),
+        [k(
+            "hidden_layer",
+            r#"{"page":1}"#,
+            1,
+            "1 layer that is switched off, with content on pages 1, 2 and 3"
+        )]
+    );
+    let f = check_pdf("layers.pdf", &layered(false), &["--show-values"]);
+    assert_eq!(f["findings"][0]["value"], "SECRET-pdf-layer-1");
+    let f = check_pdf("layers.pdf", &layered(true), &[]);
+    assert_eq!(pdf_kinds(&f, "hidden-layers"), []);
+}
