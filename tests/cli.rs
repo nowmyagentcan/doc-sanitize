@@ -196,7 +196,7 @@ fn a_device_or_locked_file_is_unreadable() {
         let dir = dir("locked");
         put(&dir, &[("locked.pdf", PDF)]);
         let path = dir.join("locked.pdf");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_err() {
             let out = run_in(&dir, &["locked.pdf"]);
             assert_eq!(out.status.code(), Some(1));
