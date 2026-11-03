@@ -140,7 +140,7 @@ pub enum Kind {
 }
 
 /// Identifies a file: `%PDF-` in the first 1,024 bytes, a CFB container (legacy or
-/// password-protected Office), or a ZIP end record.
+/// password-protected Office), or a ZIP (a local header first, or an end record anywhere).
 pub fn sniff(bytes: &[u8]) -> Result<Kind, Error> {
     let head = &bytes[..bytes.len().min(1024)];
     if head.windows(5).any(|w| w == b"%PDF-") {
@@ -153,7 +153,7 @@ pub fn sniff(bytes: &[u8]) -> Result<Kind, Error> {
             Error::legacy_office()
         });
     }
-    if bytes.windows(4).any(|w| w == b"PK\x05\x06") {
+    if bytes.starts_with(b"PK") || bytes.windows(4).any(|w| w == b"PK") {
         return Ok(Kind::Zip);
     }
     Err(Error::unsupported_format())

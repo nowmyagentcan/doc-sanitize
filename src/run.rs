@@ -10,6 +10,7 @@ use std::sync::Once;
 use std::thread;
 
 use crate::input::{self, Kind};
+use crate::office;
 use crate::report::{Error, FileResult, Format, Warning, safe};
 
 const WORKER: &str = "doc-sanitize-worker";
@@ -29,7 +30,10 @@ pub fn check(path: &Path) -> (FileResult, Option<String>) {
         let kind = input::sniff(&bytes)?;
         Ok(match kind {
             Kind::Pdf => checked_pdf(&name, path),
-            Kind::Zip => return Err(Error::unsupported_format()),
+            Kind::Zip => {
+                office::zipscan::scan(&bytes)?;
+                return Err(Error::unsupported_format());
+            }
         })
     });
     match result {

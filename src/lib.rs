@@ -2,5 +2,6 @@
 //! every face of `doc-sanitize`.
 
 pub mod input;
+pub mod office;
 pub mod report;
 pub mod run;
