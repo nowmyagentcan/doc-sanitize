@@ -6,8 +6,8 @@ mod common;
 use common::*;
 
 /// The checks each format lists, in order.
-const DOCX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
-const XLSX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
+const DOCX_CHECKS: &[&str] = &["metadata", "comments", "tracked-changes", "leftover-data"];
+const XLSX_CHECKS: &[&str] = &["metadata", "comments", "tracked-changes", "leftover-data"];
 const PPTX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
 
 const VARIANTS: [&str; 14] = [
@@ -971,4 +971,171 @@ fn a_hidden_sheet_is_named_only_with_values() {
         "Salaries"
     );
     assert!(stdout(&run_in(&dir, &["h.xlsx"])).contains("  ✗ comments  sheet 1: 1 note\n"));
+}
+
+fn doc_xml(body: &str) -> String {
+    format!(
+        "<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:o=\"urn:schemas-microsoft-com:office:office\"><w:body>{body}</w:body></w:document>"
+    )
+}
+
+const BY_SAM: &str = "w:author=\"Sam Sample\" w:date=\"2026-01-01T00:00:00Z\"";
+const BY_AVERY: &str = "w:author=\"Avery Example\"";
+
+#[test]
+fn tracked_changes_are_found_with_the_deleted_text() {
+    let body = format!(
+        "<w:p><w:pPr><w:rPr><w:del w:id=\"1\" {BY_SAM}/></w:rPr></w:pPr><w:ins w:id=\"2\" {BY_SAM}><w:r><w:t>SECRET-change-1</w:t></w:r></w:ins><w:del w:id=\"3\" {BY_SAM}><w:r><w:delText>SECRET-change-2</w:delText></w:r></w:del></w:p>\
+         <w:p><w:moveFrom w:id=\"4\" {BY_SAM}><w:r><w:t>SECRET-change-3</w:t></w:r></w:moveFrom><w:moveTo w:id=\"5\" {BY_SAM}><w:r><w:t>SECRET-change-3</w:t></w:r></w:moveTo>\
+         <w:r><w:rPr><w:b/><w:rPrChange w:id=\"6\" {BY_AVERY}><w:rPr/></w:rPrChange></w:rPr><w:t>bold</w:t></w:r></w:p>\
+         <w:tbl><w:tr><w:trPr><w:del w:id=\"7\" {BY_SAM}/></w:trPr><w:tc><w:tcPr><w:cellDel w:id=\"8\" {BY_SAM}/></w:tcPr><w:p><w:r><w:t>row</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+         <w:p><w:del w:id=\"9\" {BY_AVERY}><w:r><w:delText>second</w:delText></w:r></w:del></w:p>"
+    );
+    let doc = Pkg::new("docx").body(&doc_xml(&body)).zip();
+    assert_eq!(
+        kinds(&check_bytes("tc.docx", &doc), "tracked-changes"),
+        [
+            found(
+                "insertion",
+                "word/document.xml",
+                1,
+                "1 insertion by 1 author"
+            ),
+            found(
+                "deletion",
+                "word/document.xml",
+                3,
+                "3 deletions by 2 authors, with the deleted text"
+            ),
+            found("move", "word/document.xml", 2, "2 moves by 1 author"),
+            found(
+                "format_change",
+                "word/document.xml",
+                1,
+                "1 formatting change by 1 author"
+            ),
+            found(
+                "table_change",
+                "word/document.xml",
+                2,
+                "2 table changes by 1 author"
+            ),
+        ]
+    );
+    assert_eq!(
+        values("tc.docx", &doc),
+        [
+            "SECRET-change-1",
+            "SECRET-change-2",
+            "SECRET-change-3",
+            "",
+            ""
+        ]
+    );
+}
+
+#[test]
+fn changes_are_found_by_namespace_and_in_every_branch() {
+    // Fixture 23: the WordprocessingML namespace bound to another prefix.
+    let rebound = format!(
+        "<x:document xmlns:x=\"{W}\"><x:body><x:p><x:del x:id=\"1\" x:author=\"Sam Sample\"><x:r><x:delText>SECRET-rebind-1</x:delText></x:r></x:del></x:p></x:body></x:document>"
+    );
+    let f = check_bytes("prefix_rebind.docx", &Pkg::new("docx").body(&rebound).zip());
+    assert_eq!(
+        kinds(&f, "tracked-changes"),
+        [found(
+            "deletion",
+            "word/document.xml",
+            1,
+            "1 deletion by 1 author, with the deleted text"
+        )]
+    );
+    // A `w` prefix bound elsewhere is not WordprocessingML.
+    let foreign = "<w:document xmlns:w=\"urn:other\"><w:body><w:del><w:delText>x</w:delText></w:del></w:body></w:document>";
+    let f = check_bytes("foreign.docx", &Pkg::new("docx").body(foreign).zip());
+    assert_eq!(kinds(&f, "tracked-changes"), []);
+    // Fixture 24: the secret only in mc:Fallback.
+    let fallback = doc_xml(
+        "<w:p><mc:AlternateContent><mc:Choice Requires=\"w14\"><w:r><w:t>x</w:t></w:r></mc:Choice><mc:Fallback><w:del w:id=\"1\" w:author=\"Sam Sample\"><w:r><w:delText>SECRET-fallback-1</w:delText></w:r></w:del></mc:Fallback></mc:AlternateContent></w:p>",
+    );
+    let doc = Pkg::new("docx").body(&fallback).zip();
+    assert_eq!(
+        kinds(&check_bytes("mc_fallback.docx", &doc), "tracked-changes").len(),
+        1
+    );
+    assert_eq!(values("mc_fallback.docx", &doc), ["SECRET-fallback-1"]);
+}
+
+#[test]
+fn changes_in_headers_and_styles_are_found() {
+    let header = format!(
+        "<w:hdr xmlns:w=\"{W}\"><w:p><w:ins w:id=\"1\"><w:r><w:t>SECRET-header-1</w:t></w:r></w:ins></w:p></w:hdr>"
+    );
+    let styles = format!(
+        "<w:styles xmlns:w=\"{W}\"><w:style w:type=\"paragraph\" w:styleId=\"Normal\"><w:pPr><w:jc w:val=\"left\"/><w:pPrChange w:id=\"2\" w:author=\"Sam Sample\"><w:pPr/></w:pPrChange></w:pPr></w:style></w:styles>"
+    );
+    let doc = Pkg::new("docx")
+        .part(
+            "word/document.xml",
+            "rId1",
+            "header",
+            "word/header1.xml",
+            &format!("{OX}.wordprocessingml.header+xml"),
+            header.as_bytes(),
+        )
+        .part(
+            "word/document.xml",
+            "rId2",
+            "styles",
+            "word/styles.xml",
+            &format!("{OX}.wordprocessingml.styles+xml"),
+            styles.as_bytes(),
+        )
+        .zip();
+    assert_eq!(
+        kinds(&check_bytes("hs.docx", &doc), "tracked-changes"),
+        [
+            found("insertion", "word/header1.xml", 1, "1 insertion"),
+            found(
+                "format_change",
+                "word/styles.xml",
+                1,
+                "1 formatting change by 1 author"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn shared_workbook_logs_are_found() {
+    let ss = "application/vnd.openxmlformats-officedocument.spreadsheetml";
+    let book = workbook(&[("Sheet1", "visible", &sheet_xml(""))])
+        .part("xl/workbook.xml", "rId8", "revisionHeaders", "xl/revisions/revisionHeaders.xml", &format!("{ss}.revisionHeaders+xml"), format!("<headers xmlns=\"{S}\" xmlns:r=\"{R}\" guid=\"{{1}}\"><header guid=\"{{2}}\" dateTime=\"2026-01-01T00:00:00\" userName=\"Sam Sample\" r:id=\"rId1\"/></headers>").as_bytes())
+        .part("xl/revisions/revisionHeaders.xml", "rId1", "revisionLog", "xl/revisions/revisionLog1.xml", &format!("{ss}.revisionLog+xml"), format!("<revisions xmlns=\"{S}\"><rcc rId=\"1\" sId=\"1\"><nc r=\"A1\" t=\"inlineStr\"><is><t>SECRET-log-1</t></is></nc></rcc></revisions>").as_bytes())
+        .part("xl/workbook.xml", "rId9", "usernames", "xl/revisions/userNames.xml", &format!("{ss}.userNames+xml"), format!("<users xmlns=\"{S}\" count=\"1\"><userInfo guid=\"{{3}}\" name=\"SECRET-log-2\" id=\"1\" dateTime=\"2026-01-01T00:00:00\"/></users>").as_bytes())
+        .zip();
+    assert_eq!(
+        kinds(&check_bytes("shared.xlsx", &book), "tracked-changes"),
+        [
+            found(
+                "shared_workbook_log",
+                "xl/revisions/revisionHeaders.xml",
+                1,
+                "1 shared-workbook revision list"
+            ),
+            found(
+                "shared_workbook_log",
+                "xl/revisions/revisionLog1.xml",
+                1,
+                "1 shared-workbook revision log"
+            ),
+            found(
+                "shared_workbook_log",
+                "xl/revisions/userNames.xml",
+                1,
+                "1 shared-workbook user list"
+            ),
+        ]
+    );
+    assert_eq!(values("shared.xlsx", &book), ["", "", "SECRET-log-2"]);
 }

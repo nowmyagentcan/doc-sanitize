@@ -4,6 +4,8 @@
 //! is well-formed within the XML limits.
 
 pub mod common;
+pub mod excel;
+pub mod word;
 pub mod xml;
 pub mod zipscan;
 
@@ -40,7 +42,9 @@ pub mod ns {
 pub fn checks(format: Format) -> &'static [CheckId] {
     use CheckId::*;
     match format {
-        Format::Docx | Format::Xlsx | Format::Pptx => &[Metadata, Comments, LeftoverData],
+        Format::Docx => &[Metadata, Comments, TrackedChanges, LeftoverData],
+        Format::Xlsx => &[Metadata, Comments, TrackedChanges, LeftoverData],
+        Format::Pptx => &[Metadata, Comments, LeftoverData],
         Format::Pdf => &[],
     }
 }
@@ -50,6 +54,11 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
     let ctx = Ctx::new(pkg, values)?;
     let mut found = common::metadata(&ctx)?;
     found.extend(common::comments(&ctx)?);
+    match pkg.format {
+        Format::Docx => found.extend(word::tracked_changes(&ctx)?),
+        Format::Xlsx => found.extend(excel::shared_workbook_log(&ctx)?),
+        _ => {}
+    }
     found.extend(common::leftover_data(pkg, values)?);
     Ok(found)
 }
