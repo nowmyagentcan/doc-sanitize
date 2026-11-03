@@ -53,7 +53,11 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             HiddenText,
             FakeRedactions,
             HiddenObjects,
+            EmbeddedFiles,
+            CustomData,
+            Macros,
             LeftoverData,
+            Signatures,
         ],
         Format::Xlsx => &[
             Metadata,
@@ -64,7 +68,11 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             HiddenSheets,
             HiddenRowsColumns,
             HiddenObjects,
+            EmbeddedFiles,
+            CustomData,
+            Macros,
             LeftoverData,
+            Signatures,
         ],
         Format::Pptx => &[
             Metadata,
@@ -72,7 +80,11 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             HiddenSlides,
             SpeakerNotes,
             HiddenObjects,
+            EmbeddedFiles,
+            CustomData,
+            Macros,
             LeftoverData,
+            Signatures,
         ],
         Format::Pdf => &[],
     }
@@ -87,6 +99,7 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
         Format::Docx => {
             found.extend(word::tracked_changes(&ctx)?);
             found.extend(word::hidden_text(&ctx)?);
+            found.extend(word::story_items(&ctx)?);
         }
         Format::Xlsx => {
             found.extend(excel::shared_workbook_log(&ctx)?);
@@ -100,6 +113,7 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
         Format::Pdf => {}
     }
     found.extend(drawing::hidden_objects(&ctx)?);
+    found.extend(common::linked_parts(&ctx)?);
     found.extend(common::leftover_data(pkg, values)?);
     Ok(found)
 }

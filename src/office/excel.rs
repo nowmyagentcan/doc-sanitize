@@ -311,8 +311,21 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         // The open cell: where it is, its style, whether it holds a shared string, its text.
         let mut cell: Option<((u32, u32), usize, bool, String)> = None;
         let (mut row, mut col, mut row_hidden) = (0u32, 0u32, false);
+        // Scenarios, their saved values and the first one; custom sheet properties.
+        let (mut scenarios, mut saved, mut first_saved) = (0usize, 0usize, None);
+        let mut custom: Vec<String> = vec![];
         pkg.walk(part, |r, ev| {
             match ev {
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "scenario") => scenarios += 1,
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "inputCells") => {
+                    saved += 1;
+                    if first_saved.is_none() {
+                        first_saved = r.attr(e, "val")?.map(Cow::into_owned);
+                    }
+                }
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "customPr") => {
+                    custom.push(r.attr(e, "name")?.unwrap_or_default().into_owned());
+                }
                 Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "col") => {
                     let num = |a| -> Result<Option<f64>, Error> {
                         Ok(r.attr(e, a)?.and_then(|v| v.parse().ok()))
@@ -406,6 +419,45 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 );
                 add(CheckId::HiddenRowsColumns, kind, cells, n, unit, detail);
             }
+        }
+        let mut data = |kind, n: usize, unit, detail: String, value: Option<&str>| {
+            let f = Finding::new(
+                CheckId::CustomData,
+                kind,
+                ctx.place(part),
+                n as u64,
+                unit,
+                detail,
+            );
+            found.push(f.with_value(ctx.values, value));
+        };
+        if scenarios > 0 {
+            let detail = format!(
+                "{} with {}",
+                plural(scenarios as u64, "scenario"),
+                plural(saved as u64, "saved value")
+            );
+            data(
+                "scenarios",
+                saved.max(scenarios),
+                "values",
+                detail,
+                first_saved.as_deref(),
+            );
+        }
+        if !custom.is_empty() {
+            let detail = counted(
+                custom.len() as u64,
+                "custom sheet property",
+                "custom sheet properties",
+            );
+            data(
+                "sheet_properties",
+                custom.len(),
+                "fields",
+                detail,
+                custom.first().map(String::as_str),
+            );
         }
     }
     Ok(found)

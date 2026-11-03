@@ -13,7 +13,11 @@ const DOCX_CHECKS: &[&str] = &[
     "hidden-text",
     "fake-redactions",
     "hidden-objects",
+    "embedded-files",
+    "custom-data",
+    "macros",
     "leftover-data",
+    "signatures",
 ];
 const XLSX_CHECKS: &[&str] = &[
     "metadata",
@@ -24,7 +28,11 @@ const XLSX_CHECKS: &[&str] = &[
     "hidden-sheets",
     "hidden-rows-columns",
     "hidden-objects",
+    "embedded-files",
+    "custom-data",
+    "macros",
     "leftover-data",
+    "signatures",
 ];
 const PPTX_CHECKS: &[&str] = &[
     "metadata",
@@ -32,7 +40,11 @@ const PPTX_CHECKS: &[&str] = &[
     "hidden-slides",
     "speaker-notes",
     "hidden-objects",
+    "embedded-files",
+    "custom-data",
+    "macros",
     "leftover-data",
+    "signatures",
 ];
 
 const VARIANTS: [&str; 14] = [
@@ -1626,4 +1638,212 @@ fn hidden_shapes_are_found_in_documents_and_sheets() {
         "Data"
     );
     assert_eq!(values("shapes.xlsx", &book), ["SECRET-xdr-1"]);
+}
+
+#[test]
+fn embedded_files_custom_data_macros_and_signatures_are_found() {
+    let body = concat!(
+        "<w:altChunk r:id=\"rId20\"/>",
+        "<w:sdt><w:sdtPr><w:dataBinding w:xpath=\"/root/client\" w:storeItemID=\"{1}\"/></w:sdtPr><w:sdtContent><w:p><w:r><w:t>Bound</w:t></w:r></w:p></w:sdtContent></w:sdt>",
+        "<w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> DDEAUTO excel </w:instrText></w:r><w:r><w:instrText>\"D:\\\\Projects\\\\SECRET-dde-1.xlsx\" A1</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>42</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        "<w:fldSimple w:instr=\" PAGE \"><w:r><w:t>1</w:t></w:r></w:fldSimple><w:fldSimple w:instr=\"dde excel x\"/></w:p>",
+    );
+    let settings = format!(
+        "<w:settings xmlns:w=\"{W}\"><w:docVars><w:docVar w:name=\"Client\" w:val=\"SECRET-var-1\"/><w:docVar w:name=\"Matter\" w:val=\"42\"/></w:docVars></w:settings>"
+    );
+    let ms = "http://schemas.microsoft.com/office";
+    let doc = Pkg::new("docm")
+        .body(&doc_xml(body))
+        .part("word/document.xml", "rId1", "settings", "word/settings.xml", &format!("{OX}.wordprocessingml.settings+xml"), settings.as_bytes())
+        .part("word/document.xml", "rId2", "oleObject", "word/embeddings/oleObject1.bin", "", b"\xD0\xCF\x11\xE0SECRET-ole-1")
+        .part("word/document.xml", "rId3", "package", "word/embeddings/Book1.xlsx", &format!("{OX}.spreadsheetml.sheet"), b"PK\x03\x04SECRET-pkg-1")
+        .part("word/document.xml", "rId20", "aFChunk", "word/afchunk.htm", "text/html", b"<p>SECRET-chunk-1</p>")
+        .part("word/document.xml", "rId4", "customXml", "customXml/item1.xml", "", b"<root><client>SECRET-xml-1</client><matter> 7 </matter></root>")
+        .part("word/document.xml", "rId5", &format!("{ms}/2006/relationships/vbaProject"), "word/vbaProject.bin", "application/vnd.ms-office.vbaProject", b"\xCC\x61SECRET-vba-1")
+        .part("word/document.xml", "rId6", "control", "word/activeX/activeX1.xml", "application/vnd.ms-office.activeX+xml", b"<ax:ocx xmlns:ax=\"http://schemas.microsoft.com/office/2006/activeX\" ax:classid=\"{8BD21D40}\"/>")
+        .part("", "rId7", &format!("{ms}/2007/relationships/ui/extensibility"), "customUI/customUI14.xml", "", b"<customUI xmlns=\"http://schemas.microsoft.com/office/2009/07/customui\"/>")
+        .part("", "rId8", &format!("{PKG_RELS}/digital-signature/origin"), "_xmlsignatures/origin.sigs", "application/vnd.openxmlformats-package.digital-signature-origin", b"")
+        .part("_xmlsignatures/origin.sigs", "rId1", &format!("{PKG_RELS}/digital-signature/signature"), "_xmlsignatures/sig1.xml", "application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml", b"<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\"/>")
+        .zip();
+    let f = check_bytes("parts.docm", &doc);
+    assert_eq!(
+        kinds(&f, "embedded-files"),
+        [
+            found(
+                "imported_chunk",
+                "word/document.xml",
+                1,
+                "1 imported document"
+            ),
+            found(
+                "embedded_object",
+                "word/embeddings/oleObject1.bin",
+                1,
+                "1 embedded OLE object"
+            ),
+            found(
+                "embedded_object",
+                "word/embeddings/Book1.xlsx",
+                1,
+                "1 embedded file"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "custom-data"),
+        [
+            found(
+                "data_binding",
+                "word/document.xml",
+                1,
+                "1 data-bound content control"
+            ),
+            found(
+                "document_variables",
+                "word/settings.xml",
+                2,
+                "2 document variables"
+            ),
+            found("custom_xml", "customXml/item1.xml", 1, "1 custom XML part"),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "macros"),
+        [
+            found("dde_field", "word/document.xml", 2, "2 DDE fields"),
+            found(
+                "vba_project",
+                "word/vbaProject.bin",
+                1,
+                "1 VBA macro project"
+            ),
+            found(
+                "activex",
+                "word/activeX/activeX1.xml",
+                1,
+                "1 ActiveX control"
+            ),
+            found(
+                "ribbon_customization",
+                "customUI/customUI14.xml",
+                1,
+                "1 custom ribbon"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "signatures"),
+        [found(
+            "package_signature",
+            "_xmlsignatures/sig1.xml",
+            1,
+            "1 digital signature"
+        )]
+    );
+    let values = values("parts.docm", &doc);
+    let shown: Vec<_> = values
+        .iter()
+        .filter(|v| !v.is_empty())
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "Client=SECRET-var-1; Matter=42",
+            "SECRET-xml-1 7",
+            "DDEAUTO excel \"D:\\\\Projects\\\\SECRET-dde-1.xlsx\" A1",
+        ]
+    );
+}
+
+#[test]
+fn workbook_and_deck_data_parts_are_found() {
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\"><sheetData/><scenarios><scenario name=\"Best\" count=\"2\"><inputCells r=\"A1\" val=\"SECRET-scenario-1\"/><inputCells r=\"A2\" val=\"2\"/></scenario></scenarios><customProperties><customPr name=\"SECRET-custom-1\" r:id=\"rId1\"/></customProperties></worksheet>"
+    );
+    let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:externalData r:id=\"rId1\"/></c:chartSpace>";
+    let macro_sheet = format!(
+        "<xm:macrosheet xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\" xmlns=\"{S}\"><sheetData/></xm:macrosheet>"
+    );
+    let book = workbook(&[("Data", "visible", &sheet), ("Auto_Open", "hidden", &macro_sheet)])
+        .part("xl/worksheets/sheet1.xml", "rId5", "drawing", "xl/drawings/drawing1.xml", &format!("{OX}.drawing+xml"), b"<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>")
+        .part("xl/drawings/drawing1.xml", "rId1", "chart", "xl/charts/chart1.xml", &format!("{OX}.drawingml.chart+xml"), chart.as_bytes())
+        .part("xl/charts/chart1.xml", "rId1", "package", "xl/embeddings/Book2.xlsx", "", b"PK")
+        .entries();
+    let types = zip_types_with(
+        &book,
+        "xl/worksheets/sheet2.xml",
+        "application/vnd.ms-excel.macrosheet+xml",
+    );
+    let book = zip(&with(book, "[Content_Types].xml", &types));
+    let f = check_bytes("data.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "embedded-files"),
+        [found(
+            "chart_workbook",
+            "xl/embeddings/Book2.xlsx",
+            1,
+            "1 workbook embedded in a chart"
+        )]
+    );
+    assert_eq!(
+        kinds(&f, "custom-data"),
+        [
+            found(
+                "scenarios",
+                "xl/worksheets/sheet1.xml",
+                2,
+                "1 scenario with 2 saved values"
+            ),
+            found(
+                "sheet_properties",
+                "xl/worksheets/sheet1.xml",
+                1,
+                "1 custom sheet property"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "macros"),
+        [found(
+            "macro_sheet",
+            "xl/worksheets/sheet2.xml",
+            1,
+            "1 Excel 4.0 macro sheet"
+        )]
+    );
+    let deck = presentation(&[&slide_xml("")])
+        .part("ppt/slides/slide1.xml", "rId5", "tags", "ppt/tags/tag1.xml", &format!("{OX}.presentationml.tags+xml"), format!("<p:tagLst xmlns:p=\"{P}\"><p:tag name=\"CLIENT\" val=\"SECRET-tag-1\"/></p:tagLst>").as_bytes())
+        .part("", "rId7", "http://schemas.microsoft.com/office/2011/relationships/webextension", "ppt/webextensions/webextension1.xml", "application/vnd.ms-office.webextension+xml", b"<we:webextension xmlns:we=\"http://schemas.microsoft.com/office/webextensions/webextension/2010/11\" id=\"{1}\"><we:properties><we:property name=\"token\" value=\"SECRET-addin-1\"/></we:properties></we:webextension>")
+        .zip();
+    let f = check_bytes("data.pptx", &deck);
+    assert_eq!(
+        kinds(&f, "custom-data"),
+        [
+            found(
+                "add_in_data",
+                "ppt/webextensions/webextension1.xml",
+                1,
+                "1 add-in data part"
+            ),
+            found("tags", "ppt/tags/tag1.xml", 1, "1 tags part"),
+        ]
+    );
+    assert_eq!(
+        values("data.pptx", &deck),
+        ["token=SECRET-addin-1", "CLIENT=SECRET-tag-1"]
+    );
+}
+
+/// The `[Content_Types].xml` of `entries` with `part`'s Override changed to `ct`.
+fn zip_types_with(entries: &[Entry], part: &str, ct: &str) -> Vec<u8> {
+    let types = String::from_utf8(entries[0].data.clone()).unwrap();
+    let from = format!("<Override PartName=\"/{part}\" ContentType=\"{SHEET_TYPE}\"/>");
+    assert!(types.contains(&from));
+    types
+        .replace(
+            &from,
+            &format!("<Override PartName=\"/{part}\" ContentType=\"{ct}\"/>"),
+        )
+        .into_bytes()
 }

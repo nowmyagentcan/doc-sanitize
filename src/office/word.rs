@@ -472,3 +472,126 @@ fn page_colour(ctx: &Ctx) -> Result<Option<Rgb>, Error> {
     }
     Ok(page)
 }
+
+/// A Word part's field instructions (`w:fldSimple` and complex fields, nested ones apart),
+/// and its `w:altChunk` and `w:dataBinding` counts.
+#[derive(Default)]
+struct Story {
+    fields: Vec<String>,
+    chunks: usize,
+    bindings: usize,
+}
+
+fn story(ctx: &Ctx, part: &str) -> Result<Story, Error> {
+    let mut s = Story::default();
+    let mut open: Vec<String> = vec![];
+    ctx.pkg.walk(part, |r, ev| {
+        match ev {
+            Event::Start(e) | Event::Empty(e) if r.ns(e) == ns::W => {
+                match e.local_name().as_ref() {
+                    "altChunk" => s.chunks += 1,
+                    "dataBinding" => s.bindings += 1,
+                    "fldSimple" => s
+                        .fields
+                        .extend(r.attr_ns(e, ns::W, "instr")?.map(|i| i.into_owned())),
+                    "fldChar" => match r.attr_ns(e, ns::W, "fldCharType")?.as_deref() {
+                        Some("begin") => open.push(String::new()),
+                        Some("end") => s.fields.extend(open.pop()),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            ev if r.parent() == Some((ns::W, "instrText")) => {
+                if let (Some(f), Some(t)) = (open.last_mut(), xml::text(ev)) {
+                    *f += &t;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(s)
+}
+
+/// A field instruction's name: `INCLUDEPICTURE`, `DDEAUTO`, …
+fn field_name(instr: &str) -> String {
+    instr
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
+
+/// What Word parts hold besides text: imported chunks (`embedded-files`), data bindings and
+/// document variables (`custom-data`) and DDE fields (`macros`).
+pub fn story_items(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let mut found = vec![];
+    for part in stories(ctx) {
+        let s = story(ctx, part)?;
+        let dde: Vec<_> = s
+            .fields
+            .iter()
+            .filter(|f| matches!(field_name(f).as_str(), "DDE" | "DDEAUTO"))
+            .collect();
+        for (check, kind, n, unit, detail, value) in [
+            (
+                CheckId::EmbeddedFiles,
+                "imported_chunk",
+                s.chunks,
+                "files",
+                plural(s.chunks as u64, "imported document"),
+                None,
+            ),
+            (
+                CheckId::CustomData,
+                "data_binding",
+                s.bindings,
+                "fields",
+                plural(s.bindings as u64, "data-bound content control"),
+                None,
+            ),
+            (
+                CheckId::Macros,
+                "dde_field",
+                dde.len(),
+                "links",
+                plural(dde.len() as u64, "DDE field"),
+                dde.first().map(|f| f.trim()),
+            ),
+        ] {
+            if n > 0 {
+                let f = Finding::new(check, kind, ctx.place(part), n as u64, unit, detail);
+                found.push(f.with_value(ctx.values, value));
+            }
+        }
+    }
+    for part in common::targets(ctx.pkg, "settings") {
+        let mut vars = vec![];
+        ctx.pkg.walk(part, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev
+                && r.is(e, ns::W, "docVar")
+            {
+                let get = |a| {
+                    r.attr_ns(e, ns::W, a)
+                        .map(|v| v.unwrap_or_default().into_owned())
+                };
+                vars.push(format!("{}={}", get("name")?, get("val")?));
+            }
+            Ok(())
+        })?;
+        if !vars.is_empty() {
+            let detail = plural(vars.len() as u64, "document variable");
+            let f = Finding::new(
+                CheckId::CustomData,
+                "document_variables",
+                ctx.place(part),
+                vars.len() as u64,
+                "fields",
+                detail,
+            );
+            found.push(f.with_value(ctx.values, Some(&vars.join("; "))));
+        }
+    }
+    Ok(found)
+}

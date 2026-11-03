@@ -603,6 +603,185 @@ pub fn comments(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     Ok(found)
 }
 
+/// What a linked part's value is: nothing, all its text, or the first `name=value` of an
+/// element with those two attributes.
+#[derive(Clone, Copy)]
+enum Text {
+    None,
+    All,
+    Pair(&'static str, &'static str, &'static str),
+}
+
+/// Parts that are a finding because of what links to them: the check, the relationship
+/// type, the kind, the unit, the detail and the value.
+const LINKED_PARTS: [(CheckId, &str, &str, &str, &str, Text); 9] = [
+    (
+        CheckId::EmbeddedFiles,
+        "oleObject",
+        "embedded_object",
+        "objects",
+        "1 embedded OLE object",
+        Text::None,
+    ),
+    (
+        CheckId::EmbeddedFiles,
+        "package",
+        "embedded_object",
+        "objects",
+        "1 embedded file",
+        Text::None,
+    ),
+    (
+        CheckId::CustomData,
+        "customXml",
+        "custom_xml",
+        "parts",
+        "1 custom XML part",
+        Text::All,
+    ),
+    (
+        CheckId::CustomData,
+        "tags",
+        "tags",
+        "parts",
+        "1 tags part",
+        Text::Pair("tag", "name", "val"),
+    ),
+    (
+        CheckId::CustomData,
+        "webextension",
+        "add_in_data",
+        "parts",
+        "1 add-in data part",
+        Text::Pair("property", "name", "value"),
+    ),
+    (
+        CheckId::Macros,
+        "vbaProject",
+        "vba_project",
+        "parts",
+        "1 VBA macro project",
+        Text::None,
+    ),
+    (
+        CheckId::Macros,
+        "control",
+        "activex",
+        "objects",
+        "1 ActiveX control",
+        Text::None,
+    ),
+    (
+        CheckId::Macros,
+        "extensibility",
+        "ribbon_customization",
+        "parts",
+        "1 custom ribbon",
+        Text::None,
+    ),
+    (
+        CheckId::Signatures,
+        "signature",
+        "package_signature",
+        "signatures",
+        "1 digital signature",
+        Text::None,
+    ),
+];
+
+const CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+const MACRO_SHEETS: [&str; 2] = [
+    "application/vnd.ms-excel.macrosheet+xml",
+    "application/vnd.ms-excel.intlmacrosheet+xml",
+];
+
+/// `embedded-files`, `custom-data`, `macros` and `signatures` found as parts: embedded objects
+/// and chart workbooks, custom XML, tags, add-in data, VBA, ActiveX controls, custom ribbons,
+/// Excel 4.0 macro sheets and package signatures.
+pub fn linked_parts(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    let mut seen = HashSet::new();
+    for (check, short, kind, unit, detail, text) in LINKED_PARTS {
+        for link in pkg.links.iter().filter(|l| l.rel.short() == short) {
+            let Some(part) = link.part.as_deref().filter(|p| seen.insert(key(p))) else {
+                continue;
+            };
+            let chart = pkg.content_type(&link.source) == Some(CHART);
+            let (kind, unit, detail) = match short {
+                "package" if chart => ("chart_workbook", "files", "1 workbook embedded in a chart"),
+                _ => (kind, unit, detail),
+            };
+            let value = match text {
+                Text::None => None,
+                Text::All => Some(all_text(pkg, part)?),
+                Text::Pair(element, name, val) => first_pair(pkg, part, element, name, val)?,
+            };
+            let f = Finding::new(check, kind, ctx.place(part), 1, unit, detail.into());
+            found.push(f.with_value(ctx.values, value.as_deref()));
+        }
+    }
+    for (i, sheet) in ctx.sheets.iter().enumerate() {
+        let Some(part) = sheet.part.as_deref().filter(|p| {
+            pkg.content_type(p)
+                .is_some_and(|t| MACRO_SHEETS.contains(&t))
+        }) else {
+            continue;
+        };
+        let mut place = ctx.place(part);
+        place.sheet_index = Some(i + 1);
+        let f = Finding::new(
+            CheckId::Macros,
+            "macro_sheet",
+            place,
+            1,
+            "sheets",
+            "1 Excel 4.0 macro sheet".into(),
+        );
+        found.push(f.with_value(ctx.values, Some(&sheet.name)));
+    }
+    Ok(found)
+}
+
+/// Every text of an XML part, each element's text separated by a space.
+fn all_text(pkg: &Package, part: &str) -> Result<String, Error> {
+    let mut text = String::new();
+    if pkg.content_type(part).is_some_and(|t| t.ends_with("xml")) {
+        pkg.walk(part, |_, ev| {
+            if let Some(t) = xml::text(ev).filter(|t| !t.trim().is_empty()) {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text += t.trim();
+            }
+            Ok(())
+        })?;
+    }
+    Ok(text)
+}
+
+/// `name=value` of the first `element` with both attributes.
+fn first_pair(
+    pkg: &Package,
+    part: &str,
+    element: &str,
+    name: &str,
+    val: &str,
+) -> Result<Option<String>, Error> {
+    let mut pair = None;
+    pkg.walk(part, |r, ev| {
+        if let Event::Start(e) | Event::Empty(e) = ev
+            && pair.is_none()
+            && e.local_name().as_ref() == element
+            && let (Some(n), Some(v)) = (r.attr(e, name)?, r.attr(e, val)?)
+        {
+            pair = Some(format!("{n}={v}"));
+        }
+        Ok(())
+    })?;
+    Ok(pair)
+}
+
 /// The custom properties of a custom.xml part, as (name, value).
 fn custom_properties(pkg: &Package, part: &str) -> Result<Vec<(String, String)>, Error> {
     let mut out: Vec<(String, String)> = vec![];
