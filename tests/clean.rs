@@ -978,3 +978,89 @@ fn kept_comments_on_cleared_cells_go_with_them() {
         .collect();
     assert_eq!(left, ["SECRET-xlsx-note-1", "SECRET-xlsx-thread-1"]);
 }
+
+#[test]
+fn hidden_slides_notes_and_shapes_are_deleted() {
+    let dir = dir("clean-deck");
+    put(&dir, &[("a.pptx", &leaky_pptx("pptx"))]);
+    let out = run_in(
+        &dir,
+        &["clean", "a.pptx", "--keep", "image-metadata,cropped-images"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("  changed  Animations were removed from slide 1.\n           1 embedded object is now a picture.\n"),
+        "{text}"
+    );
+    let copy = dir.join("a.clean.pptx");
+    assert!(copy_secrets(&copy).is_empty(), "{:?}", copy_secrets(&copy));
+    let names: Vec<_> = unzip(&fs::read(&copy).unwrap())
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.contains("slide2") || n.contains("notesSlide")),
+        "{names:?}"
+    );
+    let pres = String::from_utf8(part_of(&copy, "ppt/presentation.xml")).unwrap();
+    assert!(pres.contains("<p:sldIdLst><p:sldId id=\"256\" r:id=\"rId1\"/><p:sldId id=\"258\" r:id=\"rId3\"/></p:sldIdLst>"), "{pres}");
+    assert!(
+        pres.contains("<p:sldLst/>")
+            && pres.contains(
+                "<p14:sldIdLst><p14:sldId id=\"256\"/><p14:sldId id=\"258\"/></p14:sldIdLst>"
+            ),
+        "{pres}"
+    );
+    let slide = String::from_utf8(part_of(&copy, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        slide.contains("<p:cNvPr id=\"30\" name=\"Link\"/>"),
+        "the link to the hidden slide goes: {slide}"
+    );
+    assert!(
+        !slide.contains("p:timing") && !slide.contains("id=\"21\"") && !slide.contains("id=\"22\""),
+        "{slide}"
+    );
+    assert!(
+        slide.contains("<p:cNvPr id=\"20\" name=\"Group\"/>"),
+        "the group stays"
+    );
+}
+
+#[test]
+fn hidden_shapes_go_from_documents_and_sheets() {
+    let body = "<w:p><w:r><w:drawing><wp:inline><wp:extent cx=\"10\" cy=\"10\"/><wp:docPr id=\"1\" name=\"Picture 1\" hidden=\"1\" descr=\"SECRET-hid-alt-1\"/><a:graphic><a:graphicData><pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\"x\"/><pic:cNvPicPr/></pic:nvPicPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r><w:r><w:pict><v:shape id=\"t1\" style=\"position:absolute;visibility: hidden\"><v:textbox><w:txbxContent><w:p><w:r><w:t>SECRET-hid-vml-1</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r><w:r><w:t>shown</w:t></w:r></w:p>";
+    let doc = Pkg::new("docx").body(&doc_xml(body)).zip();
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><xdr:twoCellAnchor><xdr:sp><xdr:nvSpPr><xdr:cNvPr id=\"2\" name=\"Box\" hidden=\"1\"/><xdr:cNvSpPr/></xdr:nvSpPr><xdr:txBody><a:p><a:r><a:t>SECRET-hid-xdr-1</a:t></a:r></a:p></xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor><xdr:twoCellAnchor><xdr:sp><xdr:nvSpPr><xdr:cNvPr id=\"3\" name=\"Shown\"/><xdr:cNvSpPr/></xdr:nvSpPr></xdr:sp><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>";
+    let book = workbook(&[("Data", "visible", &sheet_xml(""))])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "drawing",
+            "xl/drawings/drawing1.xml",
+            &format!("{OX}.drawing+xml"),
+            drawing.as_bytes(),
+        )
+        .zip();
+    let dir = dir("clean-shapes");
+    put(&dir, &[("a.docx", &doc), ("a.xlsx", &book)]);
+    let out = run_in(&dir, &["clean", "a.docx", "a.xlsx"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(copy_secrets(&dir.join("a.clean.docx")).is_empty());
+    assert!(copy_secrets(&dir.join("a.clean.xlsx")).is_empty());
+    assert_eq!(
+        paragraphs(&part_of(&dir.join("a.clean.docx"), "word/document.xml")),
+        ["shown"]
+    );
+    let d = String::from_utf8(part_of(
+        &dir.join("a.clean.xlsx"),
+        "xl/drawings/drawing1.xml",
+    ))
+    .unwrap();
+    assert!(
+        d.contains("name=\"Shown\"") && d.matches("<xdr:twoCellAnchor>").count() == 1,
+        "{d}"
+    );
+}

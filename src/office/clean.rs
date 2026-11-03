@@ -12,8 +12,8 @@ use zip::{CompressionMethod, DateTime, ZipWriter};
 use super::common::rels_source;
 use super::tree::{Doc, El, Node};
 use super::{
-    CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, excel, key, ns, part_name,
-    powerpoint, rels_name, resolve, revisions, word,
+    CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, drawing, excel, key, ns,
+    part_name, powerpoint, rels_name, resolve, revisions, word,
 };
 use crate::report::{Change, CheckId, Error, Finding, Format, safe};
 
@@ -291,25 +291,30 @@ impl Draft {
         names
     }
 
-    /// Removes the elements of `part` that `pick` picks (see [`El::prune`]) and the
-    /// relationships only they named; the sweep then takes the parts nothing else reaches.
-    pub fn prune_linked(&mut self, part: &str, pick: impl Fn(&El) -> bool) -> Result<usize, Error> {
+    /// Edits `part` with `f`, which gives how many things it changed; when any, the part is
+    /// written back and the relationships no element names any more go (the sweep then takes
+    /// the parts nothing else reaches).
+    pub fn change(&mut self, part: &str, f: impl FnOnce(&mut El) -> usize) -> Result<usize, Error> {
         let Some(mut doc) = self.doc(part)? else {
             return Ok(0);
         };
         let before = ids(&doc.root);
-        let n = doc.root.prune(&pick);
+        let n = f(&mut doc.root);
         if n == 0 {
             return Ok(0);
         }
         self.set(part, doc.write());
-        let after = ids(&doc.root);
-        for id in before.difference(&after) {
+        for id in before.difference(&ids(&doc.root)) {
             self.unlink(part, id)?;
         }
         Ok(n)
     }
 
+    /// Removes the elements of `part` that `pick` picks (see [`El::prune`]) and the
+    /// relationships only they named.
+    pub fn prune_linked(&mut self, part: &str, pick: impl Fn(&El) -> bool) -> Result<usize, Error> {
+        self.change(part, |root| root.prune(&pick))
+    }
     /// Deletes every part that a relationship of type `short` reaches.
     pub fn delete_linked(&mut self, short: &str) -> Result<usize, Error> {
         let links = self.linked(short)?;
@@ -485,7 +490,7 @@ fn ids(root: &El) -> HashSet<String> {
 }
 
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 14] = [
+const CLEANABLE: [CheckId; 17] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::TrackedChanges,
@@ -493,6 +498,9 @@ const CLEANABLE: [CheckId; 14] = [
     CheckId::FakeRedactions,
     CheckId::HiddenSheets,
     CheckId::HiddenRowsColumns,
+    CheckId::HiddenSlides,
+    CheckId::SpeakerNotes,
+    CheckId::HiddenObjects,
     CheckId::EmbeddedFiles,
     CheckId::CustomData,
     CheckId::Macros,
@@ -602,6 +610,20 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
             })?;
         }
     }
+    if has(CheckId::HiddenObjects) {
+        hidden_objects(&ctx, &mut d)?;
+    }
+    if has(CheckId::HiddenSlides) {
+        let hidden: Vec<String> = found
+            .iter()
+            .filter(|f| f.check == CheckId::HiddenSlides)
+            .filter_map(|f| f.place.slide.map(|i| ctx.slides[i - 1].clone()))
+            .collect();
+        powerpoint::delete_slides(&mut d, &hidden)?;
+    }
+    if has(CheckId::SpeakerNotes) {
+        d.delete_linked("notesSlide")?;
+    }
     if has(CheckId::EmbeddedFiles) {
         embedded_files(&ctx, &mut d)?;
     }
@@ -676,6 +698,54 @@ fn macros(d: &mut Draft) -> Result<(), Error> {
             "extension_changed",
             format!("Macros were removed, so the copy is .{plain}."),
         ));
+    }
+    Ok(())
+}
+
+/// `hidden-objects`: hidden shapes (and shapes off the slide) deleted; a slide's animations
+/// go when they name one of them.
+fn hidden_objects(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    let parts: Vec<String> = drawing::drawing_parts(ctx)
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let mut animated = vec![];
+    for part in parts {
+        let mut gone = vec![];
+        d.change(&part, |root| {
+            gone = drawing::remove_hidden(root, ctx.pkg.format, ctx.slide_size);
+            gone.len()
+        })?;
+        let named = |t: &El| {
+            t.is(ns::P, "timing")
+                && t.has(&|s: &El| {
+                    s.is(ns::P, "spTgt")
+                        && s.attr("", "spid")
+                            .is_some_and(|id| gone.iter().any(|g| g == id))
+                })
+        };
+        if !gone.is_empty() && d.prune_linked(&part, named)? > 0 {
+            animated.extend(
+                ctx.slides
+                    .iter()
+                    .position(|s| key(s) == key(&part))
+                    .map(|i| i + 1),
+            );
+        }
+    }
+    if !animated.is_empty() {
+        let list: Vec<String> = animated.iter().map(|n| n.to_string()).collect();
+        let slides = match list.len() {
+            1 => format!("slide {}", list[0]),
+            n => format!("slides {} and {}", list[..n - 1].join(", "), list[n - 1]),
+        };
+        d.changes.push(Change {
+            slides: Some(animated),
+            ..Change::new(
+                "animations_removed",
+                format!("Animations were removed from {slides}."),
+            )
+        });
     }
     Ok(())
 }

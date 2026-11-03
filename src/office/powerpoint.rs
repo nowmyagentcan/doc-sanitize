@@ -2,8 +2,9 @@
 
 use quick_xml::events::Event;
 
+use super::clean::Draft;
 use super::tree::{Attr, El, Node};
-use super::{Ctx, common, ns, xml};
+use super::{Ctx, common, key, ns, xml};
 use crate::report::{CheckId, Error, Finding, Where, plural};
 
 /// `hidden-slides`: slides left out of the show.
@@ -156,4 +157,54 @@ fn picture_of(frame: &El) -> Option<El> {
         vec![c_nv, El::like(frame, "cNvPicPr"), nv_pr],
     );
     Some(el(frame, "pic", vec![nv_pic, fill, shape]))
+}
+
+const P14: &str = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+
+/// Deletes the slides `slides` (parts): their entries in the slide list, custom shows and
+/// sections, and the links to them on other slides; the sweep takes their notes, comments,
+/// charts and media.
+pub fn delete_slides(d: &mut Draft, slides: &[String]) -> Result<(), Error> {
+    let gone = |p: &Option<String>| {
+        p.as_deref()
+            .is_some_and(|p| slides.iter().any(|s| key(s) == key(p)))
+    };
+    let main = d.main.clone();
+    let rids: Vec<String> = d
+        .rels(&main)?
+        .into_iter()
+        .filter(|r| r.short() == "slide" && gone(&d.target(&main, &r.id).ok().flatten()))
+        .map(|r| r.id)
+        .collect();
+    let mut numbers = vec![];
+    if let Some(doc) = d.doc(&main)? {
+        doc.root.each(&mut |e| {
+            if e.is(ns::P, "sldId")
+                && e.attr(ns::R, "id")
+                    .is_some_and(|id| rids.iter().any(|r| r == id))
+            {
+                numbers.extend(e.attr("", "id").map(String::from));
+            }
+        });
+    }
+    d.prune_linked(&main, |e| {
+        let rid = e
+            .attr(ns::R, "id")
+            .is_some_and(|id| rids.iter().any(|r| r == id));
+        ((e.is(ns::P, "sldId") || e.is(ns::P, "sld")) && rid)
+            || (e.is(P14, "sldId")
+                && e.attr("", "id")
+                    .is_some_and(|n| numbers.iter().any(|g| g == n)))
+    })?;
+    for l in d.links()? {
+        if l.rel.short() == "slide" && gone(&l.part) && key(&l.source) != key(&main) {
+            let id = l.rel.id.clone();
+            d.prune_linked(&l.source, |e| {
+                (e.is(ns::A, "hlinkClick") || e.is(ns::A, "hlinkHover"))
+                    && e.attr(ns::R, "id") == Some(&id)
+            })?;
+            d.unlink(&l.source, &l.rel.id)?;
+        }
+    }
+    Ok(())
 }

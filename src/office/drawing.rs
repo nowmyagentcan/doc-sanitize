@@ -2,6 +2,7 @@
 
 use quick_xml::events::Event;
 
+use super::tree::{El, MC, Node};
 use super::{Ctx, common, ns, word, xml};
 use crate::report::{CheckId, Error, Finding, Format, counted, plural};
 
@@ -118,7 +119,7 @@ pub fn hidden_objects(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     } else if o.leaf
                         && !around_hidden
                         && pkg.format == Format::Pptx
-                        && off_slide(ctx, &o, &open)
+                        && ctx.slide_size.is_some_and(|s| off_slide(s, &o, &open))
                     {
                         off.0 += 1;
                         off.1.get_or_insert(o.text.clone());
@@ -162,10 +163,8 @@ pub fn hidden_objects(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
 
 /// Whether a shape's box, mapped through the groups around it, misses the slide. A shape
 /// with no box of its own (a placeholder) is on the slide.
-fn off_slide(ctx: &Ctx, o: &Object, groups: &[Object]) -> bool {
-    let (Some((cx, cy)), Some((mut x, mut y)), Some((mut w, mut h))) =
-        (ctx.slide_size, o.off, o.ext)
-    else {
+fn off_slide((cx, cy): (i64, i64), o: &Object, groups: &[Object]) -> bool {
+    let (Some((mut x, mut y)), Some((mut w, mut h))) = (o.off, o.ext) else {
         return false;
     };
     for g in groups.iter().rev() {
@@ -254,4 +253,120 @@ pub fn crops_and_alt_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         }
     }
     Ok(found)
+}
+
+/// An object element and what makes it hidden: its own `cNvPr`/`docPr` and its box (both
+/// read without looking into the objects inside it).
+fn object_of(e: &El) -> Object {
+    let mut o = Object {
+        leaf: !matches!(e.local(), "grpSp" | "wgp"),
+        ..Object::default()
+    };
+    fn scan(e: &El, o: &mut Object, top: bool) {
+        for c in e.els() {
+            let object = &*c.ns != ns::W && OBJECTS.contains(&c.local());
+            if object && !top {
+                continue;
+            }
+            if (c.local() == "cNvPr" || c.local() == "docPr")
+                && c.attr("", "hidden")
+                    .is_some_and(|h| h == "1" || h == "true")
+            {
+                o.hidden = true;
+            }
+            if e.local() == "xfrm" {
+                let num = |a| c.attr("", a).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let slot = match c.local() {
+                    "off" => &mut o.off,
+                    "ext" => &mut o.ext,
+                    "chOff" => &mut o.ch_off,
+                    "chExt" => &mut o.ch_ext,
+                    _ => continue,
+                };
+                let pair = if c.local().ends_with("ff") {
+                    (num("x"), num("y"))
+                } else {
+                    (num("cx"), num("cy"))
+                };
+                slot.get_or_insert(pair);
+            }
+            if !object {
+                scan(c, o, false);
+            }
+        }
+    }
+    scan(e, &mut o, true);
+    o
+}
+
+/// Whether a VML element is styled hidden.
+fn vml_hidden(e: &El) -> bool {
+    &*e.ns == VML
+        && e.attr("", "style")
+            .is_some_and(|s| s.replace(' ', "").contains("visibility:hidden"))
+}
+
+/// Removes hidden objects (and, on slides, objects off the slide of size `slide`) from a
+/// drawing part: Word removes the `w:drawing` or `w:pict` around them, Excel the anchor,
+/// PowerPoint the shape itself. Gives the `cNvPr` ids of everything removed.
+pub fn remove_hidden(root: &mut El, format: Format, slide: Option<(i64, i64)>) -> Vec<String> {
+    let mut ids = vec![];
+    let mut groups = vec![];
+    walk(root, format, slide, &mut groups, &mut ids);
+    ids
+}
+
+fn walk(
+    e: &mut El,
+    format: Format,
+    slide: Option<(i64, i64)>,
+    groups: &mut Vec<Object>,
+    ids: &mut Vec<String>,
+) {
+    let mut kids = Vec::with_capacity(e.kids.len());
+    for k in std::mem::take(&mut e.kids) {
+        let Node::El(mut c) = k else {
+            kids.push(k);
+            continue;
+        };
+        let hidden_inside = |c: &El| {
+            c.has(&|x: &El| {
+                vml_hidden(x)
+                    || (&*x.ns != ns::W && OBJECTS.contains(&x.local()) && object_of(x).hidden)
+            })
+        };
+        let removable = |c: &El| match format {
+            Format::Docx => {
+                (c.is(ns::W, "drawing") || c.is(ns::W, "pict") || c.is(ns::W, "object"))
+                    && hidden_inside(c)
+            }
+            Format::Xlsx => c.local().ends_with("Anchor") && hidden_inside(c),
+            _ => {
+                OBJECTS.contains(&c.local()) && &*c.ns != ns::W && {
+                    let o = object_of(c);
+                    o.hidden || (o.leaf && slide.is_some_and(|s| off_slide(s, &o, groups)))
+                }
+            }
+        };
+        // One removed inside an alternative takes the whole alternative with it.
+        let whole = removable(&c) || (c.is(MC, "AlternateContent") && c.has(&removable));
+        if whole {
+            c.each(&mut |x| {
+                if x.local() == "cNvPr" {
+                    ids.extend(x.attr("", "id").map(String::from));
+                }
+            });
+            continue;
+        }
+        let group = format == Format::Pptx && c.local() == "grpSp";
+        if group {
+            groups.push(object_of(&c));
+        }
+        walk(&mut c, format, slide, groups, ids);
+        if group {
+            groups.pop();
+        }
+        kids.push(Node::El(c));
+    }
+    e.kids = kids;
 }
