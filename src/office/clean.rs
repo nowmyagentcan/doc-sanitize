@@ -843,28 +843,27 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             d.prune_linked(&part, |e| e.is(CHART, "externalData"))?;
         }
     }
-    let objects = |n: u64| {
-        if n == 1 {
-            "1 embedded object is"
-        } else {
-            "embedded objects are"
+    for (code, n, one, many) in [
+        (
+            "objects_to_pictures",
+            pictures,
+            "embedded object is now a picture",
+            "embedded objects are now pictures",
+        ),
+        (
+            "objects_removed",
+            gone,
+            "embedded object had no picture and was removed",
+            "embedded objects had no picture and were removed",
+        ),
+    ] {
+        if n > 0 {
+            d.changes.push(Change::counted(
+                code,
+                n,
+                format!("{}.", counted(n, one, many)),
+            ));
         }
-    };
-    if pictures > 0 {
-        let what = match pictures {
-            1 => "1 embedded object is now a picture.".to_string(),
-            n => format!("{n} {} now pictures.", objects(n)),
-        };
-        d.changes
-            .push(Change::counted("objects_to_pictures", pictures, what));
-    }
-    if gone > 0 {
-        let what = match gone {
-            1 => "1 embedded object had no picture and was removed.".to_string(),
-            n => format!("{n} embedded objects had no picture and were removed."),
-        };
-        d.changes
-            .push(Change::counted("objects_removed", gone, what));
     }
     Ok(())
 }

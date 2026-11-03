@@ -66,13 +66,13 @@ fn mark_deleted(p: &El) -> bool {
 pub fn accept(root: &mut El) {
     // 1. Moves: the destination stays, the source goes.
     root.unwrap(&|e| w(e, "moveTo"));
-    root.prune(&|e| w(e, "moveFrom") && !in_properties(e));
+    root.prune(&|e| w(e, "moveFrom") && !marker(e));
     // 2. Content controls whose content was all deleted or moved away.
     root.prune(&|e| w(e, "sdt") && all_deleted(e));
     // 3. Deleted paragraph marks join their paragraph to the next one.
     merge_marks(root);
     // 4. Insertions stay; marks of inserted properties go.
-    root.unwrap(&|e| w(e, "ins") && !e.is_marker());
+    root.unwrap(&|e| w(e, "ins") && !marker(e));
     // 5, 6. Range markers and old properties.
     root.prune(&|e| e.ns.as_ref() == W && RANGES.contains(&e.local()));
     root.prune(&|e| e.ns.as_ref() == W && PROPERTY_CHANGES.contains(&e.local()));
@@ -119,17 +119,10 @@ pub fn leftover(root: &El) -> Option<String> {
     found
 }
 
-impl El {
-    /// Whether this element is a mark inside properties (`w:rPr/w:ins`, `w:trPr/w:ins`, …)
-    /// rather than a wrapper around content: it holds no elements.
-    fn is_marker(&self) -> bool {
-        self.els().next().is_none() && self.kids.iter().all(|k| matches!(k, Node::Text(_)))
-    }
-}
-
-/// Whether `e` is a move or deletion mark inside properties (empty), not content.
-fn in_properties(e: &El) -> bool {
-    e.is_marker()
+/// Whether an element is a mark inside properties (`w:rPr/w:ins`, `w:trPr/w:ins`, …) rather
+/// than a wrapper around content: it holds no elements.
+fn marker(e: &El) -> bool {
+    e.kids.iter().all(|k| matches!(k, Node::Text(_)))
 }
 
 /// Whether every run in a content control was deleted or moved away (and it has one).
