@@ -3,6 +3,7 @@
 
 pub mod input;
 pub mod office;
+pub mod pdf;
 pub mod pictures;
 pub mod report;
 pub mod run;

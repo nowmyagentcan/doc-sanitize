@@ -124,7 +124,9 @@ fn pdfs_of_every_version_are_recognised() {
         "%PDF-2.0\n",
         "junk before\r\n%PDF-1.5\n",
     ] {
-        let f = check_bytes("doc.pdf", format!("{head}%%EOF\n").as_bytes());
+        let mut bytes = head.as_bytes().to_vec();
+        bytes.extend(&PDF[9..]);
+        let f = check_bytes("doc.pdf", &bytes);
         assert_eq!(
             (f["format"].as_str(), f["variant"].as_str()),
             (Some("pdf"), Some("pdf")),

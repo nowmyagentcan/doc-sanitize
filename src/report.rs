@@ -231,6 +231,15 @@ pub struct Warning {
     pub message: String,
 }
 
+impl Warning {
+    pub fn repaired() -> Self {
+        Self {
+            code: "repaired",
+            message: "The file's cross-reference table was damaged and was rebuilt; other apps may show different content.".into(),
+        }
+    }
+}
+
 /// A file that couldn't be checked, or a usage error. Messages name the file as `{name}`
 /// until [`Error::named`] fills it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -313,6 +322,33 @@ impl Error {
             "password_required",
             "{name} is password-protected.",
             "Remove the password in Office (File › Info › Protect), save, and check again.",
+        )
+    }
+
+    pub fn pdf_password() -> Self {
+        Self::new(
+            "password_required",
+            "{name} needs a password to open.",
+            "Pass it with --password.",
+        )
+    }
+
+    pub fn wrong_password() -> Self {
+        Self::new(
+            "wrong_password",
+            "The password for {name} isn't right.",
+            "Check the password and try again.",
+        )
+    }
+
+    pub fn unsupported_encryption(method: &str) -> Self {
+        Self::new(
+            "unsupported_encryption",
+            format!(
+                "{{name}} uses encryption this tool can't open ({}).",
+                safe(method)
+            ),
+            "Save an unencrypted copy from the app that made it.",
         )
     }
 

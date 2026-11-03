@@ -42,6 +42,7 @@ fn help_lists_every_check_what_isnt_checked_and_examples() {
     for line in [
         "  hidden-rows-columns  hidden rows and columns that hold values",
         "  form-data            XFA forms and values of hidden form fields",
+        "      --password PW  PDF user password",
         "Not checked: legacy .doc/.xls/.ppt, .xlsb, Strict Open XML, ODF, RTF and password-protected",
         "  doc-sanitize redacted.pdf --json",
     ] {

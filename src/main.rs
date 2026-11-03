@@ -25,6 +25,8 @@ struct Cli {
     paths: Vec<PathBuf>,
     #[arg(short = 'r')]
     recursive: bool,
+    #[arg(long, value_name = "PW")]
+    password: Option<String>,
     #[arg(long)]
     show_values: bool,
     #[arg(long)]
@@ -47,6 +49,7 @@ Commands:
 
 Options:
   -r                 Look in subfolders too
+      --password PW  PDF user password
       --show-values  Also print the hidden text itself (off: only places and counts)
       --json         Print one JSON object
       --debug        Show stack traces and timings
@@ -134,6 +137,7 @@ fn check(
     let mut files: Vec<FileResult> = vec![];
     let options = run::Options {
         show_values: cli.show_values,
+        password: cli.password.clone(),
     };
     for (i, input) in inputs.iter().enumerate() {
         let start = Instant::now();

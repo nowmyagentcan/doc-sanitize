@@ -11,6 +11,7 @@ use std::thread;
 
 use crate::input::{self, Kind};
 use crate::office::{self, Package};
+use crate::pdf;
 use crate::report::{CheckId, Error, FileResult, Format, Warning, safe};
 
 const WORKER: &str = "doc-sanitize-worker";
@@ -26,6 +27,8 @@ thread_local! {
 pub struct Options {
     /// Put each finding's text in its `value`.
     pub show_values: bool,
+    /// The PDF user password to try after the empty one.
+    pub password: Option<String>,
 }
 
 /// Checks the file at `path`. A caught panic comes back as `internal`, with where it happened
@@ -34,9 +37,16 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
     let name = safe(&path.to_string_lossy());
     let result = on_worker(|| {
         let bytes = input::load(path)?;
+        let mut warnings = vec![];
         let (format, variant, ran, findings): (_, _, Vec<CheckId>, _) = match input::sniff(&bytes)?
         {
-            Kind::Pdf => (Format::Pdf, "pdf", vec![], vec![]),
+            Kind::Pdf => {
+                let pdf = pdf::open(&bytes, options.password.as_deref())?;
+                if pdf.repaired {
+                    warnings.push(Warning::repaired());
+                }
+                (Format::Pdf, "pdf", vec![], vec![])
+            }
             Kind::Zip => {
                 let pkg = Package::open(&bytes)?;
                 let found = office::check(&pkg, options.show_values)?;
@@ -48,7 +58,9 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
                 )
             }
         };
-        let warnings = mismatch(&name, path, variant).into_iter().collect();
+        if let Some(w) = mismatch(&name, path, variant) {
+            warnings.insert(0, w);
+        }
         Ok(FileResult::checked(
             name.clone(),
             format,
