@@ -7,7 +7,21 @@ description = "Find and remove hidden data in PDF, Word, Excel and PowerPoint fi
 repository = "https://github.com/nowmyagentcan/doc-sanitize"
 publish = false
 
+[dependencies]
+hayro = "=0.9.0"
+lopdf = { version = "=0.46.0", default-features = false }
+quick-xml = "=0.42.0"
+zip = { version = "=9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# Tests parse and render whole documents, which takes seconds without optimisation: our code
+# gets a light pass, dependencies a full one.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
