@@ -7,6 +7,16 @@ pub mod common;
 pub mod xml;
 pub mod zipscan;
 
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
+
+use flate2::CrcWriter;
+use flate2::read::DeflateDecoder;
+use quick_xml::events::Event;
+
+use crate::report::{CheckId, Error, Finding, Format, Where, safe};
+use zipscan::{Entry, Zip};
+
 /// The namespaces the checks read, by their usual prefixes.
 pub mod ns {
     pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -16,6 +26,7 @@ pub mod ns {
     pub const XR: &str = "http://schemas.microsoft.com/office/spreadsheetml/2014/revision";
     pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
     pub const P14: &str = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+    pub const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     pub const CP: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
     pub const DC: &str = "http://purl.org/dc/elements/1.1/";
     pub const DCTERMS: &str = "http://purl.org/dc/terms/";
@@ -25,33 +36,107 @@ pub mod ns {
         "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
 }
 
-use crate::report::{CheckId, Finding};
-
 /// The checks of each format, in check order.
 pub fn checks(format: Format) -> &'static [CheckId] {
     use CheckId::*;
     match format {
-        Format::Docx | Format::Xlsx | Format::Pptx => &[Metadata, LeftoverData],
+        Format::Docx | Format::Xlsx | Format::Pptx => &[Metadata, Comments, LeftoverData],
         Format::Pdf => &[],
     }
 }
 
 /// Runs every check of the package's format.
 pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
-    let mut found = common::metadata(pkg, values)?;
+    let ctx = Ctx::new(pkg, values)?;
+    let mut found = common::metadata(&ctx)?;
+    found.extend(common::comments(&ctx)?);
     found.extend(common::leftover_data(pkg, values)?);
     Ok(found)
 }
 
-use std::collections::{HashMap, HashSet};
-use std::io::{self, Read, Write};
+/// A sheet of a workbook, in the workbook's order.
+#[derive(Debug)]
+pub struct Sheet {
+    pub name: String,
+    /// The sheet's part, when the package has it.
+    pub part: Option<String>,
+    /// `visible`, `hidden` or `veryHidden`.
+    pub state: String,
+}
 
-use flate2::CrcWriter;
-use flate2::read::DeflateDecoder;
-use quick_xml::events::Event;
+/// What every check of one package needs: the package, whether to show values, and the
+/// sheets or slides in their order.
+pub struct Ctx<'p> {
+    pub pkg: &'p Package<'p>,
+    pub values: bool,
+    pub sheets: Vec<Sheet>,
+    /// Slide parts in the presentation's order.
+    pub slides: Vec<String>,
+}
 
-use crate::report::{Error, Format, safe};
-use zipscan::{Entry, Zip};
+impl<'p> Ctx<'p> {
+    fn new(pkg: &'p Package, values: bool) -> Result<Self, Error> {
+        let mut ctx = Self {
+            pkg,
+            values,
+            sheets: vec![],
+            slides: vec![],
+        };
+        let main = pkg.main.as_str();
+        let target = |id: &str| {
+            pkg.links
+                .iter()
+                .find(|l| l.source == main && l.rel.id == id)
+                .and_then(|l| l.part.clone())
+        };
+        pkg.walk(main, |r, ev| {
+            let (Event::Start(e) | Event::Empty(e)) = ev else {
+                return Ok(());
+            };
+            let id = || r.attr_ns(e, ns::R, "id");
+            if r.is(e, ns::S, "sheet") {
+                let name = r.attr(e, "name")?.unwrap_or_default().into_owned();
+                let state = r.attr(e, "state")?.unwrap_or("visible".into()).into_owned();
+                let part = id()?.and_then(|id| target(&id));
+                ctx.sheets.push(Sheet { name, part, state });
+            } else if r.is(e, ns::P, "sldId")
+                && let Some(part) = id()?.and_then(|id| target(&id))
+            {
+                ctx.slides.push(part);
+            }
+            Ok(())
+        })?;
+        Ok(ctx)
+    }
+
+    /// Where `part` is: its slide or sheet, or the slide or sheet that links to it.
+    pub fn place(&self, part: &str) -> Where {
+        let k = key(part);
+        let sources = self
+            .pkg
+            .links
+            .iter()
+            .filter(|l| l.part.as_deref().is_some_and(|p| key(p) == k));
+        let mut at = Where::part(part);
+        for p in std::iter::once(part).chain(sources.map(|l| l.source.as_str())) {
+            let k = key(p);
+            if let Some(i) = self.slides.iter().position(|s| key(s) == k) {
+                at.slide = Some(i + 1);
+                break;
+            }
+            let sheet = |s: &Sheet| s.part.as_deref().is_some_and(|s| key(s) == k);
+            if let Some(i) = self.sheets.iter().position(sheet) {
+                let sheet = &self.sheets[i];
+                at.sheet_index = Some(i + 1);
+                if sheet.state == "visible" || self.values {
+                    at.sheet = Some(safe(&sheet.name));
+                }
+                break;
+            }
+        }
+        at
+    }
+}
 
 /// The most one entry may inflate to, and the whole package.
 const MAX_PART: u64 = 256 << 20;

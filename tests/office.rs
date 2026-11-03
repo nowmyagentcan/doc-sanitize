@@ -6,9 +6,9 @@ mod common;
 use common::*;
 
 /// The checks each format lists, in order.
-const DOCX_CHECKS: &[&str] = &["metadata", "leftover-data"];
-const XLSX_CHECKS: &[&str] = &["metadata", "leftover-data"];
-const PPTX_CHECKS: &[&str] = &["metadata", "leftover-data"];
+const DOCX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
+const XLSX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
+const PPTX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
 
 const VARIANTS: [&str; 14] = [
     "docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "xltx", "xltm", "pptx", "pptm", "potx", "potm",
@@ -732,4 +732,243 @@ fn empty_properties_are_not_metadata() {
         )
         .zip();
     assert_eq!(kinds(&check_bytes("plain.docx", &doc), "metadata"), []);
+}
+
+const SHEET_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const SLIDE_TYPE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+
+/// A workbook whose sheets (name, state, body) are linked as rId1, rId2, … from workbook.xml
+/// and saved as xl/worksheets/sheetN.xml.
+fn workbook(sheets: &[(&str, &str, &str)]) -> Pkg {
+    let list: String = sheets
+        .iter()
+        .enumerate()
+        .map(|(i, (name, state, _))| {
+            format!(
+                "<sheet name=\"{name}\" sheetId=\"{}\" state=\"{state}\" r:id=\"rId{}\"/>",
+                i + 1,
+                i + 1
+            )
+        })
+        .collect();
+    let mut p = Pkg::new("xlsx").body(&format!(
+        "<workbook xmlns=\"{S}\" xmlns:r=\"{R}\"><sheets>{list}</sheets></workbook>"
+    ));
+    for (i, (_, _, body)) in sheets.iter().enumerate() {
+        p = p.part(
+            "xl/workbook.xml",
+            &format!("rId{}", i + 1),
+            "worksheet",
+            &format!("xl/worksheets/sheet{}.xml", i + 1),
+            SHEET_TYPE,
+            body.as_bytes(),
+        );
+    }
+    p
+}
+
+/// A presentation whose slides (bodies) are linked as rId1, rId2, … and saved as
+/// ppt/slides/slideN.xml.
+fn presentation(slides: &[&str]) -> Pkg {
+    let list: String = (1..=slides.len())
+        .map(|i| format!("<p:sldId id=\"{}\" r:id=\"rId{i}\"/>", 255 + i))
+        .collect();
+    let mut p = Pkg::new("pptx").body(&format!(
+        "<p:presentation xmlns:p=\"{P}\" xmlns:r=\"{R}\"><p:sldIdLst>{list}</p:sldIdLst><p:sldSz cx=\"12192000\" cy=\"6858000\"/></p:presentation>"
+    ));
+    for (i, body) in slides.iter().enumerate() {
+        p = p.part(
+            "ppt/presentation.xml",
+            &format!("rId{}", i + 1),
+            "slide",
+            &format!("ppt/slides/slide{}.xml", i + 1),
+            SLIDE_TYPE,
+            body.as_bytes(),
+        );
+    }
+    p
+}
+
+fn sheet_xml(data: &str) -> String {
+    format!("<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\"><sheetData>{data}</sheetData></worksheet>")
+}
+
+fn slide_xml(shapes: &str) -> String {
+    format!(
+        "<p:sld xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"{R}\"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld></p:sld>"
+    )
+}
+
+#[test]
+fn comments_and_their_authors_are_found() {
+    let comments = format!(
+        "<w:comments xmlns:w=\"{W}\"><w:comment w:id=\"0\" w:author=\"Avery Example\" w:initials=\"AE\"><w:p><w:r><w:t>SECRET-comment-1</w:t></w:r><w:r><w:t xml:space=\"preserve\"> and more</w:t></w:r></w:p></w:comment><w:comment w:id=\"1\" w:author=\"Sam Sample\"><w:p><w:r><w:t>SECRET-comment-2</w:t></w:r></w:p></w:comment></w:comments>"
+    );
+    let people = "<w15:people xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"><w15:person w15:author=\"SECRET-comment-3\"><w15:presenceInfo w15:providerId=\"None\" w15:userId=\"x\"/></w15:person><w15:person w15:author=\"Sam Sample\"/></w15:people>";
+    let doc = Pkg::new("docx")
+        .part(
+            "word/document.xml",
+            "rId1",
+            "comments",
+            "word/comments.xml",
+            &format!("{OX}.wordprocessingml.comments+xml"),
+            comments.as_bytes(),
+        )
+        .part(
+            "word/document.xml",
+            "rId2",
+            "http://schemas.microsoft.com/office/2011/relationships/people",
+            "word/people.xml",
+            &format!("{OX}.wordprocessingml.people+xml"),
+            people.as_bytes(),
+        )
+        .zip();
+    assert_eq!(
+        kinds(&check_bytes("c.docx", &doc), "comments"),
+        [
+            found("comment", "word/comments.xml", 2, "2 comments by 2 people"),
+            found("people", "word/people.xml", 2, "2 comment authors"),
+        ]
+    );
+    assert_eq!(
+        values("c.docx", &doc),
+        ["SECRET-comment-1 and more", "SECRET-comment-3"]
+    );
+
+    let notes = format!(
+        "<comments xmlns=\"{S}\"><authors><author>Avery Example</author></authors><commentList><comment ref=\"B2\" authorId=\"0\"><text><r><t>SECRET-comment-4</t></r></text></comment></commentList></comments>"
+    );
+    let threaded = "<ThreadedComments xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\"><threadedComment ref=\"B2\" dT=\"2026-01-01T00:00:00.00\" personId=\"{P1}\" id=\"{C1}\"><text>SECRET-comment-5</text></threadedComment><threadedComment ref=\"B2\" personId=\"{P2}\" id=\"{C2}\" parentId=\"{C1}\"><text>reply</text></threadedComment></ThreadedComments>";
+    let persons = "<personList xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments\"><person displayName=\"SECRET-comment-6\" id=\"{P1}\" userId=\"avery\" providerId=\"None\"/></personList>";
+    let book = workbook(&[("Summary", "visible", &sheet_xml(""))])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "comments",
+            "xl/comments1.xml",
+            &format!("{OX}.spreadsheetml.comments+xml"),
+            notes.as_bytes(),
+        )
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId2",
+            "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment",
+            "xl/threadedComments/threadedComment1.xml",
+            "application/vnd.ms-excel.threadedcomments+xml",
+            threaded.as_bytes(),
+        )
+        .part(
+            "xl/workbook.xml",
+            "rId9",
+            "http://schemas.microsoft.com/office/2017/10/relationships/person",
+            "xl/persons/person.xml",
+            "application/vnd.ms-excel.person+xml",
+            persons.as_bytes(),
+        )
+        .zip();
+    let f = check_bytes("c.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "comments"),
+        [
+            found("people", "xl/persons/person.xml", 1, "1 comment author"),
+            found("note", "xl/comments1.xml", 1, "1 note by 1 person"),
+            found(
+                "threaded_comment",
+                "xl/threadedComments/threadedComment1.xml",
+                2,
+                "2 threaded comments by 2 people"
+            ),
+        ]
+    );
+    assert_eq!(f["findings"][1]["where"]["sheet_index"], 1);
+    assert_eq!(f["findings"][1]["where"]["sheet"], "Summary");
+    assert_eq!(
+        values("c.xlsx", &book),
+        ["SECRET-comment-6", "SECRET-comment-4", "SECRET-comment-5"]
+    );
+
+    let legacy = format!(
+        "<p:cmLst xmlns:p=\"{P}\"><p:cm authorId=\"0\" idx=\"1\"><p:pos x=\"10\" y=\"10\"/><p:text>SECRET-comment-7</p:text></p:cm></p:cmLst>"
+    );
+    let modern = "<p188:cmLst xmlns:p188=\"http://schemas.microsoft.com/office/powerpoint/2018/8/main\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p188:cm id=\"{1}\" authorId=\"{A1}\"><p188:txBody><a:p><a:r><a:t>SECRET-comment-8</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>";
+    let authors = format!(
+        "<p:cmAuthorLst xmlns:p=\"{P}\"><p:cmAuthor id=\"0\" name=\"SECRET-comment-9\" initials=\"AE\" lastIdx=\"1\" clrIdx=\"0\"/></p:cmAuthorLst>"
+    );
+    let deck = presentation(&[&slide_xml(""), &slide_xml("")])
+        .part(
+            "ppt/slides/slide2.xml",
+            "rId1",
+            "comments",
+            "ppt/comments/comment1.xml",
+            &format!("{OX}.presentationml.comments+xml"),
+            legacy.as_bytes(),
+        )
+        .part(
+            "ppt/slides/slide2.xml",
+            "rId2",
+            "http://schemas.microsoft.com/office/2018/10/relationships/comments",
+            "ppt/comments/modernComment_1.xml",
+            "application/vnd.ms-powerpoint.comments+xml",
+            modern.as_bytes(),
+        )
+        .part(
+            "ppt/presentation.xml",
+            "rId9",
+            "commentAuthors",
+            "ppt/commentAuthors.xml",
+            &format!("{OX}.presentationml.commentAuthors+xml"),
+            authors.as_bytes(),
+        )
+        .zip();
+    let f = check_bytes("c.pptx", &deck);
+    assert_eq!(
+        kinds(&f, "comments"),
+        [
+            found("people", "ppt/commentAuthors.xml", 1, "1 comment author"),
+            found(
+                "comment",
+                "ppt/comments/comment1.xml",
+                1,
+                "1 comment by 1 person"
+            ),
+            found(
+                "comment",
+                "ppt/comments/modernComment_1.xml",
+                1,
+                "1 comment by 1 person"
+            ),
+        ]
+    );
+    assert_eq!(f["findings"][1]["where"]["slide"], 2);
+    assert_eq!(
+        values("c.pptx", &deck),
+        ["SECRET-comment-9", "SECRET-comment-7", "SECRET-comment-8"]
+    );
+}
+
+#[test]
+fn a_hidden_sheet_is_named_only_with_values() {
+    let book = workbook(&[("Salaries", "veryHidden", &sheet_xml(""))])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "comments",
+            "xl/comments1.xml",
+            &format!("{OX}.spreadsheetml.comments+xml"),
+            format!("<comments xmlns=\"{S}\"><commentList><comment ref=\"A1\"><text><t>x</t></text></comment></commentList></comments>").as_bytes(),
+        )
+        .zip();
+    let dir = dir("hidden-name");
+    put(&dir, &[("h.xlsx", &book)]);
+    let at = |args: &[&str]| json(&run_in(&dir, args))["files"][0]["findings"][0]["where"].clone();
+    assert_eq!(
+        at(&["h.xlsx", "--json"]),
+        serde_json::json!({ "part": "xl/comments1.xml", "sheet_index": 1 })
+    );
+    assert_eq!(
+        at(&["h.xlsx", "--json", "--show-values"])["sheet"],
+        "Salaries"
+    );
+    assert!(stdout(&run_in(&dir, &["h.xlsx"])).contains("  ✗ comments  sheet 1: 1 note\n"));
 }

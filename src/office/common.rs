@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use quick_xml::events::Event;
 
-use super::{Package, key, ns, part_name, xml};
-use crate::report::{CheckId, Error, Finding, Format, Where, plural, safe, value};
+use super::{Ctx, Package, key, ns, part_name, xml};
+use crate::report::{CheckId, Error, Finding, Format, Where, counted, plural, safe, value};
 
 const SHARED_STRINGS: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml";
@@ -304,7 +304,8 @@ const PLAIN_APP_FIELDS: [&str; 14] = [
 
 /// `metadata`: document, application and custom properties, sensitivity labels, thumbnails,
 /// printer settings, tracking ids and editor names.
-pub fn metadata(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
+pub fn metadata(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let (pkg, values) = (ctx.pkg, ctx.values);
     let mut found = vec![];
     let mut add = |kind, part: &str, n: usize, unit, detail: String, text: Option<String>| {
         let f = Finding::new(
@@ -467,6 +468,136 @@ pub fn metadata(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
                 detail,
                 names.first().cloned(),
             );
+        }
+    }
+    Ok(found)
+}
+
+/// Comment and author parts: the format, the relationship type, the kind, the element each
+/// item is, the unit and the detail's noun.
+const COMMENT_PARTS: [(Format, &str, &str, &str, &str, &str); 8] = [
+    (
+        Format::Docx,
+        "comments",
+        "comment",
+        "comment",
+        "comments",
+        "comment",
+    ),
+    (
+        Format::Docx,
+        "people",
+        "people",
+        "person",
+        "people",
+        "comment author",
+    ),
+    (
+        Format::Xlsx,
+        "comments",
+        "note",
+        "comment",
+        "comments",
+        "note",
+    ),
+    (
+        Format::Xlsx,
+        "threadedComment",
+        "threaded_comment",
+        "threadedComment",
+        "comments",
+        "threaded comment",
+    ),
+    (
+        Format::Xlsx,
+        "person",
+        "people",
+        "person",
+        "people",
+        "comment author",
+    ),
+    (
+        Format::Pptx,
+        "comments",
+        "comment",
+        "cm",
+        "comments",
+        "comment",
+    ),
+    (
+        Format::Pptx,
+        "commentAuthors",
+        "people",
+        "cmAuthor",
+        "people",
+        "comment author",
+    ),
+    (
+        Format::Pptx,
+        "authors",
+        "people",
+        "author",
+        "people",
+        "comment author",
+    ),
+];
+
+/// `comments`: comments and notes with their authors, and the parts that list the authors.
+pub fn comments(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    for (format, short, kind, item, unit, noun) in COMMENT_PARTS {
+        if format != pkg.format {
+            continue;
+        }
+        for part in targets(pkg, short) {
+            let (mut n, mut authors, mut first) = (0, HashSet::new(), None::<String>);
+            let mut inside = None;
+            pkg.walk(part, |r, ev| {
+                match ev {
+                    Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == item => {
+                        n += 1;
+                        for (_, name, v) in r.attrs(e)? {
+                            let name = name.as_str();
+                            if kind == "people" {
+                                if first.is_none()
+                                    && ["author", "displayName", "name"].contains(&name)
+                                {
+                                    first = Some(v.into());
+                                }
+                            } else if ["author", "authorId", "personId"].contains(&name) {
+                                authors.insert(v.into_owned());
+                            }
+                        }
+                        if matches!(ev, Event::Start(_)) && n == 1 {
+                            inside = Some(r.level());
+                        }
+                    }
+                    Event::End(_) if inside == Some(r.level()) => inside = None,
+                    ev if inside.is_some() && kind != "people" => {
+                        *first.get_or_insert_default() += &xml::text(ev).unwrap_or_default();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+            if n == 0 {
+                continue;
+            }
+            let mut detail = plural(n as u64, noun);
+            if kind != "people" && !authors.is_empty() {
+                let by = counted(authors.len() as u64, "person", "people");
+                detail += &format!(" by {by}");
+            }
+            let f = Finding::new(
+                CheckId::Comments,
+                kind,
+                ctx.place(part),
+                n as u64,
+                unit,
+                detail,
+            );
+            found.push(f.with_value(ctx.values, first.as_deref()));
         }
     }
     Ok(found)
