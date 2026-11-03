@@ -3,6 +3,7 @@
 //! relationships, decides the variant from the main part's type and checks that every XML part
 //! is well-formed within the XML limits.
 
+pub mod colour;
 pub mod common;
 pub mod excel;
 pub mod word;
@@ -42,8 +43,22 @@ pub mod ns {
 pub fn checks(format: Format) -> &'static [CheckId] {
     use CheckId::*;
     match format {
-        Format::Docx => &[Metadata, Comments, TrackedChanges, LeftoverData],
-        Format::Xlsx => &[Metadata, Comments, TrackedChanges, LeftoverData],
+        Format::Docx => &[
+            Metadata,
+            Comments,
+            TrackedChanges,
+            HiddenText,
+            FakeRedactions,
+            LeftoverData,
+        ],
+        Format::Xlsx => &[
+            Metadata,
+            Comments,
+            TrackedChanges,
+            HiddenText,
+            FakeRedactions,
+            LeftoverData,
+        ],
         Format::Pptx => &[Metadata, Comments, LeftoverData],
         Format::Pdf => &[],
     }
@@ -55,8 +70,14 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
     let mut found = common::metadata(&ctx)?;
     found.extend(common::comments(&ctx)?);
     match pkg.format {
-        Format::Docx => found.extend(word::tracked_changes(&ctx)?),
-        Format::Xlsx => found.extend(excel::shared_workbook_log(&ctx)?),
+        Format::Docx => {
+            found.extend(word::tracked_changes(&ctx)?);
+            found.extend(word::hidden_text(&ctx)?);
+        }
+        Format::Xlsx => {
+            found.extend(excel::shared_workbook_log(&ctx)?);
+            found.extend(excel::hidden_cells(&ctx)?);
+        }
         _ => {}
     }
     found.extend(common::leftover_data(pkg, values)?);

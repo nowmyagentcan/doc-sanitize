@@ -6,8 +6,22 @@ mod common;
 use common::*;
 
 /// The checks each format lists, in order.
-const DOCX_CHECKS: &[&str] = &["metadata", "comments", "tracked-changes", "leftover-data"];
-const XLSX_CHECKS: &[&str] = &["metadata", "comments", "tracked-changes", "leftover-data"];
+const DOCX_CHECKS: &[&str] = &[
+    "metadata",
+    "comments",
+    "tracked-changes",
+    "hidden-text",
+    "fake-redactions",
+    "leftover-data",
+];
+const XLSX_CHECKS: &[&str] = &[
+    "metadata",
+    "comments",
+    "tracked-changes",
+    "hidden-text",
+    "fake-redactions",
+    "leftover-data",
+];
 const PPTX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
 
 const VARIANTS: [&str; 14] = [
@@ -1138,4 +1152,224 @@ fn shared_workbook_logs_are_found() {
         ]
     );
     assert_eq!(values("shared.xlsx", &book), ["", "", "SECRET-log-2"]);
+}
+
+fn theme_xml() -> String {
+    "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\"><a:themeElements><a:clrScheme name=\"Office\"><a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1><a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1><a:dk2><a:srgbClr val=\"44546A\"/></a:dk2><a:lt2><a:srgbClr val=\"E7E6E6\"/></a:lt2><a:accent1><a:srgbClr val=\"4472C4\"/></a:accent1></a:clrScheme></a:themeElements></a:theme>".into()
+}
+
+const THEME_TYPE: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
+
+fn run(props: &str, text: &str) -> String {
+    format!("<w:r><w:rPr>{props}</w:rPr><w:t xml:space=\"preserve\">{text}</w:t></w:r>")
+}
+
+fn para(runs: &str) -> String {
+    format!("<w:p>{runs}</w:p>")
+}
+
+/// A document with text hidden every way Word allows, and text that only looks like it.
+fn hidden_docx() -> Vec<u8> {
+    let styles = format!(
+        "<w:styles xmlns:w=\"{W}\"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val=\"22\"/></w:rPr></w:rPrDefault></w:docDefaults>\
+         <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/></w:style>\
+         <w:style w:type=\"character\" w:styleId=\"Secret\"><w:rPr><w:vanish/></w:rPr></w:style>\
+         <w:style w:type=\"character\" w:styleId=\"Child\"><w:basedOn w:val=\"Secret\"/><w:rPr><w:b/></w:rPr></w:style></w:styles>"
+    );
+    let body = [
+        para(&run("", "Visible text")),
+        para(&(run("<w:vanish/>", "SECRET-hidden-1") + &run("", "shown"))),
+        para(&run("<w:rStyle w:val=\"Child\"/>", "SECRET-hidden-2")),
+        para(&run("<w:vanish w:val=\"0\"/>", "not hidden")),
+        "<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr></w:p>".into(),
+        para(&run("<w:sz w:val=\"1\"/>", "SECRET-tiny-1")),
+        para(&run("<w:color w:val=\"FFFFFF\"/>", "SECRET-white-1")),
+        para(&run("<w:color w:val=\"000000\" w:themeColor=\"background1\"/>", "SECRET-white-2")),
+        para(&run("<w:color w:val=\"000000\"/><w:highlight w:val=\"black\"/>", "SECRET-black-1")),
+        format!("<w:tbl><w:tr><w:tc><w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"000000\"/></w:tcPr>{}</w:tc></w:tr></w:tbl>", para(&run("<w:color w:val=\"111111\"/>", "SECRET-black-2"))),
+        para(&run("<w:color w:val=\"auto\"/><w:highlight w:val=\"black\"/>", "auto on black")),
+        para(&run("<w:color w:val=\"FFFFFF\"/><w:highlight w:val=\"darkBlue\"/>", "white on blue")),
+        para(&run("<w:color w:val=\"FFFFFF\"/><w:shd w:val=\"clear\" w:fill=\"auto\"/><w:highlight w:val=\"none\"/>", "SECRET-white-3")),
+    ]
+    .concat();
+    let header = format!(
+        "<w:hdr xmlns:w=\"{W}\">{}</w:hdr>",
+        para(&run("", "Header text"))
+    );
+    let wml = |t: &str| format!("{OX}.wordprocessingml.{t}+xml");
+    Pkg::new("docx")
+        .body(&doc_xml(&body))
+        .part(
+            "word/document.xml",
+            "rId1",
+            "styles",
+            "word/styles.xml",
+            &wml("styles"),
+            styles.as_bytes(),
+        )
+        .part(
+            "word/document.xml",
+            "rId2",
+            "theme",
+            "word/theme/theme1.xml",
+            THEME_TYPE,
+            theme_xml().as_bytes(),
+        )
+        .part(
+            "word/document.xml",
+            "rId3",
+            "header",
+            "word/header1.xml",
+            &wml("header"),
+            header.as_bytes(),
+        )
+        .zip()
+}
+
+#[test]
+fn hidden_and_same_colour_text_is_found_in_documents() {
+    let f = check_bytes("hidden.docx", &hidden_docx());
+    assert_eq!(
+        kinds(&f, "hidden-text"),
+        [
+            found(
+                "hidden_formatting",
+                "word/document.xml",
+                30,
+                "30 characters with hidden formatting"
+            ),
+            found(
+                "tiny",
+                "word/document.xml",
+                13,
+                "13 characters smaller than 1 pt"
+            ),
+            found(
+                "same_colour",
+                "word/document.xml",
+                42,
+                "42 characters coloured like their background"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "fake-redactions"),
+        [found(
+            "same_colour",
+            "word/document.xml",
+            28,
+            "28 characters coloured like the dark background behind them"
+        )]
+    );
+    assert_eq!(
+        values("hidden.docx", &hidden_docx()),
+        [
+            "SECRET-hidden-1",
+            "SECRET-tiny-1",
+            "SECRET-white-1",
+            "SECRET-black-1"
+        ]
+    );
+}
+
+fn styles_xml(body: &str) -> String {
+    format!("<styleSheet xmlns=\"{S}\">{body}</styleSheet>")
+}
+
+#[test]
+fn hidden_and_same_colour_cells_are_found() {
+    let styles = styles_xml(
+        "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\";;;\"/></numFmts>\
+         <fonts><font><sz val=\"11\"/></font><font><color rgb=\"FFFFFFFF\"/></font><font><color rgb=\"FF000000\"/></font><font><color theme=\"0\"/></font><font><color theme=\"1\" tint=\"0.5\"/></font></fonts>\
+         <fills><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF000000\"/></patternFill></fill></fills>\
+         <cellStyleXfs><xf numFmtId=\"164\" fontId=\"1\"/></cellStyleXfs>\
+         <cellXfs><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\"/><xf numFmtId=\"0\" fontId=\"2\" fillId=\"2\"/><xf numFmtId=\"0\" fontId=\"0\" fillId=\"2\"/><xf numFmtId=\"0\" fontId=\"3\" fillId=\"1\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\"/><xf numFmtId=\"0\" fontId=\"4\" fillId=\"0\"/></cellXfs>",
+    );
+    let sheet = sheet_xml(
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>visible</t></is></c></row>\
+         <row r=\"2\"><c r=\"B2\" s=\"1\" t=\"inlineStr\"><is><t>SECRET-cell-1</t></is></c></row>\
+         <row r=\"3\"><c r=\"C3\" s=\"2\" t=\"s\"><v>0</v></c></row>\
+         <row r=\"4\"><c r=\"C4\" s=\"5\"><v>7</v></c></row>\
+         <row r=\"5\"><c r=\"D5\" s=\"3\"><v>42</v></c></row>\
+         <row r=\"6\"><c r=\"D6\" s=\"4\"><v>43</v></c><c s=\"6\"><v>1</v></c><c r=\"G6\" s=\"7\"><v>2</v></c></row>\
+         <row r=\"8\"><c r=\"F8\" s=\"2\"/></row>",
+    );
+    let sst = format!("<sst xmlns=\"{S}\"><si><t>SECRET-cell-2</t></si></sst>");
+    let ss = |t: &str| format!("{OX}.spreadsheetml.{t}+xml");
+    let book = workbook(&[("Data", "visible", &sheet)])
+        .part(
+            "xl/workbook.xml",
+            "rId7",
+            "styles",
+            "xl/styles.xml",
+            &ss("styles"),
+            styles.as_bytes(),
+        )
+        .part(
+            "xl/workbook.xml",
+            "rId8",
+            "theme",
+            "xl/theme/theme1.xml",
+            THEME_TYPE,
+            theme_xml().as_bytes(),
+        )
+        .part(
+            "xl/workbook.xml",
+            "rId9",
+            "sharedStrings",
+            "xl/sharedStrings.xml",
+            &ss("sharedStrings"),
+            sst.as_bytes(),
+        )
+        .zip();
+    let f = check_bytes("cells.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "hidden-text"),
+        [
+            found(
+                "hidden_format",
+                "xl/worksheets/sheet1.xml",
+                1,
+                "1 cell with a number format that shows nothing"
+            ),
+            found(
+                "same_colour",
+                "xl/worksheets/sheet1.xml",
+                2,
+                "2 cells coloured like their fill"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "fake-redactions"),
+        [found(
+            "same_colour",
+            "xl/worksheets/sheet1.xml",
+            2,
+            "2 cells coloured like the dark fill behind them"
+        )]
+    );
+    let places: Vec<_> = f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["where"].clone())
+        .collect();
+    assert_eq!(
+        places,
+        [
+            serde_json::json!({ "part": "xl/worksheets/sheet1.xml", "sheet_index": 1, "sheet": "Data", "cells": "B2" }),
+            serde_json::json!({ "part": "xl/worksheets/sheet1.xml", "sheet_index": 1, "sheet": "Data", "cells": "C3:C4" }),
+            serde_json::json!({ "part": "xl/worksheets/sheet1.xml", "sheet_index": 1, "sheet": "Data", "cells": "D5:D6" }),
+        ]
+    );
+    assert_eq!(
+        values("cells.xlsx", &book),
+        ["SECRET-cell-1", "SECRET-cell-2", "42"]
+    );
+    let dir = dir("cells-text");
+    put(&dir, &[("cells.xlsx", &book)]);
+    assert!(stdout(&run_in(&dir, &["cells.xlsx"])).contains(
+        "  ✗ fake-redactions  sheet Data, D5:D6: 2 cells coloured like the dark fill behind them\n"
+    ));
 }

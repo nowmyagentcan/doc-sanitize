@@ -60,6 +60,8 @@ pub struct Reader<'a> {
     stack: Vec<(String, String)>,
     /// The element the last `Start` opened; it joins `stack` on the next event.
     opened: Option<(String, String)>,
+    /// The element the last `End` closed.
+    closed: Option<(String, String)>,
 }
 
 impl<'a> Reader<'a> {
@@ -75,6 +77,7 @@ impl<'a> Reader<'a> {
             root: false,
             stack: vec![],
             opened: None,
+            closed: None,
         }
     }
 
@@ -91,6 +94,7 @@ impl<'a> Reader<'a> {
         if let Some(open) = self.opened.take() {
             self.stack.push(open);
         }
+        self.closed = None;
         let event = match self.inner.read_event() {
             Ok(e) => e,
             Err(XmlError::Namespace(NamespaceError::TooManyBindings(_))) => {
@@ -120,7 +124,7 @@ impl<'a> Reader<'a> {
             }
             Event::End(_) => {
                 self.depth -= 1;
-                self.stack.pop();
+                self.closed = self.stack.pop();
             }
             Event::Text(t) if t.len() > MAX_VALUE => {
                 return Err(self.too_large("a text value", "32 MiB"));
@@ -209,6 +213,13 @@ impl<'a> Reader<'a> {
     /// The element around the current event, as (namespace, local name).
     pub fn parent(&self) -> Option<(&str, &str)> {
         self.stack.last().map(|(n, l)| (n.as_str(), l.as_str()))
+    }
+
+    /// Whether the current `End` closes `local` in namespace `ns`.
+    pub fn closes(&self, ns: &str, local: &str) -> bool {
+        self.closed
+            .as_ref()
+            .is_some_and(|(n, l)| n == ns && l == local)
     }
 
     /// Whether `e` is the element `local` in namespace `ns`.

@@ -9,7 +9,7 @@ use crate::report::{CheckId, Error, Finding, Format, Where, counted, plural, saf
 
 const SHARED_STRINGS: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml";
-const CELL_SHEETS: [&str; 2] = [
+pub const CELL_SHEETS: [&str; 2] = [
     "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
     "application/vnd.ms-excel.macrosheet+xml",
 ];
