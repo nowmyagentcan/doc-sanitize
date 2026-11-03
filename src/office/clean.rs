@@ -484,37 +484,36 @@ fn ids(root: &El) -> HashSet<String> {
     out
 }
 
-/// What clean can't remove yet: (format, check, kind or `*` for any).
-const NOT_YET: [(Format, CheckId, &str); 6] = [
-    (Format::Xlsx, CheckId::Macros, "macro_sheet"),
-    (Format::Xlsx, CheckId::HiddenText, "*"),
-    (Format::Xlsx, CheckId::FakeRedactions, "*"),
-    (Format::Xlsx, CheckId::ExternalLinks, "external_workbook"),
-    (Format::Xlsx, CheckId::ExternalLinks, "data_connection"),
-    (Format::Xlsx, CheckId::ExternalLinks, "folder_path"),
-];
-
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 11] = [
+const CLEANABLE: [CheckId; 14] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::TrackedChanges,
     CheckId::HiddenText,
     CheckId::FakeRedactions,
+    CheckId::HiddenSheets,
+    CheckId::HiddenRowsColumns,
     CheckId::EmbeddedFiles,
     CheckId::CustomData,
     CheckId::Macros,
     CheckId::ExternalLinks,
+    CheckId::PivotCaches,
     CheckId::LeftoverData,
     CheckId::Signatures,
 ];
 
 /// Why each check in `remove` can't be removed: (check, reason, hint).
 fn blocking(
-    format: Format,
+    ctx: &Ctx,
     found: &[Finding],
     remove: &[CheckId],
-) -> Vec<(CheckId, String, String)> {
+) -> Result<Vec<(CheckId, String, String)>, Error> {
+    let pkg = ctx.pkg;
+    let typed = |t: &str| {
+        pkg.parts
+            .iter()
+            .any(|p| pkg.content_type(p).is_some_and(|ct| ct.ends_with(t)))
+    };
     let mut out = vec![];
     for &c in remove {
         let kinds: Vec<&str> = found
@@ -522,35 +521,58 @@ fn blocking(
             .filter(|f| f.check == c)
             .map(|f| f.kind)
             .collect();
-        let not_yet = kinds.iter().any(|k| {
-            NOT_YET
-                .iter()
-                .any(|n| n.0 == format && n.1 == c && (n.2 == "*" || n.2 == *k))
-        });
-        if kinds.contains(&"imported_chunk") {
-            out.push((
-                c,
-                "it holds an imported document (w:altChunk)".into(),
-                "Open and save the file in Word, which turns the imported content into normal text, then run clean again; or use --keep embedded-files.".into(),
-            ));
-        } else if !kinds.is_empty() && (!CLEANABLE.contains(&c) || not_yet) {
-            out.push((
-                c,
-                "this version can't remove it yet".into(),
-                format!("Run clean again with --keep {}.", c.id()),
-            ));
+        if kinds.is_empty() {
+            continue;
+        }
+        let why = match c {
+            CheckId::EmbeddedFiles if kinds.contains(&"imported_chunk") => Some((
+                "it holds an imported document (w:altChunk)",
+                "Open and save the file in Word, which turns the imported content into normal text, then run clean again; or use --keep embedded-files.",
+            )),
+            CheckId::PivotCaches if typed(".slicer+xml") || typed(".slicerCache+xml") => Some((
+                "its pivot table has slicers",
+                "Remove the slicers in Excel, or run clean again with --keep pivot-caches.",
+            )),
+            CheckId::PivotCaches if typed(".timeline+xml") || typed(".timelineCache+xml") => {
+                Some((
+                    "its pivot table has timelines",
+                    "Remove the timelines in Excel, or run clean again with --keep pivot-caches.",
+                ))
+            }
+            CheckId::PivotCaches if kinds.contains(&"data_model") => Some((
+                "it has a data model",
+                "Remove the data model in Excel (Data › Manage Data Model), or run clean again with --keep pivot-caches.",
+            )),
+            CheckId::ExternalLinks
+                if !remove.contains(&CheckId::PivotCaches)
+                    && excel::caches_use_connections(ctx)? =>
+            {
+                Some((
+                    "a pivot cache that is kept reads one of its data connections",
+                    "Run clean again without --keep pivot-caches, or with --keep external-links.",
+                ))
+            }
+            _ if !CLEANABLE.contains(&c) => Some(("this version can't remove it yet", "")),
+            _ => None,
+        };
+        if let Some((reason, hint)) = why {
+            let hint = match hint {
+                "" => format!("Run clean again with --keep {}.", c.id()),
+                h => h.to_string(),
+            };
+            out.push((c, reason.to_string(), hint));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Removes the checks in `remove` from the package `pkg`, whose check found `found`.
 pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned, Error> {
-    let blocks = blocking(pkg.format, found, remove);
+    let ctx = Ctx::new(pkg, false)?;
+    let blocks = blocking(&ctx, found, remove)?;
     if !blocks.is_empty() {
         return Err(Error::cannot_clean(&blocks));
     }
-    let ctx = Ctx::new(pkg, false)?;
     let before: HashSet<String> = pkg.parts.iter().map(|p| key(p)).collect();
     let mut d = Draft::new(pkg)?;
     let has = |c: CheckId| remove.contains(&c) && found.iter().any(|f| f.check == c);
@@ -588,6 +610,9 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     }
     if has(CheckId::ExternalLinks) {
         external_links(&ctx, &mut d)?;
+    }
+    if d.format == Format::Xlsx {
+        workbook(&ctx, &mut d, &has, remove.contains(&CheckId::Comments))?;
     }
     if has(CheckId::Metadata) {
         metadata(&mut d)?;
@@ -685,7 +710,7 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             }
         }
         Format::Xlsx => {
-            for sheet in excel::cell_sheets(d) {
+            for sheet in excel::cell_sheets(d)? {
                 let mut shapes = HashSet::new();
                 if let Some(doc) = d.doc(&sheet)? {
                     doc.root.each(&mut |e| {
@@ -779,6 +804,183 @@ fn drop_vml_shapes(d: &mut Draft, sheet: &str, pick: impl Fn(&El) -> bool) -> Re
         }
     }
     Ok(())
+}
+
+/// The workbook's own steps: hidden and macro sheets deleted, cells cleared, pivot caches,
+/// linked workbooks and connections removed, then the values rule and the shared strings.
+fn workbook(
+    ctx: &Ctx,
+    d: &mut Draft,
+    has: &dyn Fn(CheckId) -> bool,
+    comments_gone: bool,
+) -> Result<(), Error> {
+    let mut deleted: Vec<String> = vec![];
+    for s in &ctx.sheets {
+        let macro_sheet = s.part.as_deref().is_some_and(|p| {
+            ctx.pkg
+                .content_type(p)
+                .is_some_and(|t| t.contains("macrosheet"))
+        });
+        if (has(CheckId::HiddenSheets) && s.state != "visible")
+            || (has(CheckId::Macros) && macro_sheet)
+        {
+            deleted.push(s.name.clone());
+        }
+    }
+    if !deleted.is_empty() {
+        excel::delete_sheets(d, &deleted)?;
+    }
+    let (hidden, dark, lines) = (
+        has(CheckId::HiddenText),
+        has(CheckId::FakeRedactions),
+        has(CheckId::HiddenRowsColumns),
+    );
+    let mut cleared = 0;
+    if hidden || dark || lines {
+        let clear = excel::Clear::new(ctx, lines, hidden, dark)?;
+        for sheet in excel::cell_sheets(d)? {
+            let mut refs = vec![];
+            d.edit(&sheet, |root| {
+                refs = excel::clear_cells(root, &clear);
+                Ok(!refs.is_empty())
+            })?;
+            cleared += refs.len();
+            if !comments_gone && !refs.is_empty() {
+                drop_cell_comments(d, &sheet, &refs)?;
+            }
+        }
+    }
+    if has(CheckId::PivotCaches) {
+        d.delete_linked("pivotTable")?;
+        let book = d.main.clone();
+        d.prune_linked(&book, |e| e.is(ns::S, "pivotCaches"))?;
+    }
+    let mut external = false;
+    if has(CheckId::ExternalLinks) {
+        let book = d.main.clone();
+        external = d.prune_linked(&book, |e| e.is(ns::S, "externalReferences"))? > 0;
+        let ac = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac";
+        d.prune_linked(&book, |e| e.is(ac, "absPath"))?;
+        if external {
+            d.edit(&book, |root| {
+                let linked = |e: &El| {
+                    e.is(ns::S, "definedName") && e.text().contains('[') && e.text().contains(']')
+                };
+                Ok(root.prune(&linked) > 0)
+            })?;
+        }
+        d.delete_linked("connections")?;
+        d.delete_linked("queryTable")?;
+        for part in d.xml_parts() {
+            if d.content_type(&part)
+                .is_some_and(|t| t.ends_with(".table+xml"))
+            {
+                d.edit(&part, |root| {
+                    let mut n = 0;
+                    root.each_mut(&mut |e| {
+                        n += e.drop_attrs(|a| {
+                            a.name == "queryTableFieldId"
+                                || (a.name == "tableType" && a.value == "queryTable")
+                        });
+                    });
+                    Ok(n > 0)
+                })?;
+            }
+        }
+    }
+    if !deleted.is_empty() || cleared > 0 || external {
+        values_rule(d, &deleted)?;
+    }
+    excel::rebuild_strings(d)
+}
+
+/// The values rule: every formula becomes its saved result and every chart literal.
+fn values_rule(d: &mut Draft, deleted: &[String]) -> Result<(), Error> {
+    let (mut replaced, mut empty, mut charts) = (0, 0, 0);
+    for sheet in excel::cell_sheets(d)? {
+        d.edit(&sheet, |root| {
+            let (r, e) = excel::to_values(root);
+            (replaced, empty) = (replaced + r, empty + e);
+            Ok(r + e > 0)
+        })?;
+    }
+    for part in d.names() {
+        if d.content_type(&part).as_deref() != Some(CHART_TYPE) {
+            continue;
+        }
+        let mut stuck = None;
+        let changed = d.edit(&part, |root| match excel::chart_to_values(root, deleted) {
+            Ok(changed) => Ok(changed),
+            Err(f) => {
+                stuck = Some(f);
+                Ok(false)
+            }
+        })?;
+        if stuck.is_some() {
+            return Err(Error::cannot_clean(&[(
+                CheckId::HiddenSheets,
+                format!("chart {} has multi-level labels from a deleted sheet", safe(&part)),
+                "Change the chart's labels to one level in Excel, or run clean again with --keep hidden-sheets.".into(),
+            )]));
+        }
+        charts += u64::from(changed);
+    }
+    d.delete_linked("calcChain")?;
+    if replaced > 0 {
+        let what = match replaced {
+            1 => "1 formula was replaced by its saved result.".to_string(),
+            n => format!("{n} formulas were replaced by their saved results."),
+        };
+        d.changes
+            .push(Change::counted("formulas_to_values", replaced, what));
+    }
+    if empty > 0 {
+        let what = match empty {
+            1 => "1 formula had no saved result and is now empty.".to_string(),
+            n => format!("{n} formulas had no saved result and are now empty."),
+        };
+        d.changes
+            .push(Change::counted("formulas_without_value", empty, what));
+    }
+    if charts > 0 {
+        let what = match charts {
+            1 => "1 chart now shows its saved values instead of linked cells.".to_string(),
+            n => format!("{n} charts now show their saved values instead of linked cells."),
+        };
+        d.changes
+            .push(Change::counted("charts_to_values", charts, what));
+    }
+    Ok(())
+}
+
+/// Kept notes and threaded comments on cleared cells go with the cells.
+fn drop_cell_comments(d: &mut Draft, sheet: &str, refs: &[String]) -> Result<(), Error> {
+    let on_cleared = |e: &El| {
+        e.attr("", "ref")
+            .is_some_and(|r| refs.iter().any(|c| c == r))
+    };
+    for l in d.links()? {
+        if key(&l.source) != key(sheet) || !matches!(l.rel.short(), "comments" | "threadedComment")
+        {
+            continue;
+        }
+        if let Some(part) = l.part {
+            d.edit(&part, |root| {
+                Ok(root.prune(&|e: &El| {
+                    (e.local() == "comment" || e.local() == "threadedComment") && on_cleared(e)
+                }) > 0)
+            })?;
+        }
+    }
+    let at = |e: &El, local: &str| {
+        e.child(VML_EXCEL, "ClientData")
+            .and_then(|c| c.child(VML_EXCEL, local))
+            .and_then(|v| v.text().trim().parse::<u32>().ok())
+    };
+    drop_vml_shapes(d, sheet, |e| match (at(e, "Row"), at(e, "Column")) {
+        (Some(r), Some(c)) => refs.contains(&format!("{}{}", excel::column(c + 1), r + 1)),
+        _ => false,
+    })
 }
 
 /// `external-links` in Word and PowerPoint files and in workbook drawings: the template and
@@ -889,7 +1091,7 @@ fn comments(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                 e.child(VML_EXCEL, "ClientData")
                     .is_some_and(|c| c.attr("", "ObjectType") == Some("Note"))
             };
-            for sheet in excel::cell_sheets(d) {
+            for sheet in excel::cell_sheets(d)? {
                 drop_vml_shapes(d, &sheet, note)?;
             }
         }

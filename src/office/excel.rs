@@ -8,7 +8,7 @@ use quick_xml::events::{BytesStart, Event};
 use super::clean::Draft;
 use super::colour::{self, Rgb, Theme};
 use super::common::{CELL_SHEETS, targets};
-use super::tree::{El, Node};
+use super::tree::{Attr, El, Node};
 use super::xml::{self, Reader};
 use super::{Ctx, ns};
 use crate::report::{CheckId, Error, Finding, Where, counted, plural};
@@ -234,7 +234,7 @@ fn cell_ref(r: &str) -> Option<(u32, u32)> {
 }
 
 /// A column's letters: 1 → `A`, 27 → `AA`.
-fn column(mut col: u32) -> String {
+pub fn column(mut col: u32) -> String {
     let mut out = vec![];
     while col > 0 {
         col -= 1;
@@ -567,16 +567,16 @@ pub fn pivot_caches(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     Ok(found)
 }
 
-/// The cell sheets of the copy (worksheets and macro sheets).
-pub fn cell_sheets(d: &Draft) -> Vec<String> {
-    let names = d.names();
-    names
-        .into_iter()
-        .filter(|n| {
-            d.content_type(n)
+/// The cell sheets the copy still reaches (worksheets and macro sheets).
+pub fn cell_sheets(d: &Draft) -> Result<Vec<String>, Error> {
+    let reached = d.reachable()?;
+    let mut names = d.names();
+    names.retain(|n| {
+        reached.contains(&super::key(n))
+            && d.content_type(n)
                 .is_some_and(|t| CELL_SHEETS.contains(&t.as_str()))
-        })
-        .collect()
+    });
+    Ok(names)
 }
 
 /// The shared-string index a cell holds, when it holds one.
@@ -590,7 +590,7 @@ fn shared_index(c: &El) -> Option<usize> {
 /// Rebuilds the shared strings of the copy with only the strings some cell uses, renumbering
 /// the cells that use them.
 pub fn rebuild_strings(d: &mut Draft) -> Result<(), Error> {
-    let sheets = cell_sheets(d);
+    let sheets = cell_sheets(d)?;
     for sst in d
         .linked("sharedStrings")?
         .into_iter()
@@ -645,6 +645,341 @@ pub fn rebuild_strings(d: &mut Draft) -> Result<(), Error> {
                 Ok(changed)
             })?;
         }
+    }
+    Ok(())
+}
+
+/// Whether a pivot cache reads its source through a data connection.
+pub fn caches_use_connections(ctx: &Ctx) -> Result<bool, Error> {
+    let mut used = false;
+    for def in targets(ctx.pkg, "pivotCacheDefinition") {
+        ctx.pkg.walk(def, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev
+                && r.is(e, ns::S, "cacheSource")
+            {
+                used |= r.attr(e, "connectionId")?.is_some();
+            }
+            Ok(())
+        })?;
+    }
+    Ok(used)
+}
+
+/// Which cells clean clears: those in hidden rows and columns (`lines`), and those whose
+/// style falls under a [`CELL_KINDS`] entry that is picked.
+pub struct Clear {
+    lines: bool,
+    kinds: [bool; 3],
+    styles: Vec<Option<usize>>,
+}
+
+impl Clear {
+    /// `hidden` picks the hidden-text kinds, `dark` the fake-redactions one.
+    pub fn new(ctx: &Ctx, lines: bool, hidden: bool, dark: bool) -> Result<Self, Error> {
+        Ok(Self {
+            lines,
+            kinds: [hidden, hidden, dark],
+            styles: cell_styles(ctx)?,
+        })
+    }
+
+    fn style_clears(&self, style: usize) -> bool {
+        matches!(self.styles.get(style), Some(&Some(k)) if self.kinds[k])
+    }
+}
+
+/// A1 range bounds: (first column, first row, last column, last row).
+fn range(r: &str) -> Option<(u32, u32, u32, u32)> {
+    let (a, b) = r.split_once(':').unwrap_or((r, r));
+    let ((c0, r0), (c1, r1)) = (cell_ref(a)?, cell_ref(b)?);
+    Some((c0.min(c1), r0.min(r1), c0.max(c1), r0.max(r1)))
+}
+
+/// Clears the cells `clear` picks in a sheet: their value, formula, inline text and type go,
+/// their reference and style stay; in a merged range the top-left cell decides. Gives the
+/// references of the cleared cells that held something.
+pub fn clear_cells(root: &mut El, clear: &Clear) -> Vec<String> {
+    let mut hidden_cols: Vec<(u32, u32)> = vec![];
+    if clear.lines {
+        for col in root.child(ns::S, "cols").into_iter().flat_map(El::els) {
+            let num = |a| col.attr("", a).and_then(|v| v.parse::<f64>().ok());
+            if xml::yes(col.attr("", "hidden").map(Cow::from))
+                || num("width").is_some_and(|w| w < 0.1)
+            {
+                let (lo, hi) = (num("min").unwrap_or(0.0), num("max").unwrap_or(0.0));
+                hidden_cols.push((lo as u32, hi as u32));
+            }
+        }
+    }
+    let merges: Vec<(u32, u32, u32, u32)> = root
+        .child(ns::S, "mergeCells")
+        .into_iter()
+        .flat_map(El::els)
+        .filter_map(|m| m.attr("", "ref").and_then(range))
+        .collect();
+    // Each cell's decision, then the top-left cell's for the rest of its merged range.
+    let mut decided: HashMap<(u32, u32), bool> = HashMap::new();
+    let Some(data) = root.child_mut(ns::S, "sheetData") else {
+        return vec![];
+    };
+    let mut row_n = 0;
+    for row in data.els_mut().filter(|r| r.is(ns::S, "row")) {
+        row_n = row
+            .attr("", "r")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(row_n + 1);
+        let low = xml::yes(row.attr("", "customHeight").map(Cow::from))
+            && row
+                .attr("", "ht")
+                .and_then(|h| h.parse::<f64>().ok())
+                .is_some_and(|h| h < 0.5);
+        let row_hidden = clear.lines && (xml::yes(row.attr("", "hidden").map(Cow::from)) || low);
+        let mut col_n = 0;
+        for c in row.els_mut().filter(|c| c.is(ns::S, "c")) {
+            let at = c
+                .attr("", "r")
+                .and_then(cell_ref)
+                .unwrap_or((col_n + 1, row_n));
+            col_n = at.0;
+            let style = c.attr("", "s").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let hidden = row_hidden
+                || hidden_cols
+                    .iter()
+                    .any(|&(lo, hi)| (lo..=hi).contains(&at.0));
+            decided.insert(at, hidden || clear.style_clears(style));
+        }
+    }
+    let decides = |(col, row): (u32, u32)| {
+        let top = merges
+            .iter()
+            .find(|&&(c0, r0, c1, r1)| (c0..=c1).contains(&col) && (r0..=r1).contains(&row));
+        let at = top.map_or((col, row), |m| (m.0, m.1));
+        decided.get(&at).copied().unwrap_or(false)
+    };
+    let mut cleared = vec![];
+    let mut row_n = 0;
+    for row in data.els_mut().filter(|r| r.is(ns::S, "row")) {
+        row_n = row
+            .attr("", "r")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(row_n + 1);
+        let mut col_n = 0;
+        for c in row.els_mut().filter(|c| c.is(ns::S, "c")) {
+            let at = c
+                .attr("", "r")
+                .and_then(cell_ref)
+                .unwrap_or((col_n + 1, row_n));
+            col_n = at.0;
+            if decides(at) && c.els().next().is_some() {
+                c.kids.clear();
+                c.drop_attrs(|a| a.name == "t" || a.name == "cm" || a.name == "vm");
+                cleared.push(format!("{}{}", column(at.0), at.1));
+            }
+        }
+    }
+    cleared
+}
+
+/// The values rule in one sheet: every formula goes and its saved result stays (a string
+/// result becomes inline text); a formula with no saved result leaves the cell empty. Gives
+/// (formulas replaced, formulas without a value).
+pub fn to_values(root: &mut El) -> (u64, u64) {
+    let (mut replaced, mut empty) = (0, 0);
+    let Some(data) = root.child_mut(ns::S, "sheetData") else {
+        return (0, 0);
+    };
+    for row in data.els_mut() {
+        for c in row.els_mut().filter(|c| c.is(ns::S, "c")) {
+            if c.child(ns::S, "f").is_none() {
+                continue;
+            }
+            c.kids
+                .retain(|k| !matches!(k, Node::El(e) if e.is(ns::S, "f")));
+            let Some(v) = c.child(ns::S, "v").map(El::text) else {
+                empty += 1;
+                c.kids.clear();
+                c.drop_attrs(|a| a.name == "t");
+                continue;
+            };
+            replaced += 1;
+            if c.attr("", "t") == Some("str") {
+                c.set("", "t", "inlineStr");
+                let mut t = El::like(c, "t");
+                if v.trim() != v {
+                    t.attrs.push(Attr {
+                        name: "xml:space".into(),
+                        ns: "http://www.w3.org/XML/1998/namespace".into(),
+                        value: "preserve".into(),
+                    });
+                }
+                t.kids.push(Node::Text(v));
+                let mut is = El::like(c, "is");
+                is.kids.push(Node::El(t));
+                c.kids = vec![Node::El(is)];
+            }
+        }
+    }
+    (replaced, empty)
+}
+
+const CHART: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+
+/// Whether a formula names one of the sheets `names` (`Name!` or `'Name'!`, any case).
+pub fn names_sheet(formula: &str, names: &[String]) -> bool {
+    let f = formula.to_lowercase();
+    names.iter().any(|n| {
+        let n = n.to_lowercase();
+        f.contains(&format!("{n}!")) || f.contains(&format!("'{}'!", n.replace('\'', "''")))
+    })
+}
+
+/// A chart made literal: each cell reference becomes the values cached beside it, series
+/// names their cached text, and pivot charts lose their pivot source. Gives whether it
+/// changed, or the formula of a multi-level reference to a deleted sheet, which can't be
+/// made literal.
+pub fn chart_to_values(root: &mut El, deleted: &[String]) -> Result<bool, String> {
+    let mut stuck = None;
+    root.each(&mut |e| {
+        if e.is(CHART, "multiLvlStrRef")
+            && let Some(f) = e.child(CHART, "f").map(El::text)
+            && names_sheet(&f, deleted)
+        {
+            stuck.get_or_insert(f);
+        }
+    });
+    if let Some(f) = stuck {
+        return Err(f);
+    }
+    let mut n = root.prune(&|e: &El| {
+        e.is(CHART, "pivotSource") || e.is(CHART, "pivotFmts") || e.is(CHART, "fmtId")
+    });
+    root.each_mut(&mut |e| {
+        // A series name from a cell becomes its cached text.
+        if e.is(CHART, "tx")
+            && let Some(r) = e.child(CHART, "strRef")
+        {
+            let text = r
+                .child(CHART, "strCache")
+                .and_then(|c| c.child(CHART, "pt"))
+                .and_then(|p| p.child(CHART, "v"))
+                .map(El::text)
+                .unwrap_or_default();
+            let mut v = El::like(r, "v");
+            v.kids.push(Node::Text(text));
+            e.kids = vec![Node::El(v)];
+            n += 1;
+        }
+        for (reference, cache, literal) in [
+            ("numRef", "numCache", "numLit"),
+            ("strRef", "strCache", "strLit"),
+        ] {
+            for k in e.els_mut().filter(|k| k.is(CHART, reference)) {
+                let data = k
+                    .child(CHART, cache)
+                    .map(|c| c.kids.clone())
+                    .unwrap_or_default();
+                *k = El {
+                    kids: data,
+                    ..El::like(k, literal)
+                };
+                n += 1;
+            }
+        }
+    });
+    Ok(n > 0)
+}
+
+/// The sheets `names` deleted from the workbook: their `<sheet>` entries (the sweep takes the
+/// parts), defined names on or naming them (higher `localSheetId`s move down), the active and
+/// first tab kept on a remaining visible sheet, and the conditional formats and validations
+/// of other sheets that name them.
+pub fn delete_sheets(d: &mut Draft, names: &[String]) -> Result<(), Error> {
+    let book = d.main.clone();
+    let mut gone_ids = vec![];
+    d.edit(&book, |root| {
+        let Some(sheets) = root.child(ns::S, "sheets") else {
+            return Ok(false);
+        };
+        let list: Vec<(String, bool)> = sheets
+            .els()
+            .map(|s| {
+                let name = s.attr("", "name").unwrap_or_default().to_string();
+                let visible = s.attr("", "state").is_none_or(|v| v == "visible");
+                (name, visible)
+            })
+            .collect();
+        let gone: Vec<usize> = (0..list.len())
+            .filter(|&i| names.contains(&list[i].0))
+            .collect();
+        // The new index of each old one, None when deleted.
+        let mut next = 0;
+        let new: Vec<Option<usize>> = (0..list.len())
+            .map(|i| {
+                (!gone.contains(&i)).then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect();
+        let first_visible = (0..list.len())
+            .find(|&i| list[i].1 && new[i].is_some())
+            .and_then(|i| new[i])
+            .unwrap_or(0);
+        if let Some(sheets) = root.child_mut(ns::S, "sheets") {
+            let mut i = 0;
+            sheets.kids.retain(|k| {
+                let Node::El(s) = k else { return true };
+                i += 1;
+                if gone.contains(&(i - 1)) {
+                    gone_ids.extend(s.attr(ns::R, "id").map(String::from));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if let Some(defined) = root.child_mut(ns::S, "definedNames") {
+            defined.kids.retain_mut(|k| {
+                let Node::El(n) = k else { return true };
+                let local: Option<usize> = n.attr("", "localSheetId").and_then(|v| v.parse().ok());
+                match local.map(|l| new.get(l).copied().flatten()) {
+                    Some(None) => return false,
+                    Some(Some(l)) => n.set("", "localSheetId", &l.to_string()),
+                    None => {}
+                }
+                !names_sheet(&n.text(), names)
+            });
+        }
+        root.prune(&|e: &El| e.is(ns::S, "definedNames") && e.els().next().is_none());
+        for view in root
+            .child_mut(ns::S, "bookViews")
+            .into_iter()
+            .flat_map(El::els_mut)
+        {
+            for a in ["activeTab", "firstSheet"] {
+                if let Some(old) = view.attr("", a).and_then(|v| v.parse::<usize>().ok()) {
+                    let at = new
+                        .get(old)
+                        .copied()
+                        .flatten()
+                        .filter(|&n| list[old].1 || n == first_visible);
+                    view.set("", a, &at.unwrap_or(first_visible).to_string());
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    for id in gone_ids {
+        d.unlink(&book, &id)?;
+    }
+    d.delete_linked("calcChain")?;
+    for sheet in cell_sheets(d)? {
+        d.edit(&sheet, |root| {
+            Ok(root.prune(&|e: &El| {
+                (e.local() == "conditionalFormatting" || e.local() == "dataValidation")
+                    && names_sheet(&e.text(), names)
+            }) > 0)
+        })?;
     }
     Ok(())
 }

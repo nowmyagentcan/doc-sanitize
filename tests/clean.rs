@@ -770,3 +770,211 @@ fn slide_objects_become_their_pictures_and_charts_lose_workbooks() {
     let chart = String::from_utf8(part_of(&copy, "ppt/charts/chart1.xml")).unwrap();
     assert!(!chart.contains("externalData"), "{chart}");
 }
+
+#[test]
+fn hidden_sheets_and_cells_go_and_the_workbook_keeps_its_values() {
+    for (name, ext) in [("a.xlsx", "xlsx"), ("a.xlsm", "xlsx")] {
+        let dir = dir("clean-book");
+        put(&dir, &[(name, &leaky_xlsx(&name[2..]))]);
+        let out = run_in(
+            &dir,
+            &[
+                "clean",
+                name,
+                "--keep",
+                "image-metadata,cropped-images",
+                "--json",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+        let f = &json(&out)["files"][0];
+        let codes: Vec<_> = f["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["code"].clone())
+            .collect();
+        let mut want = vec!["formulas_to_values", "charts_to_values"];
+        if name.ends_with('m') {
+            want.insert(0, "extension_changed");
+        }
+        assert_eq!(codes, want, "{name}");
+        let copy = dir.join(format!("a.clean.{ext}"));
+        assert!(
+            copy_secrets(&copy).is_empty(),
+            "{name}: {:?}",
+            copy_secrets(&copy)
+        );
+        let book = String::from_utf8(part_of(&copy, "xl/workbook.xml")).unwrap();
+        assert!(
+            book.contains("<sheets><sheet name=\"Summary\" sheetId=\"1\" r:id=\"rId1\"/></sheets>"),
+            "{book}"
+        );
+        let sheet = String::from_utf8(part_of(&copy, "xl/worksheets/sheet1.xml")).unwrap();
+        assert!(
+            sheet.contains("<row r=\"1\"><c r=\"A1\" t=\"s\"><v>0</v></c><c r=\"B1\"><v>6</v></c><c r=\"D1\"/></row><row r=\"2\"><c r=\"A2\" s=\"1\"/><c r=\"B2\" s=\"2\"/><c r=\"C2\" s=\"3\"/>"),
+            "{sheet}"
+        );
+        assert!(
+            sheet.contains("<row r=\"5\" hidden=\"1\"><c r=\"A5\"/></row>"),
+            "rows stay hidden"
+        );
+        let chart = String::from_utf8(part_of(&copy, "xl/charts/chart1.xml")).unwrap();
+        assert!(
+            chart.contains("<c:val><c:numLit><c:ptCount val=\"3\"/>") && !chart.contains("c:f"),
+            "{chart}"
+        );
+    }
+}
+
+/// A workbook with a visible and a hidden sheet, names, views and formats that point at the
+/// hidden one, a formula with no saved value, a string result and a merged range.
+fn names_xlsx(chart_ref: &str) -> Vec<u8> {
+    let visible = format!(
+        "<worksheet xmlns=\"{S}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>Secret!A1*2</f></c><c r=\"B1\" t=\"str\"><f>\"x \"&amp;Secret!B1</f><v>x  y</v></c><c r=\"C1\"><v>3</v></c><c r=\"D1\"><v>4</v></c></row></sheetData><mergeCells count=\"1\"><mergeCell ref=\"C1:D1\"/></mergeCells><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>Secret!A1&gt;1</formula></cfRule></conditionalFormatting><conditionalFormatting sqref=\"C1\"><cfRule type=\"expression\" priority=\"2\"><formula>C1&gt;1</formula></cfRule></conditionalFormatting></worksheet>"
+    );
+    let book = format!(
+        "<workbook xmlns=\"{S}\" xmlns:r=\"{R}\"><bookViews><workbookView firstSheet=\"1\" activeTab=\"1\"/></bookViews><sheets><sheet name=\"Secret\" sheetId=\"1\" state=\"hidden\" r:id=\"rId1\"/><sheet name=\"Shown\" sheetId=\"2\" r:id=\"rId2\"/></sheets><definedNames><definedName name=\"a\" localSheetId=\"0\">Secret!$A$1</definedName><definedName name=\"b\">'secret'!$A$1</definedName><definedName name=\"c\" localSheetId=\"1\">Shown!$C$1</definedName></definedNames></workbook>"
+    );
+    let chart = format!(
+        "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:f>Shown!$A$1</c:f><c:strCache><c:pt idx=\"0\"><c:v>Total</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat>{chart_ref}</c:cat></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
+    );
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/><xdr:ext cx=\"9\" cy=\"9\"/><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"rId1\"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:absoluteAnchor></xdr:wsDr>";
+    let sml = "application/vnd.openxmlformats-officedocument";
+    Pkg::new("xlsx")
+        .body(&book)
+        .part(
+            "xl/workbook.xml",
+            "rId1",
+            "worksheet",
+            "xl/worksheets/sheet1.xml",
+            SHEET_TYPE,
+            sheet_xml("<row r=\"1\"><c r=\"A1\"><v>SECRET-names-1</v></c></row>").as_bytes(),
+        )
+        .part(
+            "xl/workbook.xml",
+            "rId2",
+            "worksheet",
+            "xl/worksheets/sheet2.xml",
+            SHEET_TYPE,
+            visible.as_bytes(),
+        )
+        .part(
+            "xl/worksheets/sheet2.xml",
+            "rId1",
+            "drawing",
+            "xl/drawings/drawing1.xml",
+            &format!("{sml}.drawing+xml"),
+            drawing.as_bytes(),
+        )
+        .part(
+            "xl/drawings/drawing1.xml",
+            "rId1",
+            "chart",
+            "xl/charts/chart1.xml",
+            &format!("{sml}.drawingml.chart+xml"),
+            chart.as_bytes(),
+        )
+        .zip()
+}
+
+#[test]
+fn deleting_a_sheet_fixes_names_views_formats_and_formulas() {
+    let dir = dir("clean-names");
+    put(
+        &dir,
+        &[(
+            "a.xlsx",
+            &names_xlsx(
+                "<c:numRef><c:f>Shown!$C$1</c:f><c:numCache><c:pt idx=\"0\"><c:v>3</c:v></c:pt></c:numCache></c:numRef>",
+            ),
+        )],
+    );
+    let out = run_in(&dir, &["clean", "a.xlsx"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "a.xlsx → a.clean.xlsx\n  removed  hidden-sheets (1 sheet)\n  changed  1 formula was replaced by its saved result.\n           1 formula had no saved result and is now empty.\n           1 chart now shows its saved values instead of linked cells.\n  ✓ re-checked: 17 checks, nothing left\n"
+    );
+    let copy = dir.join("a.clean.xlsx");
+    assert!(copy_secrets(&copy).is_empty());
+    let book = String::from_utf8(part_of(&copy, "xl/workbook.xml")).unwrap();
+    assert!(
+        book.contains("<workbookView firstSheet=\"0\" activeTab=\"0\"/>"),
+        "{book}"
+    );
+    assert!(book.contains("<definedNames><definedName name=\"c\" localSheetId=\"0\">Shown!$C$1</definedName></definedNames>"), "{book}");
+    let sheet = String::from_utf8(part_of(&copy, "xl/worksheets/sheet2.xml")).unwrap();
+    assert!(
+        sheet.contains("<row r=\"1\"><c r=\"A1\"/><c r=\"B1\" t=\"inlineStr\"><is><t>x  y</t></is></c><c r=\"C1\"><v>3</v></c>"),
+        "{sheet}"
+    );
+    assert!(
+        !sheet.contains("Secret!") && sheet.contains("C1&gt;1"),
+        "{sheet}"
+    );
+    let chart = String::from_utf8(part_of(&copy, "xl/charts/chart1.xml")).unwrap();
+    assert!(
+        chart.contains("<c:tx><c:v>Total</c:v></c:tx><c:cat><c:numLit><c:pt idx=\"0\"><c:v>3</c:v></c:pt></c:numLit></c:cat>"),
+        "{chart}"
+    );
+}
+
+#[test]
+fn a_multi_level_label_from_a_deleted_sheet_leaves_no_file() {
+    let dir = dir("clean-multi");
+    put(
+        &dir,
+        &[(
+            "a.xlsx",
+            &names_xlsx("<c:multiLvlStrRef><c:f>Secret!$A$1:$B$2</c:f></c:multiLvlStrRef>"),
+        )],
+    );
+    let out = run_in(&dir, &["clean", "a.xlsx"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "✗ Can't remove hidden-sheets from a.xlsx: chart xl/charts/chart1.xml has multi-level labels from a deleted sheet.\n  Change the chart's labels to one level in Excel, or run clean again with --keep hidden-sheets.\n"
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+}
+
+#[test]
+fn slicers_stop_the_pivot_cache_clean() {
+    let ss = "application/vnd.openxmlformats-officedocument.spreadsheetml";
+    let ms = "http://schemas.microsoft.com/office";
+    let book = format!(
+        "<workbook xmlns=\"{S}\" xmlns:r=\"{R}\"><sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets><pivotCaches><pivotCache cacheId=\"1\" r:id=\"rId2\"/></pivotCaches></workbook>"
+    );
+    let bytes = Pkg::new("xlsx")
+        .body(&book)
+        .part("xl/workbook.xml", "rId1", "worksheet", "xl/worksheets/sheet1.xml", SHEET_TYPE, sheet_xml("").as_bytes())
+        .part("xl/workbook.xml", "rId2", "pivotCacheDefinition", "xl/pivotCache/pivotCacheDefinition1.xml", &format!("{ss}.pivotCacheDefinition+xml"), format!("<pivotCacheDefinition xmlns=\"{S}\" recordCount=\"0\"/>").as_bytes())
+        .part("xl/workbook.xml", "rId3", &format!("{ms}/2007/relationships/slicerCache"), "xl/slicerCaches/slicerCache1.xml", "application/vnd.ms-excel.slicerCache+xml", b"<slicerCacheDefinition xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" name=\"S\" sourceName=\"N\"/>")
+        .zip();
+    let dir = dir("clean-slicers");
+    put(&dir, &[("a.xlsx", &bytes)]);
+    let out = run_in(&dir, &["clean", "a.xlsx"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "✗ Can't remove pivot-caches from a.xlsx: its pivot table has slicers.\n  Remove the slicers in Excel, or run clean again with --keep pivot-caches.\n"
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let out = run_in(&dir, &["clean", "a.xlsx", "--keep", "pivot-caches"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn kept_comments_on_cleared_cells_go_with_them() {
+    let dir = dir("clean-kept-notes");
+    put(&dir, &[("a.xlsx", &leaky_xlsx("xlsx"))]);
+    let keep = "comments,image-metadata,cropped-images";
+    let out = run_in(&dir, &["clean", "a.xlsx", "--keep", keep]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // The note on A1 stays: A1 keeps its value.
+    let left: Vec<_> = copy_secrets(&dir.join("a.clean.xlsx"))
+        .into_iter()
+        .collect();
+    assert_eq!(left, ["SECRET-xlsx-note-1", "SECRET-xlsx-thread-1"]);
+}
