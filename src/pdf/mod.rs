@@ -3,6 +3,7 @@
 mod bytes;
 pub mod clean;
 mod layers;
+mod raster;
 mod visible;
 
 use std::collections::HashSet;

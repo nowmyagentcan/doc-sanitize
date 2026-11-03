@@ -98,6 +98,14 @@ fn other_security_handlers_are_named() {
     }
 }
 
+/// A cross-reference section whose /Prev points at itself.
+fn prev_loop() -> Vec<u8> {
+    let objects = raw_page("");
+    let bytes = String::from_utf8(raw(&objects, "/Root 1 0 R")).unwrap();
+    let xref = bytes.rsplit("startxref\n").next().unwrap().lines().next();
+    raw(&objects, &format!("/Root 1 0 R /Prev {}", xref.unwrap()))
+}
+
 #[test]
 fn broken_structure_is_damaged_without_hanging() {
     // The page tree loops back to its root.
@@ -116,17 +124,12 @@ fn broken_structure_is_damaged_without_hanging() {
     let f = check_pdf("deep_array.pdf", &deep_array(), &[]);
     assert_eq!(f["error"]["code"], "damaged", "{f}");
 
-    // /Prev points at the same cross-reference section.
-    let objects = raw_page("");
-    let bytes = String::from_utf8(raw(&objects, "/Root 1 0 R")).unwrap();
-    let xref = bytes.rsplit("startxref\n").next().unwrap().lines().next();
-    let looped = raw(&objects, &format!("/Root 1 0 R /Prev {}", xref.unwrap()));
-    let f = check_pdf("prev_loop.pdf", &looped, &[]);
+    let f = check_pdf("prev_loop.pdf", &prev_loop(), &[]);
     assert_eq!(f["error"], serde_json::Value::Null, "{f}");
 }
 
-#[test]
-fn object_streams_that_list_themselves_are_read_or_refused() {
+/// An object stream that lists itself.
+fn objstm_self() -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let objstm = stream_body("/Type /ObjStm /N 2 /First 8", b"4 0 5 3 <<>> null");
     let at = write_objects(
@@ -154,15 +157,20 @@ fn object_streams_that_list_themselves_are_read_or_refused() {
     ];
     write_objects(&mut out, &[(6, xref_stream(&entries, "/Root 1 0 R"))]);
     out.extend(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
-    let f = check_pdf("objstm_self.pdf", &out, &[]);
+    out
+}
+
+#[test]
+fn object_streams_that_list_themselves_are_read_or_refused() {
+    let f = check_pdf("objstm_self.pdf", &objstm_self(), &[]);
     assert!(
         f["error"].is_null() || f["error"]["code"] == "damaged",
         "{f}"
     );
 }
 
-#[test]
-fn an_object_only_in_the_hybrid_stream_is_read() {
+/// A page's content listed only in the /XRefStm of a hybrid file.
+fn hybrid_xref() -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let content = stream_body("", text_at(72, 720, "Hybrid").as_bytes());
     let at = write_objects(
@@ -192,7 +200,12 @@ fn an_object_only_in_the_hybrid_stream_is_read() {
         )
         .as_bytes(),
     );
-    let f = check_pdf("hybrid_xref.pdf", &out, &[]);
+    out
+}
+
+#[test]
+fn an_object_only_in_the_hybrid_stream_is_read() {
+    let f = check_pdf("hybrid_xref.pdf", &hybrid_xref(), &[]);
     assert_eq!(f["error"], serde_json::Value::Null, "{f}");
 }
 
@@ -208,20 +221,25 @@ fn a_stream_that_inflates_past_256_mib_is_too_large() {
     );
 }
 
+/// A page stream with a /Length off by `delta`.
+fn bad_length(delta: i64) -> Vec<u8> {
+    let content = text_at(72, 720, "Lengthy");
+    let mut objects = raw_page("/Contents 4 0 R");
+    let mut body = stream_body("", content.as_bytes());
+    let real = format!("/Length {}", content.len());
+    let wrong = format!("/Length {}", content.len() as i64 + delta);
+    body = String::from_utf8(body)
+        .unwrap()
+        .replace(&real, &wrong)
+        .into();
+    objects.push((4, body));
+    raw(&objects, "/Root 1 0 R")
+}
+
 #[test]
 fn a_wrong_stream_length_is_read_and_may_be_repaired() {
     for delta in [-100i64, 100] {
-        let content = text_at(72, 720, "Lengthy");
-        let mut objects = raw_page("/Contents 4 0 R");
-        let mut body = stream_body("", content.as_bytes());
-        let real = format!("/Length {}", content.len());
-        let wrong = format!("/Length {}", content.len() as i64 + delta);
-        body = String::from_utf8(body)
-            .unwrap()
-            .replace(&real, &wrong)
-            .into();
-        objects.push((4, body));
-        let f = check_pdf("bad_length.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+        let f = check_pdf("bad_length.pdf", &bad_length(delta), &[]);
         assert_eq!(f["error"], serde_json::Value::Null, "{delta}: {f}");
         for w in f["warnings"].as_array().unwrap() {
             assert_eq!(w["code"], "repaired");
@@ -784,6 +802,15 @@ fn book_300_timing() {
     println!("book-300.pdf check: {:.1} s", start.elapsed().as_secs_f64());
     let f = &json(&out)["files"][0];
     assert_eq!(hidden_kinds(f).len(), 10, "{f}");
+    let start = Instant::now();
+    let out = run_in(&dir, &["clean", "book-300.pdf", "--json"]);
+    println!("book-300.pdf clean: {:.1} s", start.elapsed().as_secs_f64());
+    let f = &json(&out)["files"][0];
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let copy = std::fs::metadata(dir.join("book-300.clean.pdf"))
+        .unwrap()
+        .len();
+    println!("{} bytes in, {copy} bytes out", book.len());
 }
 
 const WORDS: &str = "Some words to check";
@@ -836,27 +863,22 @@ fn unknown_filter() -> Vec<u8> {
     raw(&objects, "/Root 1 0 R")
 }
 
-/// Writes the PDF fixtures into `DOC_SANITIZE_OUT`, for measuring and comparing outside the
-/// tests.
+/// Writes the PDF fixtures, and each readable one's cleaned copy as `clean-<name>`, into
+/// `DOC_SANITIZE_OUT`, for measuring and for validators outside the tests.
 #[test]
 #[ignore = "writes files: run with --ignored and DOC_SANITIZE_OUT set"]
 fn write_pdf_fixtures() {
     let out = std::path::PathBuf::from(std::env::var_os("DOC_SANITIZE_OUT").unwrap());
-    let (rgb, size) = scan_of_text();
-    let files: [(&str, Vec<u8>); 11] = [
-        ("redacted.pdf", redacted()),
-        ("leaky.pdf", leaky_structure()),
-        ("plain.pdf", plain_structure()),
-        ("incremental.pdf", incremental()),
-        ("layers.pdf", layered(false)),
-        ("abbyy_style.pdf", scanned(false, &[200; 3], (1, 1))),
-        ("ocr_scan.pdf", scanned(true, &rgb, size)),
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, bytes) in readable_pdfs() {
+        let (_, copy) = clean_pdf(name, &bytes, &[]);
+        std::fs::write(out.join(format!("clean-{name}")), copy).unwrap();
+        std::fs::write(out.join(name), bytes).unwrap();
+    }
+    for (name, bytes) in [
         ("flate_bomb.pdf", flate_bomb()),
         ("deep_array.pdf", deep_array()),
-        ("huge_image.pdf", huge_image()),
-        ("unknown_filter.pdf", unknown_filter()),
-    ];
-    for (name, bytes) in files {
+    ] {
         std::fs::write(out.join(name), bytes).unwrap();
     }
 }
@@ -1163,4 +1185,290 @@ fn a_comment_over_text_a_kept_check_found_stays() {
     let page = doc.page_iter().next().unwrap();
     let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap();
     assert_eq!(annots.as_array().unwrap().len(), 1);
+}
+
+/// A page of `bytes` drawn at 200 DPI on white: its size and RGB pixels.
+fn drawn(bytes: &[u8], number: usize) -> (usize, usize, Vec<u8>) {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings};
+    let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec()).unwrap();
+    let pages = pdf.pages();
+    let scale = 200.0 / 72.0;
+    let pixmap = hayro::render(
+        &pages[number - 1],
+        &RenderCache::new(),
+        &InterpreterSettings::default(),
+        &RenderSettings::default(),
+        &PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+        },
+    );
+    let rgb = pixmap.data().iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+    (pixmap.width().into(), pixmap.height().into(), rgb)
+}
+
+/// The share of pixels that differ by more than anti-aliasing can between two drawings of
+/// one page, `skip` being a box of pixels left out.
+fn changed(a: &(usize, usize, Vec<u8>), b: &(usize, usize, Vec<u8>), skip: [usize; 4]) -> f64 {
+    assert_eq!((a.0, a.1), (b.0, b.1));
+    let mut different = 0;
+    for y in 0..a.1 {
+        for x in 0..a.0 {
+            let inside = (skip[0]..skip[2]).contains(&x) && (skip[1]..skip[3]).contains(&y);
+            let i = (y * a.0 + x) * 3;
+            let near = (0..3).all(|k| a.2[i + k].abs_diff(b.2[i + k]) < 64);
+            different += usize::from(!inside && !near);
+        }
+    }
+    different as f64 / (a.0 * a.1) as f64
+}
+
+#[test]
+fn hidden_text_turns_its_pages_into_pictures() {
+    let input = redacted();
+    let (f, copy) = clean_pdf("redacted.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(f["recheck"]["status"], "none_found", "{f}");
+    let change = |code: &str| {
+        f["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["code"] == code)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {code}: {f}"))
+    };
+    let pages = change("pages_rasterised");
+    assert_eq!(
+        pages["pages"],
+        serde_json::json!((1..=14).collect::<Vec<_>>())
+    );
+    assert_eq!(
+        pages["detail"],
+        "Pages 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and 14 are now pictures; their text can't be selected or searched."
+    );
+    assert_eq!(change("redactions_applied")["count"], 1);
+    assert_eq!(
+        change("redactions_applied")["detail"],
+        "1 redaction mark was applied: its area is now filled in black."
+    );
+    assert_eq!(change("annotations_flattened")["count"], 1);
+    let doc = assert_rewritten(&copy, &input, false);
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    assert!(!doc.catalog().unwrap().has(b"OCProperties"));
+    for (i, id) in doc.page_iter().enumerate() {
+        let page = doc.get_dictionary(id).unwrap();
+        let content = doc.get_page_content(id);
+        let text = String::from_utf8_lossy(&content);
+        assert_eq!(text.contains("Tj"), i == 14, "page {}: {text}", i + 1);
+        assert!(!page.has(b"Annots"), "page {}", i + 1);
+        if i < 14 {
+            let bounds = page.get(b"MediaBox").unwrap();
+            assert_eq!(page.get(b"CropBox").unwrap(), bounds);
+            assert!(text.starts_with("q 595 0 0 842 0 0 cm /Im0 Do Q"), "{text}");
+        }
+    }
+    // Kept leftovers are what nothing used in the input, never what clean took out.
+    let (f, kept) = clean_pdf("redacted.pdf", &input, &["--keep", "leftover-data"]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(pdf_secrets(&kept), Vec::<String>::new());
+    // Every page looks as it did, but for the mark now painted over its area.
+    let [x0, y0, x1, y1] = [70.0, 842.0 - 715.0, 300.0, 842.0 - 695.0].map(|v| v * 200.0 / 72.0);
+    let mark = [x0 as usize, y0 as usize, x1 as usize + 1, y1 as usize + 1];
+    for page in 1..=15 {
+        let (a, b) = (drawn(&input, page), drawn(&copy, page));
+        let skip = if page == 13 { mark } else { [0; 4] };
+        let share = changed(&a, &b, skip);
+        assert!(share < 0.001, "page {page}: {share}");
+        if page == 13 {
+            let middle = (mark[1] + 20) * b.0 + (mark[0] + mark[2]) / 2;
+            assert_eq!(&b.2[middle * 3..middle * 3 + 3], [0, 0, 0]);
+        }
+    }
+}
+
+#[test]
+fn layers_that_are_off_leave_with_their_pages() {
+    let input = layered(false);
+    let (f, copy) = clean_pdf("layers.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let changes = f["changes"].as_array().unwrap();
+    assert_eq!(changes[0]["pages"], serde_json::json!([1, 2, 3]), "{f}");
+    let doc = assert_rewritten(&copy, &input, false);
+    assert!(!doc.catalog().unwrap().has(b"OCProperties"));
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    let raw = doc.get_page_content(doc.page_iter().next().unwrap());
+    assert!(!String::from_utf8_lossy(&raw).contains("BDC"));
+    // Kept, nothing changes on the pages.
+    let (f, copy) = clean_pdf("layers.pdf", &input, &["--keep", "hidden-layers"]);
+    assert_eq!(f["kept"], serde_json::json!(["hidden-layers"]));
+    assert_eq!(f["changes"], serde_json::json!([]));
+    assert!(
+        lopdf::Document::load_mem(&copy)
+            .unwrap()
+            .catalog()
+            .unwrap()
+            .has(b"OCProperties")
+    );
+}
+
+#[test]
+fn only_hidden_text_turns_a_scan_into_a_picture() {
+    let (rgb, size) = scan_of_text();
+    let input = scanned(true, &rgb, size);
+    let (f, copy) = clean_pdf("ocr_scan.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(f["changes"], serde_json::json!([]));
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    assert!(doc.extract_text(&[1]).unwrap().contains("Scanned line"));
+    let input = scanned(false, &[200; 3], (1, 1));
+    let (f, copy) = clean_pdf("abbyy_style.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(
+        f["changes"][0]["detail"],
+        "Page 1 is now a picture; its text can't be selected or searched."
+    );
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    let content = doc.get_page_content(doc.page_iter().next().unwrap());
+    assert!(!String::from_utf8_lossy(&content).contains("Tj"));
+}
+
+#[test]
+fn widgets_links_and_rotation_on_a_page_turned_into_a_picture() {
+    let mut b = PdfBuilder::new();
+    let rect = vec![100.into(), 500.into(), 300.into(), 520.into()];
+    let appearance = b.stream(
+        dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 200.into(), 20.into()] },
+        b"0.8 g 0 0 200 20 re f",
+    );
+    let widget = b.add(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => rect.clone(), "FT" => "Tx",
+        "T" => lopdf::Object::string_literal("Name"), "V" => lopdf::Object::string_literal("Shown"),
+        "AP" => dictionary! { "N" => appearance },
+    });
+    let other = b.add(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => rect.clone(), "FT" => "Tx",
+        "T" => lopdf::Object::string_literal("Other"),
+    });
+    let link = b.add(dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => rect.clone(),
+        "A" => dictionary! { "S" => "URI", "URI" => lopdf::Object::string_literal("https://example.com/") },
+    });
+    let hidden = format!("1 g {}0 g\n", text_at(72, 700, "Hidden words here"));
+    b.page_with(
+        &hidden,
+        dictionary! { "Annots" => vec![widget.into(), link.into()] },
+    );
+    b.page_with(
+        &hidden,
+        dictionary! { "Annots" => vec![link.into()], "Rotate" => 90 },
+    );
+    b.page_with(
+        &text_at(72, 700, "Plain"),
+        dictionary! { "Annots" => vec![other.into()] },
+    );
+    b.catalog = dictionary! {
+        "AcroForm" => dictionary! { "Fields" => vec![widget.into(), other.into()] },
+    };
+    let input = b.bytes();
+    let (f, copy) = clean_pdf("form.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let doc = assert_rewritten(&copy, &input, false);
+    let pages: Vec<_> = doc.page_iter().collect();
+    let page = |i: usize| doc.get_dictionary(pages[i]).unwrap();
+    let annots = |i: usize| page(i).get(b"Annots").unwrap().as_array().unwrap().len();
+    assert_eq!(annots(0), 1, "the link stays, the widget is in the picture");
+    assert!(!page(1).has(b"Annots"), "a link can't follow a turned page");
+    assert!(!page(1).has(b"Rotate"));
+    let size: Vec<f32> = page(1)
+        .get(b"MediaBox")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_float().unwrap())
+        .collect();
+    assert_eq!(size, [0.0, 0.0, 842.0, 595.0]);
+    let form = doc
+        .catalog()
+        .unwrap()
+        .get(b"AcroForm")
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    assert_eq!(form.get(b"Fields").unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(
+        f["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["code"] == "annotations_flattened")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_page_too_big_to_draw_leaves_no_file() {
+    let mut b = PdfBuilder::new();
+    let hidden = format!("1 g {}0 g\n", text_at(72, 700, "Hidden words here"));
+    let page = b.page(&hidden);
+    let mut doc = b.finish();
+    let box_: Vec<lopdf::Object> = [0, 0, 14_400, 14_400].map(lopdf::Object::from).to_vec();
+    doc.get_dictionary_mut(page).unwrap().set("MediaBox", box_);
+    let (f, _) = clean_pdf("huge.pdf", &save(&mut doc), &[]);
+    assert_eq!(f["status"], "not_cleaned", "{f}");
+    assert_eq!(
+        f["error"]["message"],
+        "Can't remove hidden-text from huge.pdf: page 1 can't be drawn as a picture of at least 72 DPI within 40 megapixels."
+    );
+    assert_eq!(
+        f["error"]["hint"],
+        "Run clean again with --keep hidden-text."
+    );
+}
+
+/// The PDFs of the hostile set (with the leak fixtures) that can be read.
+fn readable_pdfs() -> Vec<(&'static str, Vec<u8>)> {
+    let (rgb, size) = scan_of_text();
+    vec![
+        ("redacted.pdf", redacted()),
+        ("leaky.pdf", leaky_structure()),
+        ("plain.pdf", plain_structure()),
+        ("incremental.pdf", incremental()),
+        ("layers.pdf", layered(false)),
+        ("abbyy_style.pdf", scanned(false, &[200; 3], (1, 1))),
+        ("ocr_scan.pdf", scanned(true, &rgb, size)),
+        ("huge_image.pdf", huge_image()),
+        ("unknown_filter.pdf", unknown_filter()),
+        ("prev_loop.pdf", prev_loop()),
+        ("hybrid_xref.pdf", hybrid_xref()),
+        ("short_length.pdf", bad_length(-100)),
+        ("long_length.pdf", bad_length(100)),
+        ("owner_only.pdf", aes256("owner-secret", "")),
+        (
+            "linearized.pdf",
+            include_bytes!("fixtures/linearized.pdf").to_vec(),
+        ),
+        ("polyglot.pdf", polyglot().0),
+        ("unlisted.pdf", unlisted()),
+        ("pdfa.pdf", pdfa(false)),
+    ]
+}
+
+#[test]
+fn every_readable_hostile_pdf_cleans() {
+    for (name, input) in readable_pdfs() {
+        let (f, copy) = clean_pdf(name, &input, &[]);
+        let incomplete = ["huge_image.pdf", "unknown_filter.pdf"].contains(&name);
+        let status = if incomplete {
+            "cleaned_incomplete"
+        } else {
+            "cleaned"
+        };
+        assert_eq!(f["status"], status, "{name}: {f}");
+        assert_rewritten(&copy, &input, false);
+    }
 }

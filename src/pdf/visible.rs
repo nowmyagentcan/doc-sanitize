@@ -457,31 +457,33 @@ fn classify(g: &Painted, rec: &Recorder, crop: Rect, redactions: &[Rect]) -> Out
 
 /// The /Redact marks of a page, as boxes in default user space.
 fn redactions(c: &Ctx, page: &lopdf::Dictionary) -> Vec<Rect> {
+    c.annots(page)
+        .iter()
+        .filter(|(_, a)| subtype(a) == b"Redact")
+        .flat_map(|(_, a)| mark_boxes(c, a))
+        .collect()
+}
+
+/// The boxes of a /Redact mark: its /QuadPoints, else its /Rect.
+pub(super) fn mark_boxes(c: &Ctx, a: &lopdf::Dictionary) -> Vec<Rect> {
     let numbers = |o: &[lopdf::Object]| -> Vec<f64> {
         o.iter()
             .filter_map(|n| n.as_float().ok().map(f64::from))
             .collect()
     };
-    let mut marks = vec![];
-    for (_, a) in c.annots(page) {
-        if subtype(a) != b"Redact" {
-            continue;
-        }
-        let quads = numbers(c.array(a, b"QuadPoints"));
-        let rect = numbers(c.array(a, b"Rect"));
-        let boxes: Vec<_> = quads
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|q| bounds(&q[..]))
-            .collect();
-        match (boxes.is_empty(), rect.as_slice()) {
-            (false, _) => marks.extend(boxes),
-            (true, [_, _, _, _]) => marks.push(bounds(&rect)),
-            _ => {}
-        }
+    let quads = numbers(c.array(a, b"QuadPoints"));
+    let rect = numbers(c.array(a, b"Rect"));
+    let boxes: Vec<_> = quads
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|q| bounds(&q[..]))
+        .collect();
+    match (boxes.is_empty(), rect.as_slice()) {
+        (false, _) => boxes,
+        (true, [_, _, _, _]) => vec![bounds(&rect)],
+        _ => vec![],
     }
-    marks
 }
 
 /// The box around points given as x, y pairs.

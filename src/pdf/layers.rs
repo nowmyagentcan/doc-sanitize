@@ -9,9 +9,22 @@ use lopdf::{Dictionary, Object, ObjectId};
 use super::{Ctx, page_content, page_resources, walk};
 use crate::report::{CheckId, Finding, Where};
 
-pub(super) fn check(c: &Ctx) -> Vec<Finding> {
+/// What the default configuration switches off.
+#[derive(Default)]
+pub(super) struct Off {
+    /// Each layer that is off, with the pages that show it.
+    layers: BTreeMap<ObjectId, BTreeSet<usize>>,
+    /// The pages whose content (not just annotations) carries such a layer.
+    pub content: BTreeSet<usize>,
+    /// The /OC objects of annotations that are off.
+    pub annotations: HashSet<ObjectId>,
+}
+
+/// The layers that are off, and the pages and annotations that carry them.
+pub(super) fn off(c: &Ctx) -> Off {
+    let mut off = Off::default();
     let Some(props) = c.catalog().and_then(|cat| c.dict(cat, b"OCProperties")) else {
-        return vec![];
+        return off;
     };
     let config = c.dict(props, b"D");
     let ids = |key: &[u8]| -> HashSet<ObjectId> {
@@ -24,7 +37,6 @@ pub(super) fn check(c: &Ctx) -> Vec<Finding> {
         off: ids(b"OFF"),
         base_off: config.and_then(|d| super::name(d, b"BaseState")).as_deref() == Some("OFF"),
     };
-    let mut pages: BTreeMap<ObjectId, BTreeSet<usize>> = BTreeMap::new();
     for (page, dict) in c.pages() {
         let mut hidden = vec![];
         if let Some(content) = page_content(c, dict) {
@@ -41,16 +53,28 @@ pub(super) fn check(c: &Ctx) -> Vec<Finding> {
                 },
             );
         }
+        if !hidden.is_empty() {
+            off.content.insert(page);
+        }
         for (_, a) in c.annots(dict) {
             if let Ok(id) = a.get(b"OC").and_then(Object::as_reference) {
-                hidden.extend(layers.off_in(id));
+                let layers = layers.off_in(id);
+                if !layers.is_empty() {
+                    off.annotations.insert(id);
+                }
+                hidden.extend(layers);
             }
         }
         for id in hidden {
-            pages.entry(id).or_default().insert(page);
+            off.layers.entry(id).or_default().insert(page);
         }
     }
-    pages
+    off
+}
+
+pub(super) fn check(c: &Ctx) -> Vec<Finding> {
+    off(c)
+        .layers
         .into_iter()
         .map(|(id, pages)| {
             let on = super::pages_text(&pages.iter().copied().collect::<Vec<_>>());

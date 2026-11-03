@@ -2,14 +2,18 @@
 //! the copy is written as one revision with no encryption and a new /ID, keeping only the
 //! objects the trailer reaches.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
+use hayro::RenderCache;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
-use super::{COMMENTS, Ctx, Pdf, as_dict, bytes, form_fields, has_value, subtype, xmp_of};
+use super::{
+    COMMENTS, Ctx, Pdf, as_dict, bytes, form_fields, has_value, layers, pages_text, raster,
+    subtype, xmp_of,
+};
 use crate::pictures;
-use crate::report::{Change, CheckId, Cleaned, Error, Finding, Warning};
+use crate::report::{Change, CheckId, Cleaned, Error, Finding, Warning, counted};
 
 /// Removes the checks in `remove` from `pdf`, whose check found `found`.
 pub fn clean(pdf: &Pdf, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned, Error> {
@@ -28,6 +32,17 @@ pub fn clean(pdf: &Pdf, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned
             ..Cleaned::default()
         },
     };
+    let off = layers::off(&c);
+    let mut pictures: BTreeSet<usize> = found
+        .iter()
+        .filter(|f| matches!(f.check, CheckId::HiddenText | CheckId::FakeRedactions))
+        .filter(|f| remove.contains(&f.check))
+        .filter_map(|f| f.place.page)
+        .collect();
+    let layers = has(CheckId::HiddenLayers);
+    if layers {
+        pictures.extend(&off.content);
+    }
     let (macros, links) = (has(CheckId::Macros), has(CheckId::ExternalLinks));
     if macros || links {
         copy.actions(macros, links);
@@ -36,13 +51,21 @@ pub fn clean(pdf: &Pdf, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned
         copy.signatures(&c);
     }
     if has(CheckId::Comments) {
-        copy.comments(found, remove);
+        copy.comments(found, &pictures);
+    }
+    if layers {
+        let oc = |a: &Dictionary| a.get(b"OC").and_then(Object::as_reference).ok();
+        copy.drop_annots(|_, a| oc(a).is_some_and(|id| off.annotations.contains(&id)));
     }
     if has(CheckId::EmbeddedFiles) {
         copy.embedded_files();
     }
     if has(CheckId::FormData) {
         copy.form_data(&c);
+    }
+    copy.rasterise(&c, &pictures, found)?;
+    if layers {
+        copy.layers();
     }
     if has(CheckId::Metadata) {
         copy.metadata(&c);
@@ -51,7 +74,7 @@ pub fn clean(pdf: &Pdf, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned
         copy.image_metadata();
     }
     if leftovers && has(CheckId::LeftoverData) {
-        copy.unused_resources(&c);
+        copy.unused_resources(&c, &pictures);
     }
     // Objects nothing reached in the input stay only when leftover data is kept.
     let unused: HashSet<ObjectId> = match leftovers {
@@ -87,20 +110,6 @@ fn blocking(c: &Ctx, has: &impl Fn(CheckId) -> bool) -> Vec<(CheckId, String, St
                 .into(),
         ));
     }
-    for id in [
-        CheckId::HiddenText,
-        CheckId::FakeRedactions,
-        CheckId::HiddenLayers,
-    ] {
-        if has(id) {
-            out.push((
-                id,
-                "this version can't remove it yet".into(),
-                format!("Run clean again with --keep {}.", id.id()),
-            ));
-        }
-    }
-    out.sort_by_key(|b| b.0);
     out
 }
 
@@ -330,13 +339,12 @@ impl Copy {
     }
 
     /// `comments`: comment annotations go with their pop-ups (replies are comments too). One
-    /// that covers text found by a kept check stays, so removing it never uncovers text, and
-    /// comments then count as kept.
-    fn comments(&mut self, found: &[Finding], remove: &[CheckId]) {
+    /// that covers found text stays, so removing it never uncovers text: on a page in
+    /// `pictures` it is drawn into the picture; elsewhere it stays, and comments count as kept.
+    fn comments(&mut self, found: &[Finding], pictures: &BTreeSet<usize>) {
         let covered: Vec<(usize, [f64; 4])> = found
             .iter()
             .filter(|f| matches!(f.check, CheckId::HiddenText | CheckId::FakeRedactions))
-            .filter(|f| !remove.contains(&f.check))
             .filter_map(|f| Some((f.place.page?, f.place.bbox?)))
             .collect();
         let rect = |a: &Dictionary| -> Option<[f64; 4]> {
@@ -360,7 +368,7 @@ impl Copy {
         self.drop_annots(|page, a| {
             let comment = COMMENTS.contains(&subtype(a));
             let stays = comment && covers(page, a);
-            stayed.set(stayed.get() || stays);
+            stayed.set(stayed.get() || stays && !pictures.contains(&page));
             comment && !stays
         });
         if stayed.get() {
@@ -489,17 +497,245 @@ impl Copy {
 
     /// `leftover-data`: XObjects that a page or form names and never draws are dropped from
     /// its resources. A page gets resources of its own, since another page may draw them.
-    fn unused_resources(&mut self, c: &Ctx) {
+    fn unused_resources(&mut self, c: &Ctx, pictures: &BTreeSet<usize>) {
         for (form, names) in super::undrawn_in_forms(c) {
             if let Some(d) = self.dict_at(form, &[b"Resources", b"XObject"]) {
                 names.iter().for_each(|n| _ = d.remove(n));
             }
         }
         for (page, resources) in super::undrawn_on_pages(c) {
+            let number = self.pages.iter().position(|p| *p == page).map(|i| i + 1);
+            if number.is_some_and(|n| pictures.contains(&n)) {
+                continue;
+            }
             if let Ok(d) = self.doc.get_dictionary_mut(page) {
                 d.set("Resources", resources);
             }
         }
+    }
+
+    /// Turns the page numbers in `pictures` into pictures: the page is drawn from a copy
+    /// without its /Redact and /Link annotations, with every /Redact mark painted in. Every
+    /// other annotation on it is now part of the picture; its links stay.
+    fn rasterise(
+        &mut self,
+        c: &Ctx,
+        pictures: &BTreeSet<usize>,
+        found: &[Finding],
+    ) -> Result<(), Error> {
+        if pictures.is_empty() {
+            return Ok(());
+        }
+        let mut view = Self {
+            doc: self.doc.clone(),
+            pages: self.pages.clone(),
+            out: Cleaned::default(),
+        };
+        view.drop_annots(|page, a| {
+            pictures.contains(&page) && matches!(subtype(a), b"Redact" | b"Link")
+        });
+        let mut saved = vec![];
+        let root = view.doc.trailer.get(b"Root").cloned();
+        view.doc.trailer = Dictionary::new();
+        view.doc.trailer.set("Root", root.unwrap_or(Object::Null));
+        view.doc.save_to(&mut saved).ok();
+        drop(view);
+        let blocked = |page: usize| {
+            let check = found
+                .iter()
+                .find(|f| f.place.page == Some(page) && f.check != CheckId::Comments)
+                .map_or(CheckId::HiddenLayers, |f| f.check);
+            Error::cannot_clean(&[(
+                check,
+                format!(
+                    "page {page} can't be drawn as a picture of at least 72 DPI within 40 megapixels"
+                ),
+                format!("Run clean again with --keep {}.", check.id()),
+            )])
+        };
+        let first = *pictures.first().expect("a page to draw");
+        let drawing = raster::open(saved).ok_or_else(|| blocked(first))?;
+        let pages = drawing.pages();
+        let cache = RenderCache::new();
+        let (mut flattened, mut marks, mut fields) = (0, vec![], HashSet::new());
+        for &number in pictures {
+            let id = self.pages[number - 1];
+            let dict = c.doc().get_dictionary(id).ok();
+            let drawn = dict
+                .and_then(|d| raster::draw(c, pages, &cache, number, d))
+                .ok_or_else(|| blocked(number))?;
+            marks.extend(drawn.redactions.iter().copied());
+            flattened += self.replace_page(id, drawn, &mut fields);
+        }
+        self.drop_fields(&fields);
+        let numbers: Vec<usize> = pictures.iter().copied().collect();
+        let detail = match numbers[..] {
+            [one] => {
+                format!("Page {one} is now a picture; its text can't be selected or searched.")
+            }
+            _ => {
+                let shown = pages_text(&numbers).replacen("pages", "Pages", 1);
+                format!("{shown} are now pictures; their text can't be selected or searched.")
+            }
+        };
+        self.out.changes.push(Change {
+            pages: Some(numbers),
+            ..Change::new("pages_rasterised", detail)
+        });
+        if !marks.is_empty() {
+            let black = if marks.iter().all(|b| *b) {
+                " black"
+            } else {
+                ""
+            };
+            let what = match marks.len() {
+                1 => format!("1 redaction mark was applied: its area is now filled in{black}."),
+                n => format!(
+                    "{n} redaction marks were applied: their areas are now filled in{black}."
+                ),
+            };
+            let n = marks.len() as u64;
+            self.out
+                .changes
+                .push(Change::counted("redactions_applied", n, what));
+        }
+        if flattened > 0 {
+            let n = flattened as u64;
+            let what = counted(
+                n,
+                "annotation is now part of its page's picture.",
+                "annotations are now part of their pages' pictures.",
+            );
+            self.out
+                .changes
+                .push(Change::counted("annotations_flattened", n, what));
+        }
+        Ok(())
+    }
+
+    /// Replaces the page `id` by `drawn`; gives how many annotations went into the picture,
+    /// and adds the form widgets it held to `fields`.
+    fn replace_page(
+        &mut self,
+        id: ObjectId,
+        drawn: raster::Drawn,
+        fields: &mut HashSet<ObjectId>,
+    ) -> usize {
+        let mut flattened = 0;
+        let mut links = vec![];
+        for a in self.annots(id).unwrap_or_default() {
+            let widget = a.as_reference().ok();
+            let dict = match widget {
+                Some(r) => self.doc.get_dictionary(r).ok(),
+                None => a.as_dict().ok(),
+            };
+            let Some(dict) = dict else { continue };
+            let flags = dict.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+            let shown = flags & (2 | 32) == 0 && dict.has(b"AP");
+            match subtype(dict) {
+                b"Link" if !drawn.rotated => links.push(a.clone()),
+                b"Link" | b"Redact" | b"Popup" => {}
+                kind => {
+                    flattened += usize::from(shown);
+                    if kind == b"Widget" {
+                        fields.extend(widget);
+                    }
+                }
+            }
+        }
+        let [x0, y0, x1, y1] = drawn.bounds;
+        let mut image = Dictionary::new();
+        image.set("Type", Object::Name(b"XObject".to_vec()));
+        image.set("Subtype", Object::Name(b"Image".to_vec()));
+        image.set("Width", i64::from(drawn.width));
+        image.set("Height", i64::from(drawn.height));
+        image.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        image.set("BitsPerComponent", 8);
+        image.set("Filter", Object::Name(drawn.filter.as_bytes().to_vec()));
+        let image = self.doc.add_object(Stream::new(image, drawn.data));
+        let content = format!("q {} 0 0 {} {x0} {y0} cm /Im0 Do Q\n", x1 - x0, y1 - y0);
+        let contents = self
+            .doc
+            .add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let mut names = Dictionary::new();
+        names.set("Im0", image);
+        let mut resources = Dictionary::new();
+        resources.set("XObject", names);
+        let bounds: Vec<Object> = drawn.bounds.iter().map(|&v| (v as f32).into()).collect();
+        if let Ok(page) = self.doc.get_dictionary_mut(id) {
+            page.set("Contents", contents);
+            page.set("Resources", resources);
+            for key in ["MediaBox", "CropBox", "TrimBox", "BleedBox", "ArtBox"] {
+                page.set(key, bounds.clone());
+            }
+            for key in [b"Group".as_slice(), b"Rotate", b"Thumb", b"StructParents"] {
+                page.remove(key);
+            }
+            match links.is_empty() {
+                true => _ = page.remove(b"Annots"),
+                false => page.set("Annots", links),
+            }
+        }
+        flattened
+    }
+
+    /// Takes the fields with widgets `dead` out of the /AcroForm tree.
+    fn drop_fields(&mut self, dead: &HashSet<ObjectId>) {
+        fn pruned(
+            doc: &mut Document,
+            list: Vec<Object>,
+            dead: &HashSet<ObjectId>,
+            seen: &mut HashSet<ObjectId>,
+        ) -> Vec<Object> {
+            list.into_iter()
+                .filter(|o| {
+                    let Ok(id) = o.as_reference() else {
+                        return true;
+                    };
+                    if dead.contains(&id) {
+                        return false;
+                    }
+                    let kids = doc
+                        .get_dictionary(id)
+                        .ok()
+                        .and_then(|d| d.get(b"Kids").ok()?.as_array().ok().cloned());
+                    let Some(kids) = kids.filter(|_| seen.insert(id)) else {
+                        return true;
+                    };
+                    let kept = pruned(doc, kids, dead, seen);
+                    let some = !kept.is_empty();
+                    if let Ok(d) = doc.get_dictionary_mut(id) {
+                        d.set("Kids", kept);
+                    }
+                    some
+                })
+                .collect()
+        }
+        let Some(cat) = self.catalog_id() else {
+            return;
+        };
+        let list = self
+            .dict_at(cat, &[b"AcroForm"])
+            .and_then(|f| f.get(b"Fields").ok()?.as_array().ok().cloned());
+        if let Some(list) = list {
+            let kept = pruned(&mut self.doc, list, dead, &mut HashSet::new());
+            if let Some(form) = self.dict_at(cat, &[b"AcroForm"]) {
+                form.set("Fields", kept);
+            }
+        }
+    }
+
+    /// `hidden-layers`, once the pages that showed them are pictures: nothing marks content
+    /// as optional any more.
+    fn layers(&mut self) {
+        each_dict(&mut self.doc, &mut |d| {
+            if d.has(b"Subtype") {
+                d.remove(b"OC");
+            }
+            if d.has_type(b"Catalog") {
+                d.remove(b"OCProperties");
+            }
+        });
     }
 
     /// Writes the copy: the trailer keeps /Root (and /Info when metadata is kept) with a new
