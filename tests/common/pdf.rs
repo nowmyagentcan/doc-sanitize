@@ -316,10 +316,10 @@ pub fn plain_structure() -> Vec<u8> {
     let mut b = PdfBuilder::new();
     let image = b.stream(
         dictionary! {
-            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
-            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
         },
-        &super::jpeg(&[], b""),
+        &super::photo(8, 8),
     );
     let widget = b.add(dictionary! {
         "Type" => "Annot", "Subtype" => "Widget", "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],

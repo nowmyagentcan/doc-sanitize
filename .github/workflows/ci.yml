@@ -26,3 +26,74 @@ jobs:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check licenses bans advisories
+  validity:
+    runs-on: ubuntu-latest
+    env:
+      OUT: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qpdf libreoffice-writer libreoffice-calc libreoffice-impress
+      - name: Write the cleaned fixtures
+        env:
+          DOC_SANITIZE_OUT: ${{ github.workspace }}/out
+        run: |
+          cargo test --locked --test clean -- --ignored --exact write_cleaned_fixtures
+          cargo test --locked --test pdf -- --ignored --exact write_pdf_fixtures
+      - name: qpdf accepts every cleaned PDF it accepts the input of
+        working-directory: out
+        run: |
+          status=0
+          for copy in clean-*.pdf; do
+            input=${copy#clean-}
+            if qpdf --check "$input" >/dev/null 2>&1 && ! qpdf --check "$copy"; then
+              echo "::error::qpdf rejected $copy"
+              status=1
+            fi
+          done
+          exit $status
+      - name: LibreOffice converts every cleaned Office file
+        working-directory: out
+        run: |
+          for copy in clean-*.docx clean-*.xlsx clean-*.pptx; do
+            soffice -env:UserInstallation=file:///tmp/lo --headless --convert-to pdf --outdir lo "$copy"
+            test -s "lo/${copy%.*}.pdf"
+          done
+      - name: The Open XML SDK adds no error to the input's
+        run: |
+          mkdir "$RUNNER_TEMP/validator"
+          cd "$RUNNER_TEMP/validator"
+          dotnet new console --force
+          dotnet add package DocumentFormat.OpenXml --version 3.3.0
+          cat > Program.cs <<'CS'
+          using DocumentFormat.OpenXml;
+          using DocumentFormat.OpenXml.Packaging;
+          using DocumentFormat.OpenXml.Validation;
+
+          static HashSet<string> Errors(string path)
+          {
+              using OpenXmlPackage doc = Path.GetExtension(path)[1] switch
+              {
+                  'd' => WordprocessingDocument.Open(path, false),
+                  'x' => SpreadsheetDocument.Open(path, false),
+                  _ => PresentationDocument.Open(path, false),
+              };
+              var v = new OpenXmlValidator(FileFormatVersions.Microsoft365);
+              return v.Validate(doc).Select(e => $"{e.Id} {e.Description}").ToHashSet();
+          }
+
+          var failed = 0;
+          foreach (var copy in Directory.GetFiles(args[0], "clean-*.*x"))
+          {
+              var name = Path.GetFileName(copy)["clean-".Length..];
+              var input = new[] { name, name[..^1] + "m" }
+                  .Select(n => Path.Combine(args[0], n))
+                  .First(File.Exists);
+              var added = Errors(copy).Except(Errors(input)).ToList();
+              Console.WriteLine($"{Path.GetFileName(copy)}: {added.Count} new errors");
+              added.ForEach(Console.WriteLine);
+              failed += added.Count;
+          }
+          return failed == 0 ? 0 : 1;
+          CS
+          dotnet run -- "$OUT"
