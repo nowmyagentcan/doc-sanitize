@@ -1,9 +1,10 @@
 //! What pictures carry besides their pixels: EXIF (with GPS), XMP, IPTC, comments, text
 //! chunks, thumbnails and bytes after the image. The walkers read each format's own
-//! structure and never decode pixels.
+//! structure, never decode pixels, and when stripping copy every other byte as it was.
 
 use quick_xml::events::Event;
 
+use crate::office::tree::{Doc, El, Node};
 use crate::office::xml::Reader;
 use crate::report::Error;
 
@@ -13,26 +14,96 @@ pub type Labels = Vec<&'static str>;
 /// The picture's metadata labels, or None when its structure is cut short or broken. Formats
 /// other than JPEG, PNG, GIF, WebP, SVG and TIFF give none.
 pub fn metadata(b: &[u8]) -> Option<Labels> {
-    walk(b).ok()
+    let mut w = Walk::default();
+    walk(b, &mut w).ok()?;
+    let mut labels = w.labels;
+    sort(&mut labels);
+    Some(labels)
 }
 
-fn walk(b: &[u8]) -> Result<Labels, ()> {
-    let mut labels = if b.starts_with(&[0xFF, 0xD8]) {
-        jpeg(b)?
-    } else if b.starts_with(b"\x89PNG\r\n\x1a\n") {
-        png(b)?
-    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
-        gif(b)?
-    } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
-        webp(b)?
-    } else if b.starts_with(b"II*\0") || b.starts_with(b"MM\0*") {
-        tiff(b)?
-    } else {
-        vec![]
+/// The picture without its metadata, every pixel byte copied as it was; None for a TIFF or a
+/// broken picture. For `office` an EXIF orientation other than 1 stays, in an EXIF block
+/// holding only that tag; otherwise every EXIF block goes.
+pub fn strip(b: &[u8], office: bool) -> Option<Vec<u8>> {
+    if is_tiff(b) {
+        return None;
+    }
+    let mut w = Walk {
+        out: Some(vec![]),
+        office,
+        ..Walk::default()
     };
-    labels.sort_unstable_by_key(|l| ORDER.iter().position(|o| o == l));
-    labels.dedup();
-    Ok(labels)
+    match walk(b, &mut w).ok()? {
+        true => w.out,
+        false => Some(b.to_vec()),
+    }
+}
+
+pub fn is_tiff(b: &[u8]) -> bool {
+    b.starts_with(b"II*\0") || b.starts_with(b"MM\0*")
+}
+
+/// Walks a picture; false when it isn't a format with a walker.
+fn walk(b: &[u8], w: &mut Walk) -> Result<bool, ()> {
+    if b.starts_with(&[0xFF, 0xD8]) {
+        jpeg(b, w)?;
+    } else if b.starts_with(PNG) {
+        png(b, w)?;
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        gif(b, w)?;
+    } else if b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        webp(b, w)?;
+    } else if is_tiff(b) {
+        w.labels = tiff(b)?;
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// A walk over a picture: the labels of what it holds and, when stripping, the bytes of
+/// every piece that holds none.
+#[derive(Default)]
+struct Walk {
+    labels: Labels,
+    out: Option<Vec<u8>>,
+    office: bool,
+}
+
+/// What becomes of an EXIF block.
+enum Exif {
+    Keep,
+    /// Dropped, with the orientation to write back in its place.
+    Drop(Option<u16>),
+}
+
+impl Walk {
+    fn keep(&mut self, pieces: &[&[u8]]) {
+        if let Some(out) = &mut self.out {
+            for p in pieces {
+                out.extend_from_slice(p);
+            }
+        }
+    }
+
+    /// An EXIF block (a TIFF structure) holding only the orientation is no metadata: Office
+    /// copies keep it. Any other is labelled and dropped, its orientation kept for Office.
+    fn exif(&mut self, tiff: &[u8]) -> Result<Exif, ()> {
+        let entries = ifd0(tiff)?;
+        let turn = entries.iter().find(|e| e.0 == 0x0112).map(|e| e.1);
+        if entries.len() == 1 && turn.is_some() {
+            return Ok(if self.office {
+                Exif::Keep
+            } else {
+                Exif::Drop(None)
+            });
+        }
+        self.labels.push("EXIF");
+        if entries.iter().any(|e| e.0 == 0x8825) {
+            self.labels.push("GPS");
+        }
+        Ok(Exif::Drop(turn.filter(|&t| self.office && t != 1)))
+    }
 }
 
 /// The order labels are named in.
@@ -47,6 +118,11 @@ const ORDER: [&str; 9] = [
     "other metadata",
     "trailing bytes",
 ];
+
+fn sort(labels: &mut Labels) {
+    labels.sort_unstable_by_key(|l| ORDER.iter().position(|o| o == l));
+    labels.dedup();
+}
 
 fn be16(b: &[u8], at: usize) -> Result<usize, ()> {
     Ok(usize::from(u16::from_be_bytes(
@@ -63,8 +139,16 @@ fn trailing(rest: &[u8]) -> bool {
     rest.iter().any(|&c| c != 0 && !c.is_ascii_whitespace())
 }
 
-fn jpeg(b: &[u8]) -> Result<Labels, ()> {
-    let mut labels = vec![];
+/// A little-endian TIFF structure holding only the orientation `turn`.
+fn turned(turn: u16) -> Vec<u8> {
+    let mut b = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+    b.extend(turn.to_le_bytes());
+    b.extend([0; 6]);
+    b
+}
+
+fn jpeg(b: &[u8], w: &mut Walk) -> Result<(), ()> {
+    w.keep(&[&b[..2]]);
     let mut i = 2;
     loop {
         if b.get(i) != Some(&0xFF) {
@@ -77,67 +161,91 @@ fn jpeg(b: &[u8]) -> Result<Labels, ()> {
         i += 1;
         match marker {
             0xD9 => {
+                w.keep(&[&[0xFF, 0xD9]]);
                 if trailing(&b[i..]) {
-                    labels.push("trailing bytes");
+                    w.labels.push("trailing bytes");
                 }
-                return Ok(labels);
+                return Ok(());
             }
-            0xD0..=0xD7 | 0x01 | 0xD8 => continue,
+            0xD0..=0xD7 | 0x01 | 0xD8 => {
+                w.keep(&[&[0xFF, marker]]);
+                continue;
+            }
             _ => {}
         }
         let len = be16(b, i)?;
         let seg = b.get(i + 2..i + len).filter(|_| len >= 2).ok_or(())?;
+        let whole = &b[i..i + len];
         i += len;
-        match marker {
+        let keep = match marker {
             0xE0 if seg.starts_with(b"JFIF\0") => {
-                if seg.get(12..14).is_some_and(|t| t != [0, 0]) {
-                    labels.push("a thumbnail");
+                let thumbnail = seg.get(12..14).is_some_and(|t| t != [0, 0]);
+                if thumbnail {
+                    w.labels.push("a thumbnail");
+                    w.keep(&[&[0xFF, 0xE0, 0, 16], seg.get(..12).ok_or(())?, &[0, 0]]);
                 }
+                !thumbnail
             }
-            0xE0 if seg.starts_with(b"JFXX\0") => labels.push("a thumbnail"),
-            0xE1 if seg.starts_with(b"Exif\0\0") => labels.extend(exif(&seg[6..])?),
+            0xE0 if seg.starts_with(b"JFXX\0") => {
+                w.labels.push("a thumbnail");
+                false
+            }
+            0xE1 if seg.starts_with(b"Exif\0\0") => match w.exif(&seg[6..])? {
+                Exif::Keep => true,
+                Exif::Drop(turn) => {
+                    if let Some(t) = turn {
+                        let body = [b"Exif\0\0".as_slice(), &turned(t)].concat();
+                        let len = (body.len() as u16 + 2).to_be_bytes();
+                        w.keep(&[&[0xFF, 0xE1], &len, &body]);
+                    }
+                    false
+                }
+            },
             0xE1 if seg.starts_with(b"http://ns.adobe.com/xap/1.0/\0")
                 || seg.starts_with(b"http://ns.adobe.com/xmp/extension/\0") =>
             {
-                labels.push("XMP")
+                w.labels.push("XMP");
+                false
             }
-            0xE2 if seg.starts_with(b"ICC_PROFILE\0") => {}
-            0xED => labels.push("IPTC"),
-            0xEE if seg.starts_with(b"Adobe") => {}
-            0xE0..=0xEF => labels.push("other metadata"),
-            0xFE => labels.push("comments"),
-            0xDA => {
-                // Entropy-coded data runs to the next marker that isn't a stuffed byte or a
-                // restart.
-                loop {
-                    let (c, next) = (*b.get(i).ok_or(())?, *b.get(i + 1).ok_or(())?);
-                    if c == 0xFF && next != 0 && !(0xD0..=0xD7).contains(&next) {
-                        break;
-                    }
-                    i += 1;
+            0xE2 if seg.starts_with(b"ICC_PROFILE\0") => true,
+            0xED => {
+                w.labels.push("IPTC");
+                false
+            }
+            0xEE if seg.starts_with(b"Adobe") => true,
+            0xE0..=0xEF => {
+                w.labels.push("other metadata");
+                false
+            }
+            0xFE => {
+                w.labels.push("comments");
+                false
+            }
+            _ => true,
+        };
+        if keep {
+            w.keep(&[&[0xFF, marker], whole]);
+        }
+        if marker == 0xDA {
+            // Entropy-coded data runs to the next marker that isn't a stuffed byte or a
+            // restart.
+            let start = i;
+            loop {
+                let (c, next) = (*b.get(i).ok_or(())?, *b.get(i + 1).ok_or(())?);
+                if c == 0xFF && next != 0 && !(0xD0..=0xD7).contains(&next) {
+                    break;
                 }
+                i += 1;
             }
-            _ => {}
+            w.keep(&[&b[start..i]]);
         }
     }
 }
 
-/// What an EXIF block (a TIFF structure) holds: nothing when it is only the orientation.
-fn exif(b: &[u8]) -> Result<Labels, ()> {
-    let tags = ifd0(b)?;
-    if tags == [0x0112] {
-        return Ok(vec![]);
-    }
-    let mut labels = vec!["EXIF"];
-    if tags.contains(&0x8825) {
-        labels.push("GPS");
-    }
-    Ok(labels)
-}
-
-/// The tags of a TIFF structure's first directory, and an empty list when another
-/// directory follows it (so a lone orientation tag is only that when nothing follows).
-fn ifd0(b: &[u8]) -> Result<Vec<u16>, ()> {
+/// The (tag, first 16-bit value) entries of a TIFF structure's first directory, with a
+/// (0, 0) entry added when another directory follows it (so a lone orientation is only that
+/// when nothing follows).
+fn ifd0(b: &[u8]) -> Result<Vec<(u16, u16)>, ()> {
     let little = match b.get(..4) {
         Some(b"II*\0") => true,
         Some(b"MM\0*") => false,
@@ -161,21 +269,38 @@ fn ifd0(b: &[u8]) -> Result<Vec<u16>, ()> {
     };
     let start = u32_at(4)?;
     let n = usize::from(u16_at(start)?);
-    let tags = (0..n)
-        .map(|k| u16_at(start + 2 + 12 * k))
+    let mut entries = (0..n)
+        .map(|k| Ok((u16_at(start + 2 + 12 * k)?, u16_at(start + 10 + 12 * k)?)))
         .collect::<Result<Vec<_>, _>>()?;
-    let next = u32_at(start + 2 + 12 * n)?;
-    Ok(if next == 0 {
-        tags
-    } else {
-        [tags, vec![0]].concat()
-    })
+    if u32_at(start + 2 + 12 * n)? != 0 {
+        entries.push((0, 0));
+    }
+    Ok(entries)
+}
+
+/// The EXIF orientation of a JPEG (1 when it has none), or None when it can't be read.
+pub fn orientation(b: &[u8]) -> Option<u16> {
+    let mut i = 2;
+    while b.get(i) == Some(&0xFF) {
+        let marker = *b.get(i + 1)?;
+        let len = be16(b, i + 2).ok()?;
+        let seg = b.get(i + 4..i + 2 + len)?;
+        match marker {
+            0xE1 if seg.starts_with(b"Exif\0\0") => {
+                let entries = ifd0(&seg[6..]).ok()?;
+                return Some(entries.iter().find(|e| e.0 == 0x0112).map_or(1, |e| e.1));
+            }
+            0xDA => break,
+            _ => i += 2 + len,
+        }
+    }
+    Some(1)
 }
 
 /// TIFF tags that describe the picture's origin rather than its pixels.
 fn tiff(b: &[u8]) -> Result<Labels, ()> {
     let mut labels = vec![];
-    for tag in ifd0(b)? {
+    for (tag, _) in ifd0(b)? {
         labels.push(match tag {
             0x8769 => "EXIF",
             0x8825 => "GPS",
@@ -188,13 +313,29 @@ fn tiff(b: &[u8]) -> Result<Labels, ()> {
     Ok(labels)
 }
 
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
 const PNG_KEPT: [&[u8; 4]; 19] = [
     b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"iCCP", b"sRGB", b"gAMA", b"cHRM", b"sBIT",
     b"cICP", b"mDCV", b"cLLI", b"pHYs", b"bKGD", b"sPLT", b"acTL", b"fcTL", b"fdAT",
 ];
 
-fn png(b: &[u8]) -> Result<Labels, ()> {
-    let mut labels = vec![];
+/// A PNG chunk with its length and CRC.
+pub fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut crc = flate2::Crc::new();
+    crc.update(kind);
+    crc.update(data);
+    [
+        &(data.len() as u32).to_be_bytes()[..],
+        kind,
+        data,
+        &crc.sum().to_be_bytes(),
+    ]
+    .concat()
+}
+
+fn png(b: &[u8], w: &mut Walk) -> Result<(), ()> {
+    w.keep(&[PNG]);
     let mut i = 8;
     loop {
         let len = be32(b, i)?;
@@ -206,19 +347,38 @@ fn png(b: &[u8]) -> Result<Labels, ()> {
         if be32(b, i + 8 + len)? != crc.sum() as usize {
             return Err(());
         }
+        let whole = &b[i..i + 12 + len];
         i += 12 + len;
-        match kind {
+        let keep = match kind {
             b"IEND" => {
+                w.keep(&[whole]);
                 if trailing(&b[i..]) {
-                    labels.push("trailing bytes");
+                    w.labels.push("trailing bytes");
                 }
-                return Ok(labels);
+                return Ok(());
             }
-            b"tEXt" | b"zTXt" | b"iTXt" => labels.push("text chunks"),
-            b"eXIf" => labels.extend(exif(data)?),
-            k if PNG_KEPT.iter().any(|p| p == &k) => {}
-            k if k[0].is_ascii_lowercase() => labels.push("other metadata"),
-            _ => {}
+            b"tEXt" | b"zTXt" | b"iTXt" => {
+                w.labels.push("text chunks");
+                false
+            }
+            b"eXIf" => match w.exif(data)? {
+                Exif::Keep => true,
+                Exif::Drop(turn) => {
+                    if let Some(t) = turn {
+                        w.keep(&[&chunk(b"eXIf", &turned(t))]);
+                    }
+                    false
+                }
+            },
+            k if PNG_KEPT.iter().any(|p| p == &k) => true,
+            k if k[0].is_ascii_lowercase() => {
+                w.labels.push("other metadata");
+                false
+            }
+            _ => true,
+        };
+        if keep {
+            w.keep(&[whole]);
         }
     }
 }
@@ -238,8 +398,7 @@ fn sub_blocks(b: &[u8], mut i: usize) -> Result<(&[u8], usize), ()> {
     }
 }
 
-fn gif(b: &[u8]) -> Result<Labels, ()> {
-    let mut labels = vec![];
+fn gif(b: &[u8], w: &mut Walk) -> Result<(), ()> {
     let table = |flags: u8| {
         if flags & 0x80 != 0 {
             3 << ((flags & 7) + 1)
@@ -248,53 +407,94 @@ fn gif(b: &[u8]) -> Result<Labels, ()> {
         }
     };
     let mut i = 13 + table(*b.get(10).ok_or(())?);
+    w.keep(&[b.get(..i).ok_or(())?]);
     loop {
         match *b.get(i).ok_or(())? {
             0x3B => {
+                w.keep(&[&[0x3B]]);
                 if trailing(&b[i + 1..]) {
-                    labels.push("trailing bytes");
+                    w.labels.push("trailing bytes");
                 }
-                return Ok(labels);
+                return Ok(());
             }
             0x21 => {
                 let label = *b.get(i + 1).ok_or(())?;
                 let (first, next) = sub_blocks(b, i + 2)?;
-                match label {
-                    0xFE => labels.push("comments"),
-                    0xFF if first.starts_with(b"XMP DataXMP") => labels.push("XMP"),
+                let found = match label {
+                    0xFE => Some("comments"),
+                    0xFF if first.starts_with(b"XMP DataXMP") => Some("XMP"),
                     0xFF if first.starts_with(b"NETSCAPE2.0")
                         || first.starts_with(b"ANIMEXTS1.0")
-                        || first.starts_with(b"ICCRGBG1") => {}
-                    0xFF => labels.push("other metadata"),
-                    _ => {}
+                        || first.starts_with(b"ICCRGBG1") =>
+                    {
+                        None
+                    }
+                    0xFF => Some("other metadata"),
+                    _ => None,
+                };
+                match found {
+                    Some(l) => w.labels.push(l),
+                    None => w.keep(&[&b[i..next]]),
                 }
                 i = next;
             }
             0x2C => {
                 let flags = *b.get(i + 9).ok_or(())?;
-                i = sub_blocks(b, i + 11 + table(flags))?.1;
+                let next = sub_blocks(b, i + 11 + table(flags))?.1;
+                w.keep(&[&b[i..next]]);
+                i = next;
             }
             _ => return Err(()),
         }
     }
 }
 
-fn webp(b: &[u8]) -> Result<Labels, ()> {
-    let mut labels = vec![];
+fn webp(b: &[u8], w: &mut Walk) -> Result<(), ()> {
+    w.keep(&[&b[..12]]);
+    let mut exif_kept = false;
     let mut i = 12;
     while i < b.len() {
         let kind = b.get(i..i + 4).ok_or(())?;
         let quad: [u8; 4] = b.get(i + 4..i + 8).ok_or(())?.try_into().map_err(drop)?;
         let len = u32::from_le_bytes(quad) as usize;
         let data = b.get(i + 8..i + 8 + len).ok_or(())?;
-        match kind {
-            b"EXIF" => labels.extend(exif(data.strip_prefix(b"Exif\0\0").unwrap_or(data))?),
-            b"XMP " => labels.push("XMP"),
-            _ => {}
+        let whole = &b[i..(i + 8 + len + len % 2).min(b.len())];
+        let keep = match kind {
+            b"EXIF" => match w.exif(data.strip_prefix(b"Exif\0\0").unwrap_or(data))? {
+                Exif::Keep => {
+                    exif_kept = true;
+                    true
+                }
+                Exif::Drop(turn) => {
+                    if let Some(t) = turn {
+                        let t = turned(t);
+                        w.keep(&[b"EXIF", &(t.len() as u32).to_le_bytes(), &t]);
+                        exif_kept = true;
+                    }
+                    false
+                }
+            },
+            b"XMP " => {
+                w.labels.push("XMP");
+                false
+            }
+            _ => true,
+        };
+        if keep {
+            w.keep(&[whole]);
         }
         i += 8 + len + len % 2;
     }
-    Ok(labels)
+    if let Some(out) = &mut w.out {
+        let size = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&size.to_le_bytes());
+        if out.get(12..16) == Some(b"VP8X") && out.len() > 20 {
+            // The flags say which metadata chunks follow: X (XMP) always goes, E (EXIF)
+            // unless an EXIF chunk stayed.
+            out[20] &= if exif_kept { !0x04 } else { !0x0C };
+        }
+    }
+    Ok(())
 }
 
 const SVG: &str = "http://www.w3.org/2000/svg";
@@ -326,9 +526,35 @@ pub fn svg(text: &str, part: &str) -> Result<Labels, Error> {
             _ => {}
         }
     }
-    labels.sort_unstable_by_key(|l| ORDER.iter().position(|o| o == l));
-    labels.dedup();
+    sort(&mut labels);
     Ok(labels)
+}
+
+/// The SVG picture without `<metadata>`, comments, and Inkscape or Sodipodi elements,
+/// attributes and declarations; `<title>` and `<desc>` stay.
+pub fn strip_svg(bytes: &[u8], part: &str) -> Result<Vec<u8>, Error> {
+    fn clean(e: &mut El) {
+        e.attrs
+            .retain(|a| !EDITORS.contains(&&*a.ns) && !EDITORS.contains(&a.value.as_str()));
+        e.kids.retain(|k| match k {
+            Node::Raw(r) => !r.starts_with("<!--"),
+            Node::El(c) => !c.is(SVG, "metadata") && !EDITORS.contains(&&*c.ns),
+            Node::Text(_) => true,
+        });
+        e.els_mut().for_each(clean);
+    }
+    let mut doc = Doc::parse(bytes, part)?;
+    let mut prolog = String::new();
+    let mut rest = doc.prolog.as_str();
+    while let Some(at) = rest.find("<!--") {
+        prolog += &rest[..at];
+        rest = rest[at..]
+            .find("-->")
+            .map_or("", |end| &rest[at + end + 3..]);
+    }
+    doc.prolog = prolog + rest;
+    clean(&mut doc.root);
+    Ok(doc.write())
 }
 
 /// The labels joined for a detail: `EXIF`, `EXIF and GPS`, `EXIF, GPS and XMP`.
@@ -418,19 +644,6 @@ mod tests {
         assert_eq!(metadata(&[0xFF, 0xD8, 0xFF, 0xE1, 0, 40, 1]), None);
     }
 
-    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut crc = flate2::Crc::new();
-        crc.update(kind);
-        crc.update(data);
-        [
-            (data.len() as u32).to_be_bytes().to_vec(),
-            kind.to_vec(),
-            data.to_vec(),
-            crc.sum().to_be_bytes().to_vec(),
-        ]
-        .concat()
-    }
-
     #[test]
     fn png_chunks_are_named_and_checked() {
         let png = |chunks: &[Vec<u8>]| [b"\x89PNG\r\n\x1a\n".to_vec(), chunks.concat()].concat();
@@ -483,5 +696,135 @@ mod tests {
         assert_eq!(joined(&["EXIF"]), "EXIF");
         assert_eq!(joined(&["EXIF", "GPS"]), "EXIF and GPS");
         assert_eq!(joined(&["EXIF", "GPS", "XMP"]), "EXIF, GPS and XMP");
+    }
+
+    /// An EXIF block whose one directory holds `entries` as (tag, short value).
+    fn exif_with(entries: &[(u16, u16)]) -> Vec<u8> {
+        let mut b = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
+        b.extend((entries.len() as u16).to_le_bytes());
+        for (tag, v) in entries {
+            b.extend(tag.to_le_bytes());
+            b.extend([3, 0, 1, 0, 0, 0]);
+            b.extend(v.to_le_bytes());
+            b.extend([0, 0]);
+        }
+        b.extend([0; 4]);
+        b
+    }
+
+    #[test]
+    fn jpeg_metadata_goes_and_the_scan_stays_byte_for_byte() {
+        let leaky = jpeg_with(
+            &[
+                (0xE0, b"JFIF\0\x01\x02\0\0\x01\0\x01\x01\x01\x10\x20\x30"),
+                (0xE1, &exif_with(&[(0x0112, 6), (0x8825, 1)])),
+                (0xE1, b"http://ns.adobe.com/xap/1.0/\0<x/>"),
+                (0xE2, b"ICC_PROFILE\0\x01\x01icc"),
+                (0xEE, b"Adobe\0\x64"),
+                (0xFE, b"note"),
+            ],
+            b"more",
+        );
+        let scan = &leaky[leaky.len() - 17..leaky.len() - 4];
+        let office = strip(&leaky, true).unwrap();
+        assert_eq!(metadata(&office), Some(vec![]));
+        assert_eq!(orientation(&office), Some(6));
+        assert!(office.ends_with(scan), "{office:x?}");
+        let icc = b"ICC_PROFILE\0\x01\x01icc";
+        assert!(office.windows(icc.len()).any(|w| w == icc));
+        assert!(office.windows(6).any(|w| w == b"Adobe\0"));
+        assert!(office.windows(4).all(|w| w != b"note"));
+        let pdf = strip(&leaky, false).unwrap();
+        assert_eq!(metadata(&pdf), Some(vec![]));
+        assert_eq!(orientation(&pdf), Some(1));
+        assert_eq!(pdf.len(), office.len() - 36);
+        // An orientation-only block is no metadata: Office keeps it, a PDF copy doesn't.
+        let turned = jpeg_with(&[(0xE1, &exif_with(&[(0x0112, 3)]))], b"");
+        assert_eq!(strip(&turned, true).unwrap(), turned);
+        assert_eq!(orientation(&strip(&turned, false).unwrap()), Some(1));
+        let cut = jpeg_with(&[(0xFE, b"note")], b"");
+        assert_eq!(strip(&cut[..cut.len() - 4], true), None);
+    }
+
+    #[test]
+    fn png_gif_and_webp_metadata_goes() {
+        let png = |chunks: &[Vec<u8>]| [PNG.to_vec(), chunks.concat()].concat();
+        let idat = chunk(b"IDAT", b"pixels");
+        let kept = [
+            chunk(b"IHDR", &[0; 13]),
+            chunk(b"iCCP", b"icc"),
+            idat.clone(),
+            chunk(b"IEND", b""),
+        ];
+        let leaky = png(&[
+            kept[0].clone(),
+            chunk(b"tEXt", b"Author\0Avery"),
+            chunk(b"eXIf", &exif_with(&[(0x8825, 1)])[6..]),
+            kept[1].clone(),
+            chunk(b"tIME", &[0; 7]),
+            kept[2].clone(),
+            kept[3].clone(),
+            b"zip".to_vec(),
+        ]);
+        assert_eq!(strip(&leaky, true).unwrap(), png(&kept));
+
+        let mut gif = b"GIF89a\x01\0\x01\0\x80\0\0".to_vec();
+        gif.extend([0; 6]);
+        let netscape = b"\x21\xFF\x0bNETSCAPE2.0\x03\x01\0\0\0";
+        let image = b"\x2C\0\0\0\0\x01\0\x01\0\0\x02\x02\x4c\x01\0";
+        let clean = [gif.as_slice(), netscape, image, b"\x3B"].concat();
+        let leaky = [
+            gif.as_slice(),
+            b"\x21\xFE\x04note\0",
+            netscape,
+            b"\x21\xFF\x0bXMP DataXMP\x01x\0",
+            image,
+            b"\x3Btail",
+        ]
+        .concat();
+        assert_eq!(strip(&leaky, true).unwrap(), clean);
+
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0".to_vec();
+        webp.extend(b"VP8 \x01\0\0\0\x07\0");
+        webp.extend(b"EXIF");
+        let exif = exif_with(&[(0x0112, 8), (0x010F, 1)]);
+        webp.extend((exif.len() as u32).to_le_bytes());
+        webp.extend(&exif);
+        webp.extend(b"XMP \x03\0\0\0<x>\0");
+        let out = strip(&webp, true).unwrap();
+        assert_eq!(metadata(&out), Some(vec![]));
+        assert_eq!(&out[4..8], &((out.len() - 8) as u32).to_le_bytes());
+        // E stays for the orientation written back; X goes.
+        assert_eq!(out[20], 0x28);
+        assert!(out.windows(10).any(|w| w == b"VP8 \x01\0\0\0\x07\0"));
+        assert_eq!(strip(&webp, false).unwrap()[20], 0x20);
+    }
+
+    #[test]
+    fn tiff_and_unknown_pictures() {
+        assert_eq!(strip(&tiff_with(&[256, 0x8825]), true), None);
+        let emf = b"\x01\x00\x09\x00 EMF".to_vec();
+        assert_eq!(strip(&emf, true), Some(emf));
+    }
+
+    #[test]
+    fn svg_metadata_goes_and_titles_stay() {
+        let svg_text = format!(
+            "<?xml version=\"1.0\"?><!-- Created with Inkscape --><svg xmlns=\"{SVG}\" xmlns:inkscape=\"{}\" inkscape:version=\"1.3\"><title>Logo</title><!-- by Avery --><metadata><x/></metadata><inkscape:grid/><rect width=\"1\"/></svg>",
+            EDITORS[1]
+        );
+        assert_eq!(
+            svg(&svg_text, "a.svg").unwrap(),
+            ["XMP", "comments", "other metadata"]
+        );
+        let out = strip_svg(svg_text.as_bytes(), "a.svg").unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "<?xml version=\"1.0\"?><svg xmlns=\"{SVG}\"><title>Logo</title><rect width=\"1\"/></svg>"
+            )
+        );
+        assert_eq!(svg(&out, "a.svg").unwrap(), Vec::<&str>::new());
     }
 }

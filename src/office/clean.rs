@@ -16,6 +16,7 @@ use super::{
     CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, drawing, excel, key, ns,
     part_name, powerpoint, rels_name, resolve, revisions, word,
 };
+use crate::pictures;
 use crate::report::{Change, CheckId, Error, Finding, Format, counted, safe};
 use quick_xml::events::Event;
 
@@ -505,7 +506,7 @@ fn ids(root: &El) -> HashSet<String> {
 }
 
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 17] = [
+const CLEANABLE: [CheckId; 18] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::TrackedChanges,
@@ -520,6 +521,7 @@ const CLEANABLE: [CheckId; 17] = [
     CheckId::CustomData,
     CheckId::Macros,
     CheckId::ExternalLinks,
+    CheckId::ImageMetadata,
     CheckId::PivotCaches,
     CheckId::LeftoverData,
     CheckId::Signatures,
@@ -546,6 +548,18 @@ fn blocking(
             .collect();
         if kinds.is_empty() {
             continue;
+        }
+        if c == CheckId::ImageMetadata {
+            let tiff = found
+                .iter()
+                .filter(|f| f.check == c)
+                .filter_map(|f| f.place.part.as_deref())
+                .find(|p| pkg.read(p).is_ok_and(|b| pictures::is_tiff(&b)));
+            if let Some(p) = tiff {
+                let hint = "Replace the TIFF picture with a PNG or JPEG copy, or use --keep image-metadata.";
+                out.push((c, format!("picture {} is a TIFF", safe(p)), hint.into()));
+                continue;
+            }
         }
         let why = match c {
             CheckId::EmbeddedFiles if kinds.contains(&"imported_chunk") => Some((
@@ -660,6 +674,9 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     }
     if has(CheckId::Metadata) {
         metadata(&mut d)?;
+    }
+    if has(CheckId::ImageMetadata) {
+        image_metadata(&mut d, found)?;
     }
     let leftovers = remove.contains(&CheckId::LeftoverData);
     if leftovers && has(CheckId::LeftoverData) {
@@ -1371,6 +1388,26 @@ fn leftover_data(ctx: &Ctx, d: &mut Draft, found: &[Finding]) -> Result<(), Erro
         for g in word::glossaries(ctx) {
             d.delete(g)?;
         }
+    }
+    Ok(())
+}
+
+/// `image-metadata`: each picture the check named is copied without its metadata; its pixels
+/// stay byte for byte. (TIFF pictures were refused before any edit.)
+fn image_metadata(d: &mut Draft, found: &[Finding]) -> Result<(), Error> {
+    for f in found.iter().filter(|f| f.check == CheckId::ImageMetadata) {
+        let Some(part) = f.place.part.as_deref() else {
+            continue;
+        };
+        let Some(bytes) = d.bytes(part) else {
+            continue;
+        };
+        let copy = match d.content_type(part).as_deref() {
+            Some("image/svg+xml") => pictures::strip_svg(bytes, part)?,
+            _ => pictures::strip(bytes, true)
+                .ok_or_else(|| Error::damaged(&format!("picture {} is cut short", safe(part))))?,
+        };
+        d.set(part, copy);
     }
     Ok(())
 }
