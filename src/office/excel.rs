@@ -5,8 +5,10 @@ use std::collections::{HashMap, HashSet};
 
 use quick_xml::events::{BytesStart, Event};
 
+use super::clean::Draft;
 use super::colour::{self, Rgb, Theme};
 use super::common::{CELL_SHEETS, targets};
+use super::tree::{El, Node};
 use super::xml::{self, Reader};
 use super::{Ctx, ns};
 use crate::report::{CheckId, Error, Finding, Where, counted, plural};
@@ -563,6 +565,88 @@ pub fn pivot_caches(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         ));
     }
     Ok(found)
+}
+
+/// The cell sheets of the copy (worksheets and macro sheets).
+pub fn cell_sheets(d: &Draft) -> Vec<String> {
+    let names = d.names();
+    names
+        .into_iter()
+        .filter(|n| {
+            d.content_type(n)
+                .is_some_and(|t| CELL_SHEETS.contains(&t.as_str()))
+        })
+        .collect()
+}
+
+/// The shared-string index a cell holds, when it holds one.
+fn shared_index(c: &El) -> Option<usize> {
+    (c.attr("", "t") == Some("s"))
+        .then(|| c.child(ns::S, "v"))
+        .flatten()
+        .and_then(|v| v.text().trim().parse().ok())
+}
+
+/// Rebuilds the shared strings of the copy with only the strings some cell uses, renumbering
+/// the cells that use them.
+pub fn rebuild_strings(d: &mut Draft) -> Result<(), Error> {
+    let sheets = cell_sheets(d);
+    for sst in d
+        .linked("sharedStrings")?
+        .into_iter()
+        .filter_map(|l| l.part)
+    {
+        let mut used = std::collections::BTreeSet::new();
+        let mut refs = 0usize;
+        for s in &sheets {
+            if let Some(doc) = d.doc(s)? {
+                doc.root.each(&mut |e| {
+                    if e.is(ns::S, "c")
+                        && let Some(i) = shared_index(e)
+                    {
+                        used.insert(i);
+                        refs += 1;
+                    }
+                });
+            }
+        }
+        let map: HashMap<usize, usize> = used
+            .iter()
+            .enumerate()
+            .map(|(new, &old)| (old, new))
+            .collect();
+        d.edit(&sst, |root| {
+            let mut i = 0;
+            root.kids.retain(|k| match k {
+                Node::El(e) if e.is(ns::S, "si") => {
+                    i += 1;
+                    map.contains_key(&(i - 1))
+                }
+                _ => true,
+            });
+            root.set("", "count", &refs.to_string());
+            root.set("", "uniqueCount", &map.len().to_string());
+            Ok(true)
+        })?;
+        for s in &sheets {
+            d.edit(s, |root| {
+                let mut changed = false;
+                root.each_mut(&mut |e| {
+                    if e.is(ns::S, "c")
+                        && let Some(old) = shared_index(e)
+                        && let Some(&new) = map.get(&old)
+                        && new != old
+                        && let Some(v) = e.child_mut(ns::S, "v")
+                    {
+                        v.kids = vec![Node::Text(new.to_string())];
+                        changed = true;
+                    }
+                });
+                Ok(changed)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

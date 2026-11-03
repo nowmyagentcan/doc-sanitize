@@ -40,7 +40,7 @@ fn finding(
 }
 
 /// The part a relationship part belongs to ("" for the package), from its name.
-fn rels_source(name: &str) -> Option<String> {
+pub fn rels_source(name: &str) -> Option<String> {
     let (dir, file) = name.rsplit_once('/')?;
     let file = file.strip_suffix(".rels")?;
     let parent = dir.strip_suffix("_rels")?;

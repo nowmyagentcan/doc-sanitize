@@ -4,14 +4,16 @@ mod text;
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use doc_sanitize::input::{self, Input};
-use doc_sanitize::report::{CHECKS, Error, FileResult, Report, safe};
+use doc_sanitize::report::{
+    CHECKS, CheckId, CleanReport, CleanResult, Error, FileResult, Report, safe,
+};
 use doc_sanitize::run;
 use text::{Look, Out};
 
@@ -33,6 +35,14 @@ struct Cli {
     json: bool,
     #[arg(long)]
     debug: bool,
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    keep: Vec<String>,
+    #[arg(short = 'o', value_name = "FILE", conflicts_with = "out_dir")]
+    out: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+    #[arg(long)]
+    overwrite: bool,
     #[arg(short, long)]
     help: bool,
     #[arg(short = 'V', long)]
@@ -43,15 +53,21 @@ const ABOUT: &str = "Find and remove hidden data in PDF, Word, Excel and PowerPo
 
 const USAGE: &str = "\
 Usage: doc-sanitize [check] <PATH>... [OPTIONS]
+       doc-sanitize clean <PATH>... [OPTIONS]
 
 Commands:
   check  Report hidden data (the default when the first argument is a path)
+  clean  Write a copy without it, check the copy again, and keep it only if nothing is left
 
 Options:
   -r                 Look in subfolders too
       --password PW  PDF user password
       --show-values  Also print the hidden text itself (off: only places and counts)
       --json         Print one JSON object
+      --keep LIST    clean: checks to leave in place, comma-separated
+  -o FILE            clean, one file: where to write the copy
+      --out-dir DIR  clean: folder for the copies
+      --overwrite    clean: replace an existing -o file
       --debug        Show stack traces and timings
   -h, --help         Print help
   -V, --version      Print version";
@@ -66,6 +82,9 @@ JPEG 2000 metadata, Office ink and embedded fonts.
 Examples:
   doc-sanitize contract.docx
   doc-sanitize redacted.pdf --json
+  doc-sanitize clean contract.docx
+  doc-sanitize clean deck.pptx --keep speaker-notes -o deck-to-send.pptx
+  doc-sanitize clean exports/ -r --out-dir outbox/
   doc-sanitize check filing.pdf --show-values";
 
 fn help() -> String {
@@ -79,7 +98,8 @@ fn help() -> String {
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     // Only an exact first argument is a command: `./check` is a file.
-    if args.get(1).is_some_and(|a| a == "check") {
+    let clean = args.get(1).is_some_and(|a| a == "clean");
+    if clean || args.get(1).is_some_and(|a| a == "check") {
         args.remove(1);
     }
     let json = args
@@ -104,14 +124,29 @@ fn main() -> ExitCode {
         let e = Error::usage("No file given.", "Try: doc-sanitize contract.docx");
         return fail(&e, cli.json);
     }
+    if !clean && let Some(flag) = clean_only(&cli) {
+        let e = Error::usage(
+            format!("{flag} works only with clean."),
+            "See doc-sanitize --help.",
+        );
+        return fail(&e, cli.json);
+    }
     let inputs = match input::expand(&cli.paths, cli.recursive) {
         Ok(inputs) => inputs,
+        Err(e) => return fail(&e, cli.json),
+    };
+    let options = match clean.then(|| clean_options(&cli, &inputs)).transpose() {
+        Ok(o) => o,
         Err(e) => return fail(&e, cli.json),
     };
     let mut out = Out::new(io::stdout().lock(), Look::stdout());
     let mut err = Out::new(io::stderr(), Look::stderr());
     let mut code = 0;
-    match check(&cli, &inputs, &mut out, &mut err, &mut code) {
+    let done = match &options {
+        Some(o) => clean_all(&cli, o, &inputs, &mut out, &mut err, &mut code),
+        None => check(&cli, &inputs, &mut out, &mut err, &mut code),
+    };
+    match done {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
             let _ = text::error(
                 &mut err,
@@ -148,14 +183,7 @@ fn check(
             }
             Input::File(path) if cli.json => run::check(path, &options),
             Input::File(path) => {
-                let name = safe(&path.file_name().unwrap_or_default().to_string_lossy());
-                let label = match inputs.len() {
-                    1 => format!("Checking {name}"),
-                    n => {
-                        let dot = err.look.pick("·", "-");
-                        format!("Checking {} of {n} {dot} {name}", i + 1)
-                    }
-                };
+                let label = progress("Checking", err.look, path, i, inputs.len());
                 text::spin(err, &label, || run::check(path, &options))
             }
         };
@@ -180,6 +208,141 @@ fn check(
         text::summary(out, &files)?;
     }
     out.w.flush()
+}
+
+/// The first clean-only option given.
+fn clean_only(cli: &Cli) -> Option<&'static str> {
+    [
+        (!cli.keep.is_empty(), "--keep"),
+        (cli.out.is_some(), "-o"),
+        (cli.out_dir.is_some(), "--out-dir"),
+        (cli.overwrite, "--overwrite"),
+    ]
+    .into_iter()
+    .find_map(|(given, flag)| given.then_some(flag))
+}
+
+/// The clean options, refusing a `--keep` id that is unknown or can't be kept, `-o` with
+/// several files and an `-o` that is the input.
+fn clean_options(cli: &Cli, inputs: &[Input]) -> Result<run::CleanOptions, Error> {
+    let mut keep = vec![];
+    for id in cli.keep.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+        match CheckId::parse(id) {
+            Some(CheckId::Signatures) => {
+                return Err(Error::usage(
+                    "Signatures can't be kept: any change to a signed file breaks its signature.",
+                    "Leave signatures out of --keep.",
+                ));
+            }
+            Some(CheckId::OldRevisions) => {
+                return Err(Error::usage(
+                    "Old revisions can't be kept: a cleaned PDF is always written as one revision.",
+                    "Leave old-revisions out of --keep.",
+                ));
+            }
+            Some(c) => keep.push(c),
+            None => {
+                let ids: Vec<_> = CHECKS.iter().map(|c| c.0).collect();
+                return Err(Error::usage(
+                    format!("Unknown check \"{}\".", safe(id)),
+                    &format!("Checks: {}.", ids.join(", ")),
+                ));
+            }
+        }
+    }
+    let target = match (&cli.out, &cli.out_dir) {
+        (Some(file), _) => {
+            if inputs.len() != 1 {
+                return Err(Error::usage(
+                    format!("-o works with one file; you gave {}.", inputs.len()),
+                    "Use --out-dir for several files.",
+                ));
+            }
+            if same_file(file, inputs[0].path()) {
+                return Err(Error::usage(
+                    "The output would replace the input file.",
+                    "Choose another name with -o.",
+                ));
+            }
+            run::Target::File(file.clone())
+        }
+        (None, Some(dir)) => run::Target::Dir(dir.clone()),
+        (None, None) => run::Target::Beside,
+    };
+    Ok(run::CleanOptions {
+        check: run::Options {
+            show_values: cli.show_values,
+            password: cli.password.clone(),
+        },
+        keep,
+        target,
+        overwrite: cli.overwrite,
+    })
+}
+
+/// Whether two paths name one existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Cleans every input in order, printing text per file as it finishes or one JSON object at
+/// the end; `code` follows the highest exit code earned.
+fn clean_all(
+    cli: &Cli,
+    options: &run::CleanOptions,
+    inputs: &[Input],
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+    code: &mut u8,
+) -> io::Result<()> {
+    let mut files: Vec<CleanResult> = vec![];
+    for (i, input) in inputs.iter().enumerate() {
+        let start = Instant::now();
+        let (file, panic) = match input {
+            Input::Failed(path, e) => {
+                let name = safe(&path.to_string_lossy());
+                let failed = FileResult::failed(name, e.clone());
+                (CleanResult::failed(failed, e.clone()), None)
+            }
+            Input::File(path) if cli.json => run::clean(path, options),
+            Input::File(path) => {
+                let label = progress("Cleaning", err.look, path, i, inputs.len());
+                text::spin(err, &label, || run::clean(path, options))
+            }
+        };
+        *code = (*code).max(file.exit_code());
+        if cli.debug {
+            let what = file.variant.unwrap_or("not identified");
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            writeln!(err.w, "debug: {}: {what}, {ms:.1} ms", file.path)?;
+            if let Some(at) = panic {
+                writeln!(err.w, "debug: {}: {at}", file.path)?;
+            }
+        }
+        if !cli.json {
+            text::cleaned(out, err, &file, i == 0)?;
+        }
+        files.push(file);
+    }
+    if cli.json {
+        serde_json::to_writer_pretty(&mut out.w, &CleanReport::new(&files))?;
+        writeln!(out.w)?;
+    } else if files.len() > 1 {
+        text::clean_summary(out, &files)?;
+    }
+    out.w.flush()
+}
+
+/// The spinner's label: `Checking report.pdf`, or `Checking 2 of 5 · report.pdf`.
+fn progress(verb: &str, look: Look, path: &Path, i: usize, n: usize) -> String {
+    let name = safe(&path.file_name().unwrap_or_default().to_string_lossy());
+    match n {
+        1 => format!("{verb} {name}"),
+        n => format!("{verb} {} of {n} {} {name}", i + 1, look.pick("·", "-")),
+    }
 }
 
 /// A clap error as our usage error: `Unknown option --x.` or clap's own sentence.

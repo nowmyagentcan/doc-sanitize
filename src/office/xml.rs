@@ -300,6 +300,28 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// Every attribute of `e` as written, namespace declarations included, as (namespace,
+    /// qualified name, value with references replaced); a declaration has no namespace.
+    pub fn raw_attrs(&self, e: &BytesStart) -> Result<Vec<(String, String, String)>, Error> {
+        let mut out = vec![];
+        for a in e.attributes().with_checks(false) {
+            let a = a.map_err(|_| Error::bad_xml(self.part))?;
+            let name = a.key.as_ref().to_string();
+            let ns = match a.key.as_namespace_binding() {
+                Some(_) => String::new(),
+                None => match self.inner.resolver().resolve_attribute(a.key).0 {
+                    ResolveResult::Bound(ns) => ns.0.to_string(),
+                    _ => String::new(),
+                },
+            };
+            let value = a
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|_| Error::bad_xml(self.part))?;
+            out.push((ns, name, value.into_owned()));
+        }
+        Ok(out)
+    }
+
     /// Reads to the end, checking every event.
     pub fn validate(mut self) -> Result<(), Error> {
         while !matches!(self.event()?, Event::Eof) {}

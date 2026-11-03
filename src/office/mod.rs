@@ -3,11 +3,13 @@
 //! relationships, decides the variant from the main part's type and checks that every XML part
 //! is well-formed within the XML limits.
 
+pub mod clean;
 pub mod colour;
 pub mod common;
 pub mod drawing;
 pub mod excel;
 pub mod powerpoint;
+pub mod tree;
 pub mod word;
 pub mod xml;
 pub mod zipscan;
@@ -155,7 +157,7 @@ pub struct Ctx<'p> {
 }
 
 impl<'p> Ctx<'p> {
-    fn new(pkg: &'p Package, values: bool) -> Result<Self, Error> {
+    pub fn new(pkg: &'p Package, values: bool) -> Result<Self, Error> {
         let mut ctx = Self {
             pkg,
             values,
@@ -229,14 +231,14 @@ impl<'p> Ctx<'p> {
 const MAX_PART: u64 = 256 << 20;
 const MAX_PACKAGE: u64 = 1 << 30;
 
-const CONTENT_TYPES: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
-const RELATIONSHIPS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+pub const CONTENT_TYPES: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+pub const RELATIONSHIPS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const OFFICE_DOCUMENT: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
 const STRICT: &str = "http://purl.oclc.org/ooxml/";
 
 /// The variant each main part's content type makes a package.
-const MAIN_TYPES: [(&str, Format, &str); 14] = [
+pub const MAIN_TYPES: [(&str, Format, &str); 14] = [
     (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
         Format::Docx,

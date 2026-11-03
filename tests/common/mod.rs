@@ -493,3 +493,33 @@ pub const PDF_CHECKS: [&str; 13] = [
     "signatures",
     "form-data",
 ];
+
+/// Every entry of a ZIP, inflated, in order.
+pub fn unzip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    (0..z.len())
+        .map(|i| {
+            let mut e = z.by_index(i).unwrap();
+            let mut data = vec![];
+            e.read_to_end(&mut data).unwrap();
+            (e.name().unwrap().to_string(), data)
+        })
+        .collect()
+}
+
+/// The planted secrets (each starts with SECRET) anywhere in `bytes`, in order.
+pub fn secrets_in(bytes: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Vec<String> = text
+        .match_indices("SECRET")
+        .map(|(i, _)| {
+            text[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect()
+        })
+        .collect();
+    out.dedup();
+    out
+}

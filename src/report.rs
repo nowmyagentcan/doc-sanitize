@@ -89,8 +89,41 @@ pub const CHECKS: [(&str, &str); 22] = [
 ];
 
 impl CheckId {
+    pub const ALL: [CheckId; 22] = {
+        use CheckId::*;
+        [
+            Metadata,
+            Comments,
+            TrackedChanges,
+            HiddenText,
+            FakeRedactions,
+            HiddenLayers,
+            HiddenSheets,
+            HiddenRowsColumns,
+            HiddenSlides,
+            SpeakerNotes,
+            HiddenObjects,
+            EmbeddedFiles,
+            CustomData,
+            Macros,
+            ExternalLinks,
+            ImageMetadata,
+            CroppedImages,
+            PivotCaches,
+            OldRevisions,
+            LeftoverData,
+            Signatures,
+            FormData,
+        ]
+    };
+
     pub fn id(self) -> &'static str {
         CHECKS[self as usize].0
+    }
+
+    /// The check with the id `id`.
+    pub fn parse(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.id() == id)
     }
 }
 
@@ -116,6 +149,8 @@ pub enum Status {
     NoneFound,
     Incomplete,
     Error,
+    /// A re-check's check that the person chose to keep.
+    Kept,
 }
 
 /// Where a finding is. Every field is a place in the file's structure, never a found value.
@@ -303,9 +338,9 @@ impl Error {
         }
     }
 
-    /// The message with the file's name in place of `{name}`.
+    /// The message with the file's name in place of each `{name}`.
     pub fn named(mut self, name: &str) -> Self {
-        self.message = self.message.replacen("{name}", name, 1);
+        self.message = self.message.split("{name}").collect::<Vec<_>>().join(name);
         self
     }
 
@@ -442,6 +477,47 @@ impl Error {
 
     pub fn usage(message: impl Into<String>, hint: &str) -> Self {
         Self::new("usage", message, hint)
+    }
+
+    /// `cannot_clean`, one line per blocking check: (check, reason, hint).
+    pub fn cannot_clean(blocks: &[(CheckId, String, String)]) -> Self {
+        let message: Vec<_> = blocks
+            .iter()
+            .map(|(c, reason, _)| format!("Can't remove {} from {{name}}: {reason}.", c.id()))
+            .collect();
+        let hint: Vec<_> = blocks.iter().map(|b| b.2.as_str()).collect();
+        Self::new("cannot_clean", message.join("\n"), &hint.join("\n"))
+    }
+
+    pub fn recheck_failed(check: CheckId) -> Self {
+        Self::new(
+            "recheck_failed",
+            format!(
+                "The cleaned copy of {{name}} still held {}, so it wasn't saved.",
+                check.id()
+            ),
+            "This is a bug. Please report it at https://github.com/nowmyagentcan/doc-sanitize/issues with the --json output (no file needed).",
+        )
+    }
+
+    pub fn output_exists(output: &str) -> Self {
+        Self::new(
+            "output_exists",
+            format!("{} already exists.", safe(output)),
+            "Pass --overwrite to replace it, or choose another name with -o.",
+        )
+    }
+
+    pub fn write_failed(output: &str, reason: impl std::fmt::Display) -> Self {
+        Self::new(
+            "write_failed",
+            format!(
+                "Can't write {}: {}.",
+                safe(output),
+                safe(&reason.to_string())
+            ),
+            "Check that the folder exists and you can write to it.",
+        )
     }
 
     pub fn exit_code(&self) -> u8 {
@@ -583,6 +659,202 @@ impl<'a> Report<'a> {
                 with_findings: count(Status::Found),
                 incomplete: count(Status::Incomplete),
                 failed: count(Status::Error),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanStatus {
+    Cleaned,
+    CleanedIncomplete,
+    NotCleaned,
+}
+
+/// What clean removed of one check, in one unit.
+#[derive(Debug, Serialize)]
+pub struct Removed {
+    pub check: CheckId,
+    pub count: u64,
+    pub unit: &'static str,
+    pub detail: String,
+}
+
+/// Something about the copy that a reader will see differently.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Change {
+    pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<usize>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slides: Option<Vec<usize>>,
+    pub detail: String,
+}
+
+impl Change {
+    pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            count: None,
+            pages: None,
+            slides: None,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn counted(code: &'static str, n: u64, detail: impl Into<String>) -> Self {
+        Self {
+            count: Some(n),
+            ..Self::new(code, detail)
+        }
+    }
+}
+
+/// The check of the copy: kept checks show as `kept`, and the status leaves them out.
+#[derive(Debug, Serialize)]
+pub struct Recheck {
+    pub status: Status,
+    pub checks: Vec<CheckResult>,
+    pub findings: Vec<Finding>,
+}
+
+impl Recheck {
+    /// `copy`'s check with the `kept` checks marked; its findings are those of the rest.
+    pub fn of(copy: FileResult, kept: &[CheckId]) -> Self {
+        let mut checks = copy.checks;
+        for c in &mut checks {
+            if kept.contains(&c.id) {
+                c.status = Status::Kept;
+            }
+        }
+        let findings: Vec<_> = copy
+            .findings
+            .into_iter()
+            .filter(|f| !kept.contains(&f.check))
+            .collect();
+        let status = if !findings.is_empty() {
+            Status::Found
+        } else if checks.iter().any(|c| c.status == Status::Incomplete) {
+            Status::Incomplete
+        } else {
+            Status::NoneFound
+        };
+        Self {
+            status,
+            checks,
+            findings,
+        }
+    }
+}
+
+/// One cleaned (or not cleaned) file.
+#[derive(Debug, Serialize)]
+pub struct CleanResult {
+    pub path: String,
+    pub format: Option<Format>,
+    pub variant: Option<&'static str>,
+    pub output: Option<String>,
+    pub status: CleanStatus,
+    pub removed: Vec<Removed>,
+    pub kept: Vec<CheckId>,
+    pub changes: Vec<Change>,
+    pub recheck: Option<Recheck>,
+    pub warnings: Vec<Warning>,
+    pub error: Option<Error>,
+}
+
+impl CleanResult {
+    /// A file that wasn't cleaned, with what was known about it.
+    pub fn failed(checked: FileResult, error: Error) -> Self {
+        Self {
+            error: Some(error.named(&checked.path)),
+            path: checked.path,
+            format: checked.format,
+            variant: checked.variant,
+            output: None,
+            status: CleanStatus::NotCleaned,
+            removed: vec![],
+            kept: vec![],
+            changes: vec![],
+            recheck: None,
+            warnings: checked.warnings,
+        }
+    }
+
+    /// 0 when cleaned, 3 for write and internal errors, else 1.
+    pub fn exit_code(&self) -> u8 {
+        match (&self.error, self.status) {
+            (Some(e), _) => e.exit_code(),
+            (None, CleanStatus::Cleaned) => 0,
+            _ => 1,
+        }
+    }
+}
+
+/// The input's findings summed per check and unit, the kept checks left out.
+pub fn removed(findings: &[Finding], kept: &[CheckId]) -> Vec<Removed> {
+    let mut out: Vec<Removed> = vec![];
+    for f in findings.iter().filter(|f| !kept.contains(&f.check)) {
+        match out
+            .iter_mut()
+            .find(|r| r.check == f.check && r.unit == f.unit)
+        {
+            Some(r) => r.count += f.count,
+            None => out.push(Removed {
+                check: f.check,
+                count: f.count,
+                unit: f.unit,
+                detail: String::new(),
+            }),
+        }
+    }
+    for r in &mut out {
+        r.detail = format!("{} removed", quantity(r.count, r.unit));
+    }
+    out
+}
+
+/// `1 sheet`, `3 sheets`, `1 person`: a count with its unit, singular for one.
+pub fn quantity(n: u64, unit: &str) -> String {
+    let one = match unit {
+        "people" => "person",
+        u => u.strip_suffix('s').unwrap_or(u),
+    };
+    counted(n, one, unit)
+}
+
+#[derive(Debug, Serialize)]
+pub struct CleanSummary {
+    pub files: usize,
+    pub cleaned: usize,
+    pub cleaned_incomplete: usize,
+    pub not_cleaned: usize,
+}
+
+/// A clean run, as `--json` prints it.
+#[derive(Debug, Serialize)]
+pub struct CleanReport<'a> {
+    pub version: &'static str,
+    pub command: &'static str,
+    pub files: &'a [CleanResult],
+    pub summary: CleanSummary,
+}
+
+impl<'a> CleanReport<'a> {
+    pub fn new(files: &'a [CleanResult]) -> Self {
+        let count = |s| files.iter().filter(|f| f.status == s).count();
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            command: "clean",
+            files,
+            summary: CleanSummary {
+                files: files.len(),
+                cleaned: count(CleanStatus::Cleaned),
+                cleaned_incomplete: count(CleanStatus::CleanedIncomplete),
+                not_cleaned: count(CleanStatus::NotCleaned),
             },
         }
     }

@@ -640,3 +640,15 @@ pub fn story_items(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     }
     Ok(found)
 }
+
+/// The document's glossary parts.
+pub fn glossaries<'p>(ctx: &Ctx<'p>) -> Vec<&'p str> {
+    let pkg = ctx.pkg;
+    stories(ctx)
+        .into_iter()
+        .filter(|p| {
+            pkg.content_type(p)
+                .is_some_and(|t| t.ends_with("glossary+xml"))
+        })
+        .collect()
+}

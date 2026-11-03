@@ -8,7 +8,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use doc_sanitize::report::{FileResult, Finding, Status, plural};
+use doc_sanitize::report::{
+    CleanResult, CleanStatus, FileResult, Finding, Status, plural, quantity,
+};
 
 const BOLD: &str = "1";
 const DIM: &str = "2";
@@ -231,11 +233,123 @@ pub fn summary(out: &mut Out<impl Write>, files: &[FileResult]) -> io::Result<()
     out.line(&line)
 }
 
-/// `✗ message` and the hint indented on the next line.
+/// `✗ message` and the hint indented on the next line; a message of several lines with as many
+/// hints gives each line its hint.
 pub fn error(err: &mut Out<impl Write>, message: &str, hint: &str) -> io::Result<()> {
     let mark = err.look.paint(RED, err.look.pick("✗", "x"));
+    let (lines, hints): (Vec<_>, Vec<_>) = (message.lines().collect(), hint.lines().collect());
+    if lines.len() > 1 && lines.len() == hints.len() {
+        for (m, h) in lines.iter().zip(hints) {
+            err.line(&format!("{mark} {m}"))?;
+            err.line(&format!("  {h}"))?;
+        }
+        return Ok(());
+    }
     err.line(&format!("{mark} {message}"))?;
     err.line(&format!("  {hint}"))
+}
+
+/// One cleaned file: `{path} → {output}`, what was removed and kept, the changes, warnings and
+/// the re-check; or why it wasn't cleaned, on stderr. `first` leaves out the blank line that
+/// separates files.
+pub fn cleaned(
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+    f: &CleanResult,
+    first: bool,
+) -> io::Result<()> {
+    let (Some(output), Some(recheck)) = (&f.output, &f.recheck) else {
+        if !first {
+            err.line("")?;
+        }
+        let e = f.error.as_ref();
+        return error(
+            err,
+            e.map_or("", |e| e.message.as_str()),
+            e.map_or("", |e| e.hint.as_str()),
+        );
+    };
+    if !first {
+        out.line("")?;
+    }
+    let look = out.look;
+    let arrow = look.pick("→", "->");
+    let label = |s: &str| look.paint(DIM, s);
+    out.line(&format!(
+        "{} {arrow} {}",
+        look.paint(BOLD, &f.path),
+        look.paint(BOLD, output)
+    ))?;
+    let mut groups: Vec<(&str, Vec<String>)> = vec![];
+    for r in &f.removed {
+        let q = quantity(r.count, r.unit);
+        match groups.iter_mut().find(|g| g.0 == r.check.id()) {
+            Some(g) => g.1.push(q),
+            None => groups.push((r.check.id(), vec![q])),
+        }
+    }
+    if !groups.is_empty() {
+        let shown: Vec<_> = groups
+            .iter()
+            .map(|(id, qs)| format!("{id} ({})", qs.join(", ")))
+            .collect();
+        out.line(&format!("  {}  {}", label("removed"), shown.join(", ")))?;
+    }
+    if !f.kept.is_empty() {
+        let ids: Vec<_> = f.kept.iter().map(|c| c.id()).collect();
+        out.line(&format!("  {}     {}", label("kept"), ids.join(", ")))?;
+    }
+    for (i, c) in f.changes.iter().enumerate() {
+        match i {
+            0 => out.line(&format!("  {}  {}", label("changed"), c.detail))?,
+            _ => out.line(&format!("           {}", c.detail))?,
+        }
+    }
+    for w in &f.warnings {
+        out.line(&format!("  {} {}", look.paint(YELLOW, "!"), w.message))?;
+    }
+    let incomplete: Vec<_> = recheck
+        .checks
+        .iter()
+        .filter(|c| c.status == Status::Incomplete)
+        .collect();
+    let n = plural(recheck.checks.len() as u64, "check");
+    let mut line = match incomplete.len() {
+        0 => format!(
+            "{} re-checked: {n}, nothing left",
+            look.paint(GREEN, look.pick("✓", "ok"))
+        ),
+        i => format!(
+            "{} re-checked: {n}, {i} incomplete",
+            look.paint(YELLOW, "!")
+        ),
+    };
+    if !f.kept.is_empty() {
+        line += &format!(" ({} kept)", f.kept.len());
+    }
+    out.line(&format!("  {line}"))?;
+    for c in incomplete {
+        let note = c.note.as_deref().unwrap_or_default();
+        out.line(&format!(
+            "    {} {}  {note}",
+            look.paint(YELLOW, "!"),
+            c.id.id()
+        ))?;
+    }
+    Ok(())
+}
+
+/// `{c} of {n} cleaned`, with ` · {e} not cleaned` when any weren't, after a blank line.
+pub fn clean_summary(out: &mut Out<impl Write>, files: &[CleanResult]) -> io::Result<()> {
+    let count = |s| files.iter().filter(|f| f.status == s).count();
+    let mut line = format!("{} of {} cleaned", count(CleanStatus::Cleaned), files.len());
+    let not = count(CleanStatus::NotCleaned);
+    if not > 0 {
+        let dot = out.look.paint(DIM, out.look.pick("·", "-"));
+        line += &format!(" {dot} {not} not cleaned");
+    }
+    out.line("")?;
+    out.line(&line)
 }
 
 /// How long work runs before the spinner shows, and how long each frame stays.
