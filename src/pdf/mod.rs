@@ -2,6 +2,7 @@
 
 mod bytes;
 mod layers;
+mod visible;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -189,9 +190,11 @@ pub fn name(dict: &Dictionary, key: &[u8]) -> Option<String> {
 }
 
 /// The checks every PDF gets, in report order.
-pub const CHECKS: [CheckId; 11] = [
+pub const CHECKS: [CheckId; 13] = [
     CheckId::Metadata,
     CheckId::Comments,
+    CheckId::HiddenText,
+    CheckId::FakeRedactions,
     CheckId::HiddenLayers,
     CheckId::EmbeddedFiles,
     CheckId::Macros,
@@ -216,6 +219,7 @@ pub fn check(pdf: &Pdf, bytes: &[u8], values: bool) -> Found {
     let mut found = Found::default();
     found.findings.extend(metadata(&c));
     found.findings.extend(comments(&c));
+    visible::check(&c, bytes, &mut found);
     found.findings.extend(layers::check(&c));
     found.findings.extend(embedded_files(&c));
     found.findings.extend(actions(&c));

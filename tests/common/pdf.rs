@@ -343,3 +343,113 @@ pub fn plain_structure() -> Vec<u8> {
     b.catalog = dictionary! { "AcroForm" => dictionary! { "Fields" => vec![widget.into()] } };
     b.bytes()
 }
+
+/// A 1×1 grey image XObject (0 black, 255 white), stretched by the page that draws it.
+pub fn grey_image(b: &mut PdfBuilder, level: u8) -> ObjectId {
+    b.stream(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+        },
+        &[level],
+    )
+}
+
+/// The case pages of redacted.pdf, in order, as (name, expected kind or "").
+pub const REDACTED_CASES: [(&str, &str); 15] = [
+    ("black box", "text_under_box"),
+    ("black square annotation", "text_under_box"),
+    ("black box with a label", "text_under_box"),
+    ("white box", "text_under_box"),
+    ("black image", "text_under_image"),
+    ("white text", "same_colour"),
+    ("black on black", "same_colour"),
+    ("invisible text", "invisible"),
+    ("invisible text under a box on a scan", "text_under_box"),
+    ("outside the page", "outside_page"),
+    ("zero-area clip", "clipped"),
+    ("half-point text", "tiny"),
+    ("unapplied redaction", "unapplied_redaction"),
+    ("hidden layer", "hidden_layer"),
+    ("real redaction", ""),
+];
+
+/// One page per redaction case, each hiding `SECRET-pdf-case-N` (N = page) at (72, 700)
+/// beside a visible line at (72, 600); the last page is a real redaction with no text under
+/// its box.
+pub fn redacted() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let black = grey_image(&mut b, 0);
+    let scan = grey_image(&mut b, 230);
+    let layer = b.add(dictionary! { "Type" => "OCG", "Name" => Object::string_literal("Draft") });
+    let rect: Object = vec![70.into(), 695.into(), 300.into(), 715.into()].into();
+    for (i, _) in REDACTED_CASES.iter().enumerate() {
+        let page = i + 1;
+        let secret = format!("SECRET-pdf-case-{page}");
+        let hidden = text_at(72, 700, &secret);
+        let visible = text_at(72, 600, "A visible line of ordinary text, Illicit 1111.");
+        let resources = match page {
+            5 => dictionary! { "XObject" => dictionary! { "Black" => black } },
+            9 => dictionary! { "XObject" => dictionary! { "Scan" => scan } },
+            14 => dictionary! { "Properties" => dictionary! { "draft" => layer } },
+            _ => Dictionary::new(),
+        };
+        let mut extra = dictionary! { "Resources" => resources };
+        let box_ = "70 695 230 20 re f\n";
+        let content = match page {
+            1 => format!("{hidden}0 g {box_}"),
+            2 => {
+                let ap = b.stream(
+                    dictionary! { "Type" => "XObject", "Subtype" => "Form", "BBox" => vec![0.into(), 0.into(), 230.into(), 20.into()] },
+                    b"0 g 0 0 230 20 re f",
+                );
+                extra.set(
+                    "Annots",
+                    vec![Object::from(dictionary! {
+                        "Type" => "Annot", "Subtype" => "Square", "Rect" => rect.clone(),
+                        "IC" => vec![0.into(), 0.into(), 0.into()],
+                        "AP" => dictionary! { "N" => ap },
+                    })],
+                );
+                hidden
+            }
+            3 => format!(
+                "{hidden}0 g {box_}1 g {}0 g\n",
+                text_at(80, 700, "REDACTED")
+            ),
+            4 => format!("{hidden}1 g {box_}0 g\n"),
+            5 => format!("{hidden}q 230 0 0 20 70 695 cm /Black Do Q\n"),
+            6 => format!("1 g {hidden}0 g\n"),
+            7 => format!("0 g {box_}{hidden}"),
+            8 => format!("BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj ET\n"),
+            9 => format!(
+                "q 595 0 0 842 0 0 cm /Scan Do Q BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj ET 0 g {box_}"
+            ),
+            10 => text_at(-500, 700, &secret),
+            11 => format!("q 0 0 0 0 re W n {hidden}Q\n"),
+            12 => format!("BT /F1 0.5 Tf 72 700 Td ({secret}) Tj ET\n"),
+            13 => {
+                let quads: Vec<Object> = [70, 715, 300, 715, 70, 695, 300, 695]
+                    .map(Object::from)
+                    .to_vec();
+                extra.set(
+                    "Annots",
+                    vec![Object::from(dictionary! {
+                        "Type" => "Annot", "Subtype" => "Redact", "Rect" => rect.clone(), "QuadPoints" => quads,
+                    })],
+                );
+                hidden
+            }
+            14 => format!("/OC /draft BDC\n{hidden}EMC\n"),
+            _ => format!("0 g {box_}"),
+        };
+        b.page_with(&format!("{content}{visible}"), extra);
+    }
+    b.catalog = dictionary! {
+        "OCProperties" => dictionary! {
+            "OCGs" => vec![layer.into()],
+            "D" => dictionary! { "OFF" => vec![layer.into()] },
+        },
+    };
+    b.bytes()
+}

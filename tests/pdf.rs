@@ -579,3 +579,89 @@ fn content_in_layers_that_are_off_is_found_with_its_pages() {
     let f = check_pdf("layers.pdf", &layered(true), &[]);
     assert_eq!(pdf_kinds(&f, "hidden-layers"), []);
 }
+
+/// The kinds the rendered and layer checks found on each page, by page.
+fn hidden_kinds(f: &serde_json::Value) -> Vec<(u64, String)> {
+    let mut kinds: Vec<_> = f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| {
+            ["hidden-text", "fake-redactions", "hidden-layers"]
+                .contains(&x["check"].as_str().unwrap())
+        })
+        .map(|x| {
+            (
+                x["where"]["page"].as_u64().unwrap(),
+                x["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    kinds.sort();
+    kinds
+}
+
+#[test]
+fn each_redaction_case_gives_exactly_its_kind() {
+    let f = check_pdf("redacted.pdf", &redacted(), &[]);
+    let expected: Vec<_> = REDACTED_CASES
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, kind))| !kind.is_empty() && !["same_colour", "invisible"].contains(kind))
+        .map(|(i, (_, kind))| ((i + 1) as u64, kind.to_string()))
+        .collect();
+    assert_eq!(hidden_kinds(&f), expected, "{f}");
+    let first = &f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["kind"] == "text_under_box")
+        .unwrap();
+    assert_eq!(first["detail"], "17 characters under a black box");
+    let bbox = first["where"]["bbox"].as_array().unwrap();
+    assert!(
+        bbox[0].as_f64().unwrap() >= 72.0 && bbox[3].as_f64().unwrap() <= 715.0,
+        "{bbox:?}"
+    );
+    let out = stdout(&run_in(&dir("x"), &["--version"]));
+    assert!(!out.contains("SECRET-"));
+}
+
+/// A scanned page: a full-page picture with its text drawn before it, visible (as ABBYY's
+/// "text under image") or invisible (as OCRmyPDF's layer).
+fn scanned(invisible: bool, picture: &[u8], size: (i64, i64)) -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let scan = b.stream(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => size.0, "Height" => size.1,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        },
+        picture,
+    );
+    let mode = if invisible { 3 } else { 0 };
+    let text: String = (0..5)
+        .map(|i| {
+            format!(
+                "BT {mode} Tr /F1 12 Tf 72 {} Td (Scanned line {i} of the letter) Tj ET\n",
+                700 - 20 * i
+            )
+        })
+        .collect();
+    b.page_with(
+        &format!("{text}q 595 0 0 842 0 0 cm /Scan Do Q\n"),
+        dictionary! { "Resources" => dictionary! { "XObject" => dictionary! { "Scan" => scan } } },
+    );
+    b.bytes()
+}
+
+#[test]
+fn visible_text_under_a_page_picture_is_hidden_text() {
+    let f = check_pdf("abbyy_style.pdf", &scanned(false, &[200; 3], (1, 1)), &[]);
+    let kinds = hidden_kinds(&f);
+    assert_eq!(kinds, [(1, "text_under_page_image".to_string())], "{f}");
+    // Five lines in a row under one picture make one group.
+    assert_eq!(
+        findings_of(&f, "hidden-text")[0]["detail"],
+        "115 characters under a picture that covers the page"
+    );
+}
