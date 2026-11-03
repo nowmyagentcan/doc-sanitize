@@ -337,6 +337,7 @@ name = "doc-sanitize"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "flate2",
  "hayro",
  "lopdf",
  "quick-xml",

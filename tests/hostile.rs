@@ -224,3 +224,140 @@ fn a_cut_short_zip_is_damaged() {
         "cut.docx is damaged: its structure can't be read.",
     );
 }
+
+/// A Word package whose document part is `xml`.
+fn document(xml: &[u8]) -> Vec<u8> {
+    zip(&with(package("docx", &[], &[]), "word/document.xml", xml))
+}
+
+#[test]
+fn a_ratio_bomb_stops_at_256_mib() {
+    let bomb = with(package("docx", &[], &[]), "word/document.xml", b"");
+    let bomb: Vec<Entry> = bomb
+        .into_iter()
+        .map(|e| {
+            if e.name == "word/document.xml" {
+                zeros(&e.name, 1 << 30)
+            } else {
+                e
+            }
+        })
+        .collect();
+    refused(
+        "ratio_bomb.docx",
+        &zip(&bomb),
+        "too_large",
+        "ratio_bomb.docx is too large to check (part word/document.xml is over 256 MiB unpacked).",
+    );
+}
+
+#[test]
+fn declared_sizes_are_never_trusted() {
+    let bytes = zip(&package("xlsx", &[], &[]));
+    let cd = central_start(&bytes);
+    // The workbook's uncompressed size in the directory, 24 bytes into its record.
+    let record = cd
+        + bytes[cd..]
+            .windows(15)
+            .position(|w| w == b"xl/workbook.xml")
+            .unwrap()
+        - 46;
+    let mut huge = bytes.clone();
+    huge[record + 24..record + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let f = check("declared_huge.xlsx", &huge);
+    assert_eq!(
+        (f["variant"].as_str(), &f["error"]),
+        (Some("xlsx"), &serde_json::Value::Null),
+        "{f}"
+    );
+
+    let f = check("zip64.pptx", &zip_of(&package("pptx", &[], &[]), true));
+    assert_eq!(
+        (f["variant"].as_str(), &f["error"]),
+        (Some("pptx"), &serde_json::Value::Null),
+        "{f}"
+    );
+}
+
+#[test]
+fn a_doctype_anywhere_is_damage() {
+    let doctype = format!(
+        "<?xml version=\"1.0\"?><!DOCTYPE w:document SYSTEM \"file:///etc/passwd\"><w:document xmlns:w=\"{W}\"/>"
+    );
+    let message = "is damaged: it contains a DOCTYPE declaration, which Office files never use.";
+    refused(
+        "doctype.docx",
+        &document(doctype.as_bytes()),
+        "damaged",
+        &format!("doctype.docx {message}"),
+    );
+
+    let laughs: String = (1..10)
+        .map(|i| {
+            format!(
+                "<!ENTITY lol{i} \"{}\">",
+                format!("&lol{};", i - 1).repeat(10)
+            )
+        })
+        .collect();
+    let sst = format!(
+        "<!DOCTYPE sst [<!ENTITY lol0 \"lol\">{laughs}]><sst xmlns=\"{S}\"><si><t>&lol9;</t></si></sst>"
+    );
+    let book = package(
+        "xlsx",
+        &[(
+            "xl/sharedStrings.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+        )],
+        &[entry("xl/sharedStrings.xml", sst.as_bytes())],
+    );
+    refused(
+        "billion_laughs.xlsx",
+        &zip(&book),
+        "damaged",
+        &format!("billion_laughs.xlsx {message}"),
+    );
+}
+
+#[test]
+fn xml_limits_are_too_large_without_running_out_of_stack() {
+    let deep = format!(
+        "<w:document xmlns:w=\"{W}\">{}{}</w:document>",
+        "<w:p>".repeat(100_000),
+        "</w:p>".repeat(100_000)
+    );
+    refused(
+        "deep_nest.docx",
+        &document(deep.as_bytes()),
+        "too_large",
+        "deep_nest.docx is too large to check (element nesting in part word/document.xml is over 256 levels).",
+    );
+
+    let attr = format!(
+        "<w:document xmlns:w=\"{W}\" w:x=\"{}\"/>",
+        "a".repeat(40 << 20)
+    );
+    refused(
+        "huge_attr.docx",
+        &document(attr.as_bytes()),
+        "too_large",
+        "huge_attr.docx is too large to check (an attribute value in part word/document.xml is over 32 MiB).",
+    );
+
+    let xmlns: String = (0..100_000)
+        .map(|i| format!(" xmlns:p{i}=\"urn:x:{i}\""))
+        .collect();
+    let many = format!("<w:document xmlns:w=\"{W}\"{xmlns}/>");
+    let start = Instant::now();
+    refused(
+        "many_xmlns.docx",
+        &document(many.as_bytes()),
+        "too_large",
+        "many_xmlns.docx is too large to check (the namespace declaration count of one element in part word/document.xml is over 64).",
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+}

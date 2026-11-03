@@ -10,8 +10,8 @@ use std::sync::Once;
 use std::thread;
 
 use crate::input::{self, Kind};
-use crate::office;
-use crate::report::{Error, FileResult, Format, Warning, safe};
+use crate::office::Package;
+use crate::report::{CheckId, Error, FileResult, Format, Warning, safe};
 
 const WORKER: &str = "doc-sanitize-worker";
 const WORKER_STACK: usize = 64 << 20;
@@ -27,25 +27,29 @@ pub fn check(path: &Path) -> (FileResult, Option<String>) {
     let name = safe(&path.to_string_lossy());
     let result = on_worker(|| {
         let bytes = input::load(path)?;
-        let kind = input::sniff(&bytes)?;
-        Ok(match kind {
-            Kind::Pdf => checked_pdf(&name, path),
+        let (format, variant, ran, findings): (_, _, Vec<CheckId>, _) = match input::sniff(&bytes)?
+        {
+            Kind::Pdf => (Format::Pdf, "pdf", vec![], vec![]),
             Kind::Zip => {
-                office::zipscan::scan(&bytes)?;
-                return Err(Error::unsupported_format());
+                let pkg = Package::open(&bytes)?;
+                (pkg.format, pkg.variant, vec![], vec![])
             }
-        })
+        };
+        let warnings = mismatch(&name, path, variant).into_iter().collect();
+        Ok(FileResult::checked(
+            name.clone(),
+            format,
+            variant,
+            &ran,
+            findings,
+            warnings,
+        ))
     });
     match result {
         Ok(Ok(file)) => (file, None),
         Ok(Err(e)) => (FileResult::failed(name, e), None),
         Err(at) => (FileResult::failed(name, Error::internal()), Some(at)),
     }
-}
-
-fn checked_pdf(name: &str, path: &Path) -> FileResult {
-    let warnings = mismatch(name, path, "pdf").into_iter().collect();
-    FileResult::checked(name.into(), Format::Pdf, "pdf", &[], vec![], warnings)
 }
 
 /// `extension_mismatch` when the file's extension isn't its variant's.

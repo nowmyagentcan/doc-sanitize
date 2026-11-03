@@ -1,0 +1,338 @@
+//! Reading one XML part within limits: UTF-8 or UTF-16 only, no DOCTYPE, no entities but the
+//! five predefined ones, elements nested at most 256 deep, at most 64 namespace declarations
+//! on one element and no text or attribute value over 32 MiB. Names are matched by namespace
+//! URI, never by prefix.
+
+use std::borrow::Cow;
+
+use quick_xml::errors::Error as XmlError;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{NamespaceError, ResolveResult};
+use quick_xml::{NsReader, XmlVersion};
+
+use crate::report::{Error, safe};
+
+const MAX_DEPTH: usize = 256;
+const MAX_XMLNS: usize = 64;
+const MAX_VALUE: usize = 32 << 20;
+
+/// A part's bytes as text: a UTF-8 or UTF-16 byte-order mark is honoured, UTF-16 without one
+/// is recognised from `<?`, and anything that isn't valid UTF-8 or UTF-16 is damage.
+pub fn decode<'b>(bytes: &'b [u8], part: &str) -> Result<Cow<'b, str>, Error> {
+    let utf16 = |b: &[u8], big: bool| {
+        if !b.len().is_multiple_of(2) {
+            return Err(Error::bad_xml(part));
+        }
+        let units = b.as_chunks::<2>().0.iter().map(|&pair| {
+            if big {
+                u16::from_be_bytes(pair)
+            } else {
+                u16::from_le_bytes(pair)
+            }
+        });
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map(Cow::Owned)
+            .map_err(|_| Error::bad_xml(part))
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, false);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, true);
+    }
+    if bytes.starts_with(b"<\0?\0") || bytes.starts_with(b"\0<\0?") {
+        return utf16(bytes, bytes[0] == 0);
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    std::str::from_utf8(body)
+        .map(Cow::Borrowed)
+        .map_err(|_| Error::bad_xml(part))
+}
+
+/// Events of one part, each checked against the limits before it is handed out.
+pub struct Reader<'a> {
+    inner: NsReader<&'a [u8]>,
+    part: &'a str,
+    depth: usize,
+    root: bool,
+}
+
+impl<'a> Reader<'a> {
+    pub fn new(text: &'a str, part: &'a str) -> Self {
+        let mut inner = NsReader::from_str(text);
+        inner
+            .resolver_mut()
+            .set_max_namespace_bindings(MAX_DEPTH * MAX_XMLNS);
+        Self {
+            inner,
+            part,
+            depth: 0,
+            root: false,
+        }
+    }
+
+    fn too_large(&self, what: &str, limit: &str) -> Error {
+        Error::too_large(&format!("{what} in part {}", safe(self.part)), limit)
+    }
+
+    /// The next event; `Eof` once the root element has closed.
+    pub fn event(&mut self) -> Result<Event<'a>, Error> {
+        let event = match self.inner.read_event() {
+            Ok(e) => e,
+            Err(XmlError::Namespace(NamespaceError::TooManyBindings(_))) => {
+                return Err(self.too_large("the namespace declaration count of one element", "64"));
+            }
+            Err(_) => return Err(Error::bad_xml(self.part)),
+        };
+        match &event {
+            Event::DocType(_) => {
+                return Err(Error::damaged(
+                    "it contains a DOCTYPE declaration, which Office files never use",
+                ));
+            }
+            Event::Start(e) | Event::Empty(e) => {
+                if self.depth == 0 && self.root {
+                    return Err(Error::bad_xml(self.part));
+                }
+                self.root = true;
+                if self.depth + 1 > MAX_DEPTH {
+                    return Err(self.too_large("element nesting", "256 levels"));
+                }
+                self.attributes(e)?;
+                if matches!(event, Event::Start(_)) {
+                    self.depth += 1;
+                }
+            }
+            Event::End(_) => self.depth -= 1,
+            Event::Text(t) if t.len() > MAX_VALUE => {
+                return Err(self.too_large("a text value", "32 MiB"));
+            }
+            Event::CData(t) if t.len() > MAX_VALUE => {
+                return Err(self.too_large("a text value", "32 MiB"));
+            }
+            Event::GeneralRef(r) => {
+                let known = ["lt", "gt", "amp", "apos", "quot"].contains(&&**r);
+                // XML 1.0 characters: no controls but tab, newline and return.
+                let allowed = |c: char| {
+                    (c >= ' ' && !matches!(c, '\u{FFFE}' | '\u{FFFF}')) || "\t\n\r".contains(c)
+                };
+                if !known && !matches!(r.resolve_char_ref(), Ok(Some(c)) if allowed(c)) {
+                    return Err(Error::bad_xml(self.part));
+                }
+            }
+            Event::Decl(d) => {
+                let encoding = d
+                    .encoding()
+                    .transpose()
+                    .map_err(|_| Error::bad_xml(self.part))?;
+                let known = encoding.is_none_or(|e| {
+                    ["utf-8", "utf8", "utf-16", "utf16"].contains(&e.to_ascii_lowercase().as_str())
+                });
+                if !known {
+                    return Err(Error::bad_xml(self.part));
+                }
+            }
+            Event::Eof if self.depth > 0 || !self.root => return Err(Error::bad_xml(self.part)),
+            _ => {}
+        }
+        Ok(event)
+    }
+
+    /// Checks an element's namespace declarations and attribute values against the limits.
+    fn attributes(&self, e: &BytesStart) -> Result<(), Error> {
+        let raw = e.attributes_raw();
+        if raw.contains("xmlns") {
+            let xmlns = e
+                .attributes()
+                .with_checks(false)
+                .flatten()
+                .filter(|a| a.key.as_namespace_binding().is_some())
+                .count();
+            if xmlns > MAX_XMLNS {
+                return Err(self.too_large("the namespace declaration count of one element", "64"));
+            }
+        }
+        if raw.contains('&') {
+            for a in e.attributes().with_checks(false) {
+                let a = a.map_err(|_| Error::bad_xml(self.part))?;
+                a.normalized_value(XmlVersion::Implicit1_0)
+                    .map_err(|_| Error::bad_xml(self.part))?;
+            }
+        }
+        if raw.len() > MAX_VALUE
+            && e.attributes()
+                .with_checks(false)
+                .flatten()
+                .any(|a| a.value.len() > MAX_VALUE)
+        {
+            return Err(self.too_large("an attribute value", "32 MiB"));
+        }
+        Ok(())
+    }
+
+    /// The namespace URI of an element (empty when it has none).
+    pub fn ns(&self, e: &BytesStart) -> &str {
+        match self.inner.resolver().resolve_element(e.name()).0 {
+            ResolveResult::Bound(ns) => ns.0,
+            _ => "",
+        }
+    }
+
+    /// Whether `e` is the element `local` in namespace `ns`.
+    pub fn is(&self, e: &BytesStart, ns: &str, local: &str) -> bool {
+        e.local_name().as_ref() == local && self.ns(e) == ns
+    }
+
+    /// The value of an unprefixed attribute, with references replaced.
+    pub fn attr<'e>(&self, e: &'e BytesStart, name: &str) -> Result<Option<Cow<'e, str>>, Error> {
+        for a in e.attributes().with_checks(false) {
+            let a = a.map_err(|_| Error::bad_xml(self.part))?;
+            if a.key.as_ref() == name {
+                let value = a.normalized_value(XmlVersion::Implicit1_0);
+                return value.map(Some).map_err(|_| Error::bad_xml(self.part));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Reads to the end, checking every event.
+    pub fn validate(mut self) -> Result<(), Error> {
+        while !matches!(self.event()?, Event::Eof) {}
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(xml: &str) -> Result<(), Error> {
+        Reader::new(xml, "word/document.xml").validate()
+    }
+
+    fn code(xml: &str) -> &'static str {
+        check(xml).map_or_else(|e| e.code, |()| "ok")
+    }
+
+    #[test]
+    fn well_formed_parts_pass() {
+        assert_eq!(
+            code(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<a x=\"1 &amp; 2\"><b>&lt;&#169;&#x20AC;</b><c/></a>"
+            ),
+            "ok"
+        );
+        assert_eq!(code("<a><![CDATA[x]]><!-- c --><?pi x?></a>"), "ok");
+    }
+
+    #[test]
+    fn broken_xml_is_damage() {
+        for xml in [
+            "",
+            "<a>",
+            "<a></b>",
+            "<a/><b/>",
+            "<a>&lol;</a>",
+            "<a x='&lol;'/>",
+            "text",
+            "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>",
+        ] {
+            let e = check(xml).unwrap_err();
+            assert_eq!(
+                e.message, "{name} is damaged: part word/document.xml isn't valid XML.",
+                "{xml}"
+            );
+        }
+        let e = check("<a>&#0;</a>").unwrap_err();
+        assert_eq!(e.code, "damaged");
+    }
+
+    #[test]
+    fn a_doctype_is_damage_and_nothing_is_fetched() {
+        let e = check("<?xml version=\"1.0\"?><!DOCTYPE a SYSTEM \"file:///etc/passwd\"><a/>")
+            .unwrap_err();
+        assert_eq!(
+            e.message,
+            "{name} is damaged: it contains a DOCTYPE declaration, which Office files never use."
+        );
+        let laughs = "<!DOCTYPE l [<!ENTITY a \"aaaa\"><!ENTITY b \"&a;&a;&a;\">]><l>&b;</l>";
+        assert_eq!(code(laughs), "damaged");
+    }
+
+    #[test]
+    fn limits_are_too_large() {
+        let deep = "<a>".repeat(257) + &"</a>".repeat(257);
+        let e = check(&deep).unwrap_err();
+        assert_eq!(
+            e.message,
+            "{name} is too large to check (element nesting in part word/document.xml is over 256 levels)."
+        );
+        let fits = "<a>".repeat(256) + &"</a>".repeat(256);
+        assert_eq!(code(&fits), "ok");
+        let empty_deep = "<a>".repeat(256) + "<b/>" + &"</a>".repeat(256);
+        assert_eq!(code(&empty_deep), "too_large");
+
+        let ns: String = (0..65)
+            .map(|i| format!(" xmlns:p{i}=\"urn:{i}\""))
+            .collect();
+        let e = check(&format!("<a{ns}/>")).unwrap_err();
+        assert!(e.message.ends_with("(the namespace declaration count of one element in part word/document.xml is over 64)."), "{}", e.message);
+        let ns: String = (0..64)
+            .map(|i| format!(" xmlns:p{i}=\"urn:{i}\""))
+            .collect();
+        assert_eq!(code(&format!("<a{ns}/>")), "ok");
+
+        let big = "x".repeat(MAX_VALUE + 1);
+        assert_eq!(code(&format!("<a v=\"{big}\"/>")), "too_large");
+        assert_eq!(code(&format!("<a>{big}</a>")), "too_large");
+        assert_eq!(code(&format!("<a v=\"{}\"/>", &big[1..])), "ok");
+    }
+
+    #[test]
+    fn names_resolve_by_namespace_never_by_prefix() {
+        let xml =
+            "<x:document xmlns:x=\"urn:w\"><t xmlns=\"urn:w\" Id=\"a&amp;b\"/><x:t/></x:document>";
+        let mut r = Reader::new(xml, "p");
+        let mut seen = vec![];
+        loop {
+            match r.event().unwrap() {
+                Event::Start(e) | Event::Empty(e) => seen.push((
+                    r.is(&e, "urn:w", "t"),
+                    r.attr(&e, "Id").unwrap().map(Cow::into_owned),
+                )),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [(false, None), (true, Some("a&b".into())), (true, None)]
+        );
+    }
+
+    #[test]
+    fn utf16_and_byte_order_marks_decode() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><a>é</a>";
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let bare: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        for bytes in [le, be, bare] {
+            let decoded = decode(&bytes, "p").unwrap();
+            assert_eq!(decoded, text);
+            assert_eq!(Reader::new(&decoded, "p").validate(), Ok(()));
+        }
+        assert_eq!(decode(b"\xEF\xBB\xBF<a/>", "p").unwrap(), "<a/>");
+        assert_eq!(decode(b"<a>\xFF</a>", "p").unwrap_err().code, "damaged");
+        assert_eq!(
+            decode(&[0xFF, 0xFE, b'<'], "p").unwrap_err().code,
+            "damaged"
+        );
+    }
+}
