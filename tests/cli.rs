@@ -81,7 +81,7 @@ fn usage_errors_exit_2_as_text_or_json() {
 #[test]
 fn only_an_exact_first_argument_is_a_command() {
     let dir = dir("command");
-    put(&dir, &[("check", PDF), ("x.pdf", PDF)]);
+    put(&dir, &[("check", PDF), ("clean", PDF), ("x.pdf", PDF)]);
     let out = run_in(&dir, &["check", "x.pdf", "--json"]);
     assert_eq!(json(&out)["files"].as_array().unwrap().len(), 1);
     let sep = std::path::MAIN_SEPARATOR;
@@ -341,4 +341,28 @@ fn a_closed_stream_ends_quietly_with_the_code_so_far() {
         }
         assert_eq!(closed(&dir, &args, true).status.code(), Some(0));
     }
+}
+
+#[test]
+fn a_file_named_clean_is_a_path() {
+    let dir = dir("named-clean");
+    put(&dir, &[("clean", PDF)]);
+    let sep = std::path::MAIN_SEPARATOR;
+    let out = run_in(&dir, &[&format!(".{sep}clean"), "--json"]);
+    assert_eq!(json(&out)["files"][0]["format"], "pdf");
+}
+
+#[test]
+fn a_run_checks_at_most_10000_files() {
+    let dir = dir("many");
+    std::fs::create_dir(dir.join("in")).unwrap();
+    for i in 0..10_001 {
+        std::fs::write(dir.join(format!("in/{i:05}.pdf")), PDF).unwrap();
+    }
+    let out = run_in(&dir, &["in", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        json(&out)["error"]["message"],
+        "More than 10,000 files to check."
+    );
 }

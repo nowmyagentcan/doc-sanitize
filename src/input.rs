@@ -54,7 +54,7 @@ pub fn expand(paths: &[PathBuf], recursive: bool) -> Result<Vec<Input>, Error> {
         }
         if inputs.len() > MAX_FILES {
             return Err(Error::usage(
-                format!("More than {MAX_FILES} files to check."),
+                "More than 10,000 files to check.",
                 "Check fewer files or folders at a time.",
             ));
         }
