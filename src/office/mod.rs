@@ -339,8 +339,8 @@ impl<'a> Package<'a> {
     pub fn reachable(&self) -> Result<Vec<String>, Error> {
         let mut seen = HashSet::new();
         let mut found = vec![];
-        let mut todo = vec![String::new()];
-        while let Some(source) = todo.pop() {
+        let mut pending = vec![String::new()];
+        while let Some(source) = pending.pop() {
             for rel in self.rels(&source)? {
                 let Some(target) = resolve(&source, &rel.target).filter(|_| !rel.external) else {
                     continue;
@@ -350,7 +350,7 @@ impl<'a> Package<'a> {
                 {
                     let name = self.zip.entries[i].name.clone();
                     found.push(name.clone());
-                    todo.push(name);
+                    pending.push(name);
                 }
             }
         }

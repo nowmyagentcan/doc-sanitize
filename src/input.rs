@@ -65,8 +65,8 @@ pub fn expand(paths: &[PathBuf], recursive: bool) -> Result<Vec<Input>, Error> {
 /// Collects the files of `dir` into `files`, walking with a stack so no tree is too deep; a
 /// folder that can't be listed is a failed input.
 fn folder(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>, inputs: &mut Vec<Input>) {
-    let mut todo = vec![dir.to_path_buf()];
-    while let Some(dir) = todo.pop() {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -77,7 +77,7 @@ fn folder(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>, inputs: &mut Ve
         for entry in entries.flatten() {
             let path = entry.path();
             match entry.file_type() {
-                Ok(t) if t.is_dir() && recursive => todo.push(path),
+                Ok(t) if t.is_dir() && recursive => pending.push(path),
                 Ok(t) if t.is_file() && wanted(&path) => files.push(path),
                 _ => {}
             }
