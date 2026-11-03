@@ -56,6 +56,9 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             EmbeddedFiles,
             CustomData,
             Macros,
+            ExternalLinks,
+            ImageMetadata,
+            CroppedImages,
             LeftoverData,
             Signatures,
         ],
@@ -71,6 +74,10 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             EmbeddedFiles,
             CustomData,
             Macros,
+            ExternalLinks,
+            ImageMetadata,
+            CroppedImages,
+            PivotCaches,
             LeftoverData,
             Signatures,
         ],
@@ -83,6 +90,9 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             EmbeddedFiles,
             CustomData,
             Macros,
+            ExternalLinks,
+            ImageMetadata,
+            CroppedImages,
             LeftoverData,
             Signatures,
         ],
@@ -105,6 +115,7 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
             found.extend(excel::shared_workbook_log(&ctx)?);
             found.extend(excel::cells(&ctx)?);
             found.extend(excel::hidden_sheets(&ctx)?);
+            found.extend(excel::pivot_caches(&ctx)?);
         }
         Format::Pptx => {
             found.extend(powerpoint::hidden_slides(&ctx)?);
@@ -113,7 +124,10 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
         Format::Pdf => {}
     }
     found.extend(drawing::hidden_objects(&ctx)?);
+    found.extend(drawing::crops_and_alt_text(&ctx)?);
     found.extend(common::linked_parts(&ctx)?);
+    found.extend(common::external_links(&ctx)?);
+    found.extend(common::image_metadata(&ctx)?);
     found.extend(common::leftover_data(pkg, values)?);
     Ok(found)
 }

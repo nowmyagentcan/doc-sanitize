@@ -514,6 +514,22 @@ fn story(ctx: &Ctx, part: &str) -> Result<Story, Error> {
     Ok(s)
 }
 
+/// A field instruction's words after its name; quoted ones whole, without the quotes.
+fn arguments(instr: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let (mut word, mut quoted) = (String::new(), false);
+    for c in instr.chars().chain([' ']) {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                out.extend((!word.is_empty()).then(|| std::mem::take(&mut word)))
+            }
+            c => word.push(c),
+        }
+    }
+    out.into_iter().skip(1).collect()
+}
+
 /// A field instruction's name: `INCLUDEPICTURE`, `DDEAUTO`, …
 fn field_name(instr: &str) -> String {
     instr
@@ -524,7 +540,8 @@ fn field_name(instr: &str) -> String {
 }
 
 /// What Word parts hold besides text: imported chunks (`embedded-files`), data bindings and
-/// document variables (`custom-data`) and DDE fields (`macros`).
+/// document variables (`custom-data`), DDE fields (`macros`) and fields that read files
+/// (`external-links`).
 pub fn story_items(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     let mut found = vec![];
     for part in stories(ctx) {
@@ -533,6 +550,17 @@ pub fn story_items(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
             .fields
             .iter()
             .filter(|f| matches!(field_name(f).as_str(), "DDE" | "DDEAUTO"))
+            .collect();
+        let paths: Vec<_> = s
+            .fields
+            .iter()
+            .filter(|f| {
+                matches!(
+                    field_name(f).as_str(),
+                    "INCLUDETEXT" | "INCLUDEPICTURE" | "LINK"
+                )
+            })
+            .filter(|f| arguments(f).iter().any(|a| common::is_path(a, false)))
             .collect();
         for (check, kind, n, unit, detail, value) in [
             (
@@ -558,6 +586,18 @@ pub fn story_items(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 "links",
                 plural(dde.len() as u64, "DDE field"),
                 dde.first().map(|f| f.trim()),
+            ),
+            (
+                CheckId::ExternalLinks,
+                "field_path",
+                paths.len(),
+                "links",
+                counted(
+                    paths.len() as u64,
+                    "field that reads a file",
+                    "fields that read files",
+                ),
+                paths.first().map(|f| f.trim()),
             ),
         ] {
             if n > 0 {

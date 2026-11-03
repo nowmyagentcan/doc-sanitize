@@ -2,8 +2,8 @@
 
 use quick_xml::events::Event;
 
-use super::{Ctx, ns, word, xml};
-use crate::report::{CheckId, Error, Finding, Format, plural};
+use super::{Ctx, common, ns, word, xml};
+use crate::report::{CheckId, Error, Finding, Format, counted, plural};
 
 const VML: &str = "urn:schemas-microsoft-com:vml";
 const DRAWING_PART: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
@@ -195,4 +195,72 @@ fn off_slide(ctx: &Ctx, o: &Object, groups: &[Object]) -> bool {
         h = scale(h, ext.1, ch_ext.1);
     }
     x + w < 0 || y + h < 0 || x > cx || y > cy
+}
+
+/// `cropped-images` and `external-links` in drawings: pictures whose crop hides at least 1% of
+/// the image, and `descr` or `title` alt text that holds a path.
+pub fn crops_and_alt_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    for part in drawing_parts(ctx) {
+        let (mut crops, mut most, mut paths) = (0u64, 0.0f64, vec![]);
+        pkg.walk(part, |r, ev| {
+            let (Event::Start(e) | Event::Empty(e)) = ev else {
+                return Ok(());
+            };
+            if r.is(e, ns::A, "srcRect") {
+                let side = |a| -> Result<f64, Error> {
+                    let v: f64 = r.attr(e, a)?.and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    Ok((v.max(0.0) / 100_000.0).min(1.0))
+                };
+                let (w, h) = (1.0 - side("l")? - side("r")?, 1.0 - side("t")? - side("b")?);
+                let hidden = 1.0 - w.max(0.0) * h.max(0.0);
+                if hidden >= 0.01 {
+                    crops += 1;
+                    most = most.max(hidden);
+                }
+            }
+            for (ns, name, v) in r.attrs(e)? {
+                if ns.is_empty()
+                    && (name == "descr" || name == "title")
+                    && common::is_path(&v, false)
+                {
+                    paths.push(v.into_owned());
+                }
+            }
+            Ok(())
+        })?;
+        if crops > 0 {
+            let share = format!("{}% cut away by cropping", (most * 100.0).round());
+            let detail = match crops {
+                1 => format!("1 picture with {share}"),
+                n => format!("{} with up to {share}", plural(n, "picture")),
+            };
+            found.push(Finding::new(
+                CheckId::CroppedImages,
+                "cropped_picture",
+                ctx.place(part),
+                crops,
+                "pictures",
+                detail,
+            ));
+        }
+        if !paths.is_empty() {
+            let detail = counted(
+                paths.len() as u64,
+                "alt text that holds a file path",
+                "alt texts that hold a file path",
+            );
+            let f = Finding::new(
+                CheckId::ExternalLinks,
+                "path_in_alt_text",
+                ctx.place(part),
+                paths.len() as u64,
+                "links",
+                detail,
+            );
+            found.push(f.with_value(ctx.values, paths.first().map(String::as_str)));
+        }
+    }
+    Ok(found)
 }

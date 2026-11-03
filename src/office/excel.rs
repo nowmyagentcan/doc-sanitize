@@ -502,6 +502,73 @@ pub fn hidden_sheets(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     Ok(found)
 }
 
+/// `pivot-caches`: pivot caches with their source rows, and data model parts.
+pub fn pivot_caches(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    for def in targets(pkg, "pivotCacheDefinition") {
+        let (mut rows, mut first) = (None, None);
+        pkg.walk(def, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev {
+                if r.level() == 0 {
+                    rows = r
+                        .attr(e, "recordCount")?
+                        .and_then(|v| v.parse::<u64>().ok());
+                } else if first.is_none() && r.is(e, ns::S, "s") && r.within(ns::S, "sharedItems") {
+                    first = r.attr(e, "v")?.map(Cow::into_owned);
+                }
+            }
+            Ok(())
+        })?;
+        let records = pkg
+            .links
+            .iter()
+            .find(|l| l.source == def && l.rel.short() == "pivotCacheRecords")
+            .and_then(|l| l.part.as_deref());
+        if let Some(part) = records {
+            let mut n = 0;
+            pkg.walk(part, |r, ev| {
+                if let Event::Start(e) | Event::Empty(e) = ev
+                    && r.level() == 1
+                    && r.is(e, ns::S, "r")
+                {
+                    n += 1;
+                }
+                Ok(())
+            })?;
+            rows = Some(n);
+        }
+        let detail = format!(
+            "1 pivot cache with {}",
+            plural(rows.unwrap_or(0), "source row")
+        );
+        let f = Finding::new(
+            CheckId::PivotCaches,
+            "pivot_cache",
+            ctx.place(records.unwrap_or(def)),
+            1,
+            "parts",
+            detail,
+        );
+        found.push(f.with_value(ctx.values, first.as_deref()));
+    }
+    for part in pkg
+        .parts
+        .iter()
+        .filter(|p| p.to_ascii_lowercase().starts_with("xl/model/"))
+    {
+        found.push(Finding::new(
+            CheckId::PivotCaches,
+            "data_model",
+            ctx.place(part),
+            1,
+            "parts",
+            "1 data model".into(),
+        ));
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

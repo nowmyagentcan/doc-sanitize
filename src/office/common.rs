@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use quick_xml::events::Event;
 
 use super::{Ctx, Package, key, ns, part_name, xml};
+use crate::pictures;
 use crate::report::{CheckId, Error, Finding, Format, Where, counted, plural, safe, value};
 
 const SHARED_STRINGS: &str =
@@ -780,6 +781,232 @@ fn first_pair(
         Ok(())
     })?;
     Ok(pair)
+}
+
+/// Whether `v` is a path to a local or network file: `file:`, a UNC or `//host` path, a
+/// drive letter, a `/Users/`, `/home/` or `/Volumes/` path, or (with `relative`, for
+/// relationship targets) a reference with no URI scheme.
+pub fn is_path(v: &str, relative: bool) -> bool {
+    let v = v.trim();
+    let b = v.as_bytes();
+    let drive =
+        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+    let host = v
+        .strip_prefix("//")
+        .is_some_and(|h| h.starts_with(|c: char| c.is_alphanumeric()));
+    let scheme = v.split_once(':').is_some_and(|(s, _)| {
+        s.len() > 1
+            && s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
+    });
+    v.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:"))
+        || v.starts_with("\\\\")
+        || host
+        || drive
+        || ["/Users/", "/home/", "/Volumes/"]
+            .iter()
+            .any(|p| v.starts_with(p))
+        || (relative && !scheme && !v.is_empty() && !v.starts_with('#') && !v.starts_with("//"))
+}
+
+/// Relationship types that `external-links` reports under their own kinds.
+const OWN_LINKS: [&str; 5] = [
+    "attachedTemplate",
+    "mailMergeSource",
+    "mailMergeHeaderSource",
+    "recipientData",
+    "externalLinkPath",
+];
+
+const SPREADSHEET_AC: &str = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac";
+
+/// `external-links` found in relationships and package parts: template paths, mail merge
+/// sources, links to files, linked workbooks, data connections and saved folder paths.
+pub fn external_links(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    let mut add = |kind, part: &str, n: usize, detail: String, value: Option<&str>| {
+        let f = Finding::new(
+            CheckId::ExternalLinks,
+            kind,
+            ctx.place(part),
+            n as u64,
+            "links",
+            detail,
+        );
+        found.push(f.with_value(ctx.values, value));
+    };
+    for l in pkg
+        .links
+        .iter()
+        .filter(|l| l.rel.external && l.rel.short() == "attachedTemplate")
+    {
+        add(
+            "template_path",
+            &l.source,
+            1,
+            "1 path to the document's template".into(),
+            Some(&l.rel.target),
+        );
+    }
+    for part in targets(pkg, "settings") {
+        let (mut merge, mut connect) = (false, None);
+        pkg.walk(part, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev {
+                merge |= r.is(e, ns::W, "mailMerge");
+                if r.is(e, ns::W, "connectString") {
+                    connect = r.attr_ns(e, ns::W, "val")?.map(|v| v.into_owned());
+                }
+            }
+            Ok(())
+        })?;
+        if merge {
+            let source = pkg.links.iter().find(|l| {
+                l.source == part && l.rel.external && OWN_LINKS[1..4].contains(&l.rel.short())
+            });
+            let value = source.map(|l| l.rel.target.clone()).or(connect);
+            add(
+                "mail_merge_source",
+                part,
+                1,
+                "1 mail merge data source".into(),
+                value.as_deref(),
+            );
+        }
+    }
+    let mut files: Vec<(&str, Vec<&str>)> = vec![];
+    for l in &pkg.links {
+        if l.rel.external && !OWN_LINKS.contains(&l.rel.short()) && is_path(&l.rel.target, true) {
+            match files.iter_mut().find(|(s, _)| *s == l.source) {
+                Some((_, targets)) => targets.push(&l.rel.target),
+                None => files.push((&l.source, vec![&l.rel.target])),
+            }
+        }
+    }
+    for (source, links) in files {
+        let detail = format!(
+            "{} to local or network files",
+            plural(links.len() as u64, "link")
+        );
+        add(
+            "linked_file",
+            source,
+            links.len(),
+            detail,
+            links.first().copied(),
+        );
+    }
+    for part in targets(pkg, "externalLink") {
+        let mut cached = 0;
+        pkg.walk(part, |r, ev| {
+            if let Event::Start(e) = ev
+                && r.is(e, ns::S, "cell")
+            {
+                cached += 1;
+            }
+            Ok(())
+        })?;
+        let path = pkg
+            .links
+            .iter()
+            .find(|l| l.source == part && l.rel.short() == "externalLinkPath");
+        let detail = format!("1 linked workbook with {}", plural(cached, "cached value"));
+        add(
+            "external_workbook",
+            part,
+            1,
+            detail,
+            path.map(|l| l.rel.target.as_str()),
+        );
+    }
+    for part in targets(pkg, "connections") {
+        let (mut n, mut first) = (0, None);
+        pkg.walk(part, |r, ev| {
+            let (Event::Start(e) | Event::Empty(e)) = ev else {
+                return Ok(());
+            };
+            // Where each element keeps the source it reads.
+            let source = match e.local_name().as_ref() {
+                "connection" => {
+                    n += 1;
+                    "sourceFile"
+                }
+                "dbPr" => "connection",
+                "webPr" => "url",
+                "textPr" => "sourceFile",
+                _ => return Ok(()),
+            };
+            if first.is_none() {
+                first = r.attr(e, source)?.map(|v| v.into_owned());
+            }
+            Ok(())
+        })?;
+        if n > 0 {
+            add(
+                "data_connection",
+                part,
+                n,
+                plural(n as u64, "data connection"),
+                first.as_deref(),
+            );
+        }
+    }
+    for part in targets(pkg, "queryTable") {
+        add("data_connection", part, 1, "1 query table".into(), None);
+    }
+    if pkg.format == Format::Xlsx {
+        let mut url = None;
+        pkg.walk(&pkg.main, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev
+                && r.is(e, SPREADSHEET_AC, "absPath")
+            {
+                url = Some(r.attr(e, "url")?.unwrap_or_default().into_owned());
+            }
+            Ok(())
+        })?;
+        if let Some(url) = url {
+            add(
+                "folder_path",
+                &pkg.main,
+                1,
+                "1 folder path the workbook was saved in".into(),
+                Some(&url),
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// `image-metadata`: pictures that carry EXIF, GPS, XMP, IPTC, comments, text chunks,
+/// thumbnails or bytes after the image.
+pub fn image_metadata(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let pkg = ctx.pkg;
+    let mut found = vec![];
+    for part in &pkg.parts {
+        let Some(ct) = pkg.content_type(part).filter(|t| t.starts_with("image/")) else {
+            continue;
+        };
+        let bytes = pkg.read(part)?;
+        let labels = if ct == "image/svg+xml" {
+            pictures::svg(&xml::decode(&bytes, part)?, part)?
+        } else {
+            pictures::metadata(&bytes)
+                .ok_or_else(|| Error::damaged(&format!("picture {} is cut short", safe(part))))?
+        };
+        if !labels.is_empty() {
+            let detail = format!("1 picture with {}", pictures::joined(&labels));
+            found.push(Finding::new(
+                CheckId::ImageMetadata,
+                "picture_metadata",
+                ctx.place(part),
+                1,
+                "pictures",
+                detail,
+            ));
+        }
+    }
+    Ok(found)
 }
 
 /// The custom properties of a custom.xml part, as (name, value).

@@ -16,6 +16,9 @@ const DOCX_CHECKS: &[&str] = &[
     "embedded-files",
     "custom-data",
     "macros",
+    "external-links",
+    "image-metadata",
+    "cropped-images",
     "leftover-data",
     "signatures",
 ];
@@ -31,6 +34,10 @@ const XLSX_CHECKS: &[&str] = &[
     "embedded-files",
     "custom-data",
     "macros",
+    "external-links",
+    "image-metadata",
+    "cropped-images",
+    "pivot-caches",
     "leftover-data",
     "signatures",
 ];
@@ -43,6 +50,9 @@ const PPTX_CHECKS: &[&str] = &[
     "embedded-files",
     "custom-data",
     "macros",
+    "external-links",
+    "image-metadata",
+    "cropped-images",
     "leftover-data",
     "signatures",
 ];
@@ -1846,4 +1856,349 @@ fn zip_types_with(entries: &[Entry], part: &str, ct: &str) -> Vec<u8> {
             &format!("<Override PartName=\"/{part}\" ContentType=\"{ct}\"/>"),
         )
         .into_bytes()
+}
+
+#[test]
+fn links_to_local_files_are_found_and_web_links_are_not() {
+    let settings = format!(
+        "<w:settings xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:attachedTemplate r:id=\"rId1\"/><w:mailMerge><w:mainDocumentType w:val=\"formLetters\"/><w:connectString w:val=\"Provider=x\"/><w:dataSource r:id=\"rId2\"/></w:mailMerge></w:settings>"
+    );
+    let body = "<w:p><w:fldSimple w:instr=\" INCLUDEPICTURE &quot;\\\\\\\\fileserver\\\\share\\\\SECRET-field-1.png&quot; \\* MERGEFORMAT \"/><w:fldSimple w:instr=\"INCLUDEPICTURE &quot;https://example.com/a.png&quot;\"/><w:fldSimple w:instr=\"LINK Excel.Sheet.12 D:\\\\Budget.xlsx A1\"/></w:p>\
+         <w:p><w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"Picture 1\" descr=\"D:\\Projects\\avery\\SECRET-alt-1.png\"/></wp:inline></w:drawing></w:r>\
+         <w:r><w:drawing><wp:inline><wp:docPr id=\"2\" name=\"Picture 2\" descr=\"A photo of a dog\" title=\"/home/avery/SECRET-alt-2.jpg\"/></wp:inline></w:drawing></w:r></w:p>";
+    let doc = Pkg::new("docx")
+        .body(&doc_xml(body))
+        .part(
+            "word/document.xml",
+            "rId1",
+            "settings",
+            "word/settings.xml",
+            &format!("{OX}.wordprocessingml.settings+xml"),
+            settings.as_bytes(),
+        )
+        .link(
+            "word/settings.xml",
+            external(
+                "rId1",
+                "attachedTemplate",
+                "file:///D:/Projects/avery/SECRET-template-1.dotx",
+            ),
+        )
+        .link(
+            "word/settings.xml",
+            external(
+                "rId2",
+                "mailMergeSource",
+                "file:///\\\\fileserver\\share\\SECRET-merge-1.xlsx",
+            ),
+        )
+        .link(
+            "word/document.xml",
+            external("rId7", "hyperlink", "../Budget/SECRET-link-1.xlsx"),
+        )
+        .link(
+            "word/document.xml",
+            external("rId8", "hyperlink", "https://example.com/report"),
+        )
+        .link(
+            "word/document.xml",
+            external("rId9", "hyperlink", "mailto:avery@example.com"),
+        )
+        .link(
+            "word/document.xml",
+            external("rId10", "image", "\\\\fileserver\\share\\logo.png"),
+        )
+        .zip();
+    let f = check_bytes("links.docx", &doc);
+    assert_eq!(
+        kinds(&f, "external-links"),
+        [
+            found(
+                "field_path",
+                "word/document.xml",
+                2,
+                "2 fields that read files"
+            ),
+            found(
+                "path_in_alt_text",
+                "word/document.xml",
+                2,
+                "2 alt texts that hold a file path"
+            ),
+            found(
+                "template_path",
+                "word/settings.xml",
+                1,
+                "1 path to the document's template"
+            ),
+            found(
+                "mail_merge_source",
+                "word/settings.xml",
+                1,
+                "1 mail merge data source"
+            ),
+            found(
+                "linked_file",
+                "word/document.xml",
+                2,
+                "2 links to local or network files"
+            ),
+        ]
+    );
+    let shown = values("links.docx", &doc);
+    assert_eq!(
+        shown,
+        [
+            "INCLUDEPICTURE \"\\\\\\\\fileserver\\\\share\\\\SECRET-field-1.png\" \\* MERGEFORMAT",
+            "D:\\Projects\\avery\\SECRET-alt-1.png",
+            "file:///D:/Projects/avery/SECRET-template-1.dotx",
+            "file:///\\\\fileserver\\share\\SECRET-merge-1.xlsx",
+            "../Budget/SECRET-link-1.xlsx",
+        ]
+    );
+}
+
+#[test]
+fn workbook_links_connections_and_paths_are_found() {
+    let ss = |t: &str| format!("{OX}.spreadsheetml.{t}+xml");
+    let link = format!(
+        "<externalLink xmlns=\"{S}\" xmlns:r=\"{R}\"><externalBook r:id=\"rId1\"><sheetNames><sheetName val=\"Rates\"/></sheetNames><sheetDataSet><sheetData sheetId=\"0\"><row r=\"1\"><cell r=\"A1\"><v>SECRET-cache-1</v></cell><cell r=\"B1\"><v>2</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>"
+    );
+    let connections = format!(
+        "<connections xmlns=\"{S}\"><connection id=\"1\" name=\"Query - Clients\" type=\"5\"><dbPr connection=\"Provider=SQLOLEDB;Data Source=SECRET-server-1\" command=\"x\"/></connection><connection id=\"2\" name=\"web\" type=\"4\"><webPr url=\"https://example.com\"/></connection></connections>"
+    );
+    let book = workbook(&[("Data", "visible", &sheet_xml(""))])
+        .body(&format!("<workbook xmlns=\"{S}\" xmlns:r=\"{R}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:x15ac=\"http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac\"><mc:AlternateContent><mc:Choice Requires=\"x15\"><x15ac:absPath url=\"D:\\Projects\\avery\\SECRET-folder-1\\\"/></mc:Choice></mc:AlternateContent><sheets><sheet name=\"Data\" sheetId=\"1\" r:id=\"rId1\"/></sheets><externalReferences><externalReference r:id=\"rId8\"/></externalReferences></workbook>"))
+        .part("xl/workbook.xml", "rId8", "externalLink", "xl/externalLinks/externalLink1.xml", &ss("externalLink"), link.as_bytes())
+        .link("xl/externalLinks/externalLink1.xml", external("rId1", "externalLinkPath", "file:///D:/Projects/SECRET-book-1.xlsx"))
+        .part("xl/workbook.xml", "rId9", "connections", "xl/connections.xml", &ss("connections"), connections.as_bytes())
+        .part("xl/worksheets/sheet1.xml", "rId1", "queryTable", "xl/queryTables/queryTable1.xml", &ss("queryTable"), format!("<queryTable xmlns=\"{S}\" name=\"q\" connectionId=\"1\"/>").as_bytes())
+        .zip();
+    let f = check_bytes("links.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "external-links"),
+        [
+            found(
+                "external_workbook",
+                "xl/externalLinks/externalLink1.xml",
+                1,
+                "1 linked workbook with 2 cached values"
+            ),
+            found(
+                "data_connection",
+                "xl/connections.xml",
+                2,
+                "2 data connections"
+            ),
+            found(
+                "folder_path",
+                "xl/workbook.xml",
+                1,
+                "1 folder path the workbook was saved in"
+            ),
+            found(
+                "data_connection",
+                "xl/queryTables/queryTable1.xml",
+                1,
+                "1 query table"
+            ),
+        ]
+    );
+    let shown: Vec<_> = values("links.xlsx", &book)
+        .into_iter()
+        .filter(|v| !v.is_empty())
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "file:///D:/Projects/SECRET-book-1.xlsx",
+            "Provider=SQLOLEDB;Data Source=SECRET-server-1",
+            "D:\\Projects\\avery\\SECRET-folder-1\\",
+        ]
+    );
+}
+
+#[test]
+fn the_path_rule_tells_files_from_web_links() {
+    for path in [
+        "file:///D:/a.docx",
+        "FILE://server/x",
+        "\\\\fileserver\\share\\a.xlsx",
+        "//fileserver/share/a",
+        "D:\\Projects\\a.png",
+        "c:/x",
+        "/Users/avery/a",
+        "/home/avery/a",
+        "/Volumes/Disk/a",
+    ] {
+        assert!(doc_sanitize::office::common::is_path(path, false), "{path}");
+    }
+    for not in [
+        "https://example.com/a",
+        "mailto:a@example.com",
+        "ftp://x",
+        "tel:123",
+        "#bookmark",
+        "Budget.xlsx",
+        "a photo",
+        "",
+        "///x",
+    ] {
+        assert!(!doc_sanitize::office::common::is_path(not, false), "{not}");
+    }
+    assert!(doc_sanitize::office::common::is_path(
+        "../Budget.xlsx",
+        true
+    ));
+    assert!(doc_sanitize::office::common::is_path("Budget.xlsx", true));
+    assert!(!doc_sanitize::office::common::is_path(
+        "https://example.com",
+        true
+    ));
+    assert!(!doc_sanitize::office::common::is_path("#Sheet2!A1", true));
+}
+
+/// A JPEG whose EXIF block holds `tags` (each a short), with optional bytes after the end.
+fn jpeg(tags: &[u16], after: &[u8]) -> Vec<u8> {
+    let mut exif = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
+    exif.extend((tags.len() as u16).to_le_bytes());
+    for t in tags {
+        exif.extend(t.to_le_bytes());
+        exif.extend([3, 0, 1, 0, 0, 0, 6, 0, 0, 0]);
+    }
+    exif.extend([0; 4]);
+    let mut b = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    b.extend(((exif.len() + 2) as u16).to_be_bytes());
+    b.extend(exif);
+    b.extend([0xFF, 0xDA, 0, 2, 0x12, 0x34, 0xFF, 0xD9]);
+    b.extend(after);
+    b
+}
+
+fn picture_doc(media: &[(&str, &[u8])], body: &str) -> Vec<u8> {
+    let mut p = Pkg::new("docx").body(&doc_xml(body));
+    for (i, (name, bytes)) in media.iter().enumerate() {
+        p = p.part(
+            "word/document.xml",
+            &format!("rId{}", i + 1),
+            "image",
+            name,
+            "",
+            bytes,
+        );
+    }
+    p.zip()
+}
+
+fn blip(id: &str, crop: &str) -> String {
+    format!(
+        "<w:p><w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"p\"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed=\"{id}\"/>{crop}<a:stretch/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
+    )
+}
+
+#[test]
+fn picture_metadata_and_crops_are_found() {
+    let body = blip(
+        "rId1",
+        "<a:srcRect l=\"10000\" r=\"20000\" t=\"0\" b=\"20000\"/>",
+    ) + &blip("rId2", "<a:srcRect l=\"500\"/>")
+        + &blip("rId3", "<a:srcRect l=\"-5000\" t=\"40000\"/>")
+        + &blip("rId2", "");
+    let doc = picture_doc(
+        &[
+            ("word/media/image1.jpeg", &jpeg(&[0x0112, 0x8825], b"")),
+            ("word/media/image2.jpeg", &jpeg(&[0x0112], b"")),
+            (
+                "word/media/image3.jpeg",
+                &jpeg(&[0x0112], b"SECRET-trailing-1"),
+            ),
+        ],
+        &body,
+    );
+    let f = check_bytes("pictures.docx", &doc);
+    assert_eq!(
+        kinds(&f, "image-metadata"),
+        [
+            found(
+                "picture_metadata",
+                "word/media/image1.jpeg",
+                1,
+                "1 picture with EXIF and GPS"
+            ),
+            found(
+                "picture_metadata",
+                "word/media/image3.jpeg",
+                1,
+                "1 picture with trailing bytes"
+            ),
+        ]
+    );
+    assert_eq!(
+        kinds(&f, "cropped-images"),
+        [found(
+            "cropped_picture",
+            "word/document.xml",
+            2,
+            "2 pictures with up to 44% cut away by cropping"
+        )]
+    );
+    let cut = jpeg(&[0x0112], b"");
+    let broken = picture_doc(&[("word/media/image1.jpeg", &cut[..cut.len() - 2])], "");
+    let f = check_bytes("broken.docx", &broken);
+    assert_eq!(f["error"]["code"], "damaged");
+    assert_eq!(
+        f["error"]["message"],
+        "broken.docx is damaged: picture word/media/image1.jpeg is cut short."
+    );
+}
+
+#[test]
+fn pivot_caches_and_data_models_are_found() {
+    let ss = |t: &str| format!("{OX}.spreadsheetml.{t}+xml");
+    let def = format!(
+        "<pivotCacheDefinition xmlns=\"{S}\" xmlns:r=\"{R}\" r:id=\"rId1\" recordCount=\"9\"><cacheSource type=\"worksheet\"><worksheetSource ref=\"A1:B3\" sheet=\"Deleted\"/></cacheSource><cacheFields count=\"1\"><cacheField name=\"Name\"><sharedItems><s v=\"SECRET-pivot-1\"/><s v=\"Sam\"/></sharedItems></cacheField></cacheFields></pivotCacheDefinition>"
+    );
+    let records = format!(
+        "<pivotCacheRecords xmlns=\"{S}\" count=\"2\"><r><x v=\"0\"/></r><r><x v=\"1\"/></r></pivotCacheRecords>"
+    );
+    let book = workbook(&[("Data", "visible", &sheet_xml(""))])
+        .part(
+            "xl/workbook.xml",
+            "rId8",
+            "pivotCacheDefinition",
+            "xl/pivotCache/pivotCacheDefinition1.xml",
+            &ss("pivotCacheDefinition"),
+            def.as_bytes(),
+        )
+        .part(
+            "xl/pivotCache/pivotCacheDefinition1.xml",
+            "rId1",
+            "pivotCacheRecords",
+            "xl/pivotCache/pivotCacheRecords1.xml",
+            &ss("pivotCacheRecords"),
+            records.as_bytes(),
+        )
+        .part(
+            "xl/workbook.xml",
+            "rId9",
+            "http://schemas.microsoft.com/office/2007/relationships/powerPivotData",
+            "xl/model/item.data",
+            "application/vnd.openxmlformats-officedocument.model+data",
+            b"\0SECRET-model-1",
+        )
+        .zip();
+    let f = check_bytes("pivot.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "pivot-caches"),
+        [
+            found(
+                "pivot_cache",
+                "xl/pivotCache/pivotCacheRecords1.xml",
+                1,
+                "1 pivot cache with 2 source rows"
+            ),
+            found("data_model", "xl/model/item.data", 1, "1 data model"),
+        ]
+    );
+    assert_eq!(values("pivot.xlsx", &book), ["SECRET-pivot-1", ""]);
 }
