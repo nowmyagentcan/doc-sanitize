@@ -184,7 +184,7 @@ fn pages(doc: &Document) -> Result<Vec<ObjectId>, Error> {
 }
 
 /// The name under `key`, without its slash.
-pub fn name(dict: &Dictionary, key: &[u8]) -> Option<String> {
+fn name(dict: &Dictionary, key: &[u8]) -> Option<String> {
     let n = dict.get(key).ok()?.as_name().ok()?;
     Some(String::from_utf8_lossy(n).into())
 }

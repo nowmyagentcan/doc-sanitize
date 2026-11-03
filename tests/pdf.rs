@@ -244,10 +244,6 @@ fn pdf_kinds(f: &serde_json::Value, check: &str) -> Vec<(String, String, u64, St
         .collect()
 }
 
-fn k(kind: &str, place: &str, count: u64, detail: &str) -> (String, String, u64, String) {
-    (kind.into(), place.into(), count, detail.into())
-}
-
 #[test]
 fn structure_leaks_are_found_and_their_values_stay_out() {
     let dir = dir("pdf-structure");
@@ -271,26 +267,26 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     assert_eq!(
         pdf_kinds(f, "metadata"),
         [
-            k(
+            found(
                 "info_dict",
                 r#"{"field":"/Info"}"#,
                 2,
                 "2 document properties, including the author"
             ),
-            k("xmp", &xmp, 1, "1 XMP metadata packet"),
-            k("object_xmp", "{}", 1, "1 object with its own XMP metadata"),
-            k(
+            found("xmp", &xmp, 1, "1 XMP metadata packet"),
+            found("object_xmp", "{}", 1, "1 object with its own XMP metadata"),
+            found(
                 "app_data",
                 "{}",
                 1,
                 "1 object with private application data"
             ),
-            k("thumbnail", "{}", 1, "1 page thumbnail"),
+            found("thumbnail", "{}", 1, "1 page thumbnail"),
         ]
     );
     assert_eq!(
         pdf_kinds(f, "comments"),
-        [k(
+        [found(
             "annotation",
             r#"{"page":1}"#,
             1,
@@ -300,15 +296,15 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     assert_eq!(
         pdf_kinds(f, "embedded-files"),
         [
-            k("attachment", "{}", 1, "1 attached file"),
-            k("associated_file", "{}", 1, "1 associated file"),
-            k(
+            found("attachment", "{}", 1, "1 attached file"),
+            found("associated_file", "{}", 1, "1 associated file"),
+            found(
                 "portfolio",
                 "{}",
                 1,
                 "the file is a portfolio that shows its attachments as its content"
             ),
-            k(
+            found(
                 "file_annotation",
                 r#"{"page":1}"#,
                 1,
@@ -319,13 +315,13 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     assert_eq!(
         pdf_kinds(f, "macros"),
         [
-            k(
+            found(
                 "javascript",
                 "{}",
                 1,
                 "1 script that runs when the file is opened or used"
             ),
-            k(
+            found(
                 "action",
                 "{}",
                 1,
@@ -336,8 +332,8 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     assert_eq!(
         pdf_kinds(f, "external-links"),
         [
-            k("remote_go_to", "{}", 1, "1 link to another file"),
-            k("file_uri", "{}", 1, "1 link to a local file"),
+            found("remote_go_to", "{}", 1, "1 link to another file"),
+            found("file_uri", "{}", 1, "1 link to a local file"),
         ]
     );
     let image = pdf_kinds(f, "image-metadata");
@@ -347,7 +343,7 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     );
     assert_eq!(
         pdf_kinds(f, "signatures"),
-        [k(
+        [found(
             "pdf_signature",
             "{}",
             2,
@@ -357,8 +353,8 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
     assert_eq!(
         pdf_kinds(f, "form-data"),
         [
-            k("xfa", "{}", 1, "an XFA form in 1 part"),
-            k(
+            found("xfa", "{}", 1, "an XFA form in 1 part"),
+            found(
                 "hidden_field_value",
                 "{}",
                 1,
@@ -426,7 +422,7 @@ fn earlier_revisions_name_what_changed_after_them() {
     let f = check_pdf("incremental.pdf", &incremental(), &[]);
     assert_eq!(
         pdf_kinds(&f, "old-revisions"),
-        [k(
+        [found(
             "earlier_revision",
             r#"{"revision":1}"#,
             1,
@@ -458,14 +454,14 @@ fn leftovers_are_found_in_the_bytes_and_the_objects() {
     let after = format!("{} bytes after the PDF ends", thousands(size as u64));
     assert_eq!(
         pdf_kinds(&f, "leftover-data"),
-        [k("data_outside_pdf", "{}", size as u64, &after)]
+        [found("data_outside_pdf", "{}", size as u64, &after)]
     );
     let mut before = b"%!PS junk\n".to_vec();
     before.extend(one_page(""));
     let f = check_pdf("before.pdf", &before, &[]);
     assert_eq!(
         pdf_kinds(&f, "leftover-data"),
-        [k(
+        [found(
             "data_outside_pdf",
             "{}",
             10,
@@ -497,19 +493,19 @@ fn leftovers_are_found_in_the_bytes_and_the_objects() {
     assert_eq!(
         pdf_kinds(&f, "leftover-data"),
         [
-            k(
+            found(
                 "unused_objects",
                 "{}",
                 1,
                 "1 object that nothing in the file uses"
             ),
-            k(
+            found(
                 "unlisted_objects",
                 "{}",
                 1,
                 "1 object body that no cross-reference table lists"
             ),
-            k(
+            found(
                 "unused_resources",
                 r#"{"page":1}"#,
                 1,
@@ -561,7 +557,7 @@ fn content_in_layers_that_are_off_is_found_with_its_pages() {
     let f = check_pdf("layers.pdf", &layered(false), &[]);
     assert_eq!(
         pdf_kinds(&f, "hidden-layers"),
-        [k(
+        [found(
             "hidden_layer",
             r#"{"page":1}"#,
             1,

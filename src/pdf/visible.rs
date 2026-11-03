@@ -18,6 +18,7 @@ use hayro::hayro_interpret::{
 use hayro::hayro_syntax::Pdf as Pages;
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath, Rect, Shape};
+use hayro::vello_cpu::Pixmap;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
@@ -606,7 +607,7 @@ fn report(c: &Ctx, page: usize, rec: &Recorder, outcomes: &[Outcome], found: &mu
 
 /// A page drawn at up to 144 DPI without anti-aliasing, so flat areas are exactly flat.
 struct Pixels {
-    rgba: Vec<u8>,
+    drawn: Pixmap,
     width: usize,
     height: usize,
     /// From default user space to pixels.
@@ -636,16 +637,16 @@ impl Pixels {
         };
         let drawn = hayro::render(page, cache, settings, &render, &pixmap);
         Self {
-            rgba: drawn.data_as_u8_slice().to_vec(),
             width: usize::from(drawn.width()),
             height: usize::from(drawn.height()),
+            drawn,
             map: Affine::scale(f64::from(scale)) * page.initial_transform(true).to_kurbo(),
         }
     }
 
     fn at(&self, x: usize, y: usize) -> [u8; 3] {
-        let i = (y * self.width + x) * 4;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2]]
+        let p = self.drawn.data()[y * self.width + x];
+        [p.r, p.g, p.b]
     }
 
     /// The pixel columns and rows of `r`, clamped to the page.
