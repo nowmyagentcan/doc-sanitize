@@ -40,13 +40,15 @@ jobs:
         run: |
           cargo test --locked --test clean -- --ignored --exact write_cleaned_fixtures
           cargo test --locked --test pdf -- --ignored --exact write_pdf_fixtures
-      - name: qpdf accepts every cleaned PDF it accepts the input of
+      - name: qpdf accepts every cleaned PDF unless its input has errors too
         working-directory: out
         run: |
           status=0
           for copy in clean-*.pdf; do
-            input=${copy#clean-}
-            if qpdf --check "$input" >/dev/null 2>&1 && ! qpdf --check "$copy"; then
+            qpdf --check "$copy" && continue
+            code=0
+            qpdf --check "${copy#clean-}" >/dev/null 2>&1 || code=$?
+            if [ "$code" -ne 2 ]; then
               echo "::error::qpdf rejected $copy"
               status=1
             fi
