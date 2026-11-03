@@ -12,8 +12,8 @@ use zip::{CompressionMethod, DateTime, ZipWriter};
 use super::common::rels_source;
 use super::tree::{Doc, El, Node};
 use super::{
-    CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, excel, key, ns, part_name,
-    rels_name, resolve, revisions, word,
+    CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, excel, key, ns, part_name,
+    powerpoint, rels_name, resolve, revisions, word,
 };
 use crate::report::{Change, CheckId, Error, Finding, Format, safe};
 
@@ -484,31 +484,56 @@ fn ids(root: &El) -> HashSet<String> {
     out
 }
 
-/// What clean can't remove yet: (check, kind, what it is).
-const NOT_YET: [(CheckId, &str); 2] = [
-    (CheckId::Macros, "macro_sheet"),
-    (CheckId::Macros, "dde_field"),
+/// What clean can't remove yet: (format, check, kind or `*` for any).
+const NOT_YET: [(Format, CheckId, &str); 6] = [
+    (Format::Xlsx, CheckId::Macros, "macro_sheet"),
+    (Format::Xlsx, CheckId::HiddenText, "*"),
+    (Format::Xlsx, CheckId::FakeRedactions, "*"),
+    (Format::Xlsx, CheckId::ExternalLinks, "external_workbook"),
+    (Format::Xlsx, CheckId::ExternalLinks, "data_connection"),
+    (Format::Xlsx, CheckId::ExternalLinks, "folder_path"),
 ];
 
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 7] = [
+const CLEANABLE: [CheckId; 11] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::TrackedChanges,
+    CheckId::HiddenText,
+    CheckId::FakeRedactions,
+    CheckId::EmbeddedFiles,
     CheckId::CustomData,
     CheckId::Macros,
+    CheckId::ExternalLinks,
     CheckId::LeftoverData,
     CheckId::Signatures,
 ];
 
 /// Why each check in `remove` can't be removed: (check, reason, hint).
-fn blocking(found: &[Finding], remove: &[CheckId]) -> Vec<(CheckId, String, String)> {
+fn blocking(
+    format: Format,
+    found: &[Finding],
+    remove: &[CheckId],
+) -> Vec<(CheckId, String, String)> {
     let mut out = vec![];
     for &c in remove {
-        let not_yet = found
+        let kinds: Vec<&str> = found
             .iter()
-            .any(|f| f.check == c && NOT_YET.iter().any(|n| n.0 == c && n.1 == f.kind));
-        if found.iter().any(|f| f.check == c) && (!CLEANABLE.contains(&c) || not_yet) {
+            .filter(|f| f.check == c)
+            .map(|f| f.kind)
+            .collect();
+        let not_yet = kinds.iter().any(|k| {
+            NOT_YET
+                .iter()
+                .any(|n| n.0 == format && n.1 == c && (n.2 == "*" || n.2 == *k))
+        });
+        if kinds.contains(&"imported_chunk") {
+            out.push((
+                c,
+                "it holds an imported document (w:altChunk)".into(),
+                "Open and save the file in Word, which turns the imported content into normal text, then run clean again; or use --keep embedded-files.".into(),
+            ));
+        } else if !kinds.is_empty() && (!CLEANABLE.contains(&c) || not_yet) {
             out.push((
                 c,
                 "this version can't remove it yet".into(),
@@ -521,7 +546,7 @@ fn blocking(found: &[Finding], remove: &[CheckId]) -> Vec<(CheckId, String, Stri
 
 /// Removes the checks in `remove` from the package `pkg`, whose check found `found`.
 pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cleaned, Error> {
-    let blocks = blocking(found, remove);
+    let blocks = blocking(pkg.format, found, remove);
     if !blocks.is_empty() {
         return Err(Error::cannot_clean(&blocks));
     }
@@ -545,8 +570,24 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     if has(CheckId::TrackedChanges) {
         tracked_changes(&ctx, &mut d)?;
     }
+    let (hidden, dark) = (has(CheckId::HiddenText), has(CheckId::FakeRedactions));
+    if (hidden || dark) && d.format == Format::Docx {
+        let look = word::Look::read(&ctx)?;
+        for part in word::pages(&ctx) {
+            d.edit(part, |root| {
+                look.clean_runs(root, hidden, dark);
+                Ok(true)
+            })?;
+        }
+    }
+    if has(CheckId::EmbeddedFiles) {
+        embedded_files(&ctx, &mut d)?;
+    }
     if has(CheckId::CustomData) {
         custom_data(&mut d)?;
+    }
+    if has(CheckId::ExternalLinks) {
+        external_links(&ctx, &mut d)?;
     }
     if has(CheckId::Metadata) {
         metadata(&mut d)?;
@@ -593,6 +634,11 @@ fn macros(d: &mut Draft) -> Result<(), Error> {
         d.prune_linked(&part, controls)?;
     }
     d.delete_linked("control")?;
+    if d.format == Format::Docx {
+        for part in d.xml_parts() {
+            d.edit(&part, |root| Ok(word::unlink_fields(root, false, true) > 0))?;
+        }
+    }
     if let Some(&(_, plain)) = MACRO_FREE.iter().find(|m| m.0 == d.variant) {
         let (ct, ..) = MAIN_TYPES
             .iter()
@@ -605,6 +651,209 @@ fn macros(d: &mut Draft) -> Result<(), Error> {
             "extension_changed",
             format!("Macros were removed, so the copy is .{plain}."),
         ));
+    }
+    Ok(())
+}
+
+const OFFICE: &str = "urn:schemas-microsoft-com:office:office";
+const CHART: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+
+/// `embedded-files`: Word objects keep their picture, PowerPoint objects become their preview
+/// picture, Excel objects go with their shapes, and charts lose their workbooks (they still
+/// draw from their caches).
+fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    let (mut pictures, mut gone) = (0u64, 0u64);
+    let object = |e: &El| {
+        e.is(OFFICE, "OLEObject") || e.is(ns::W, "objectEmbed") || e.is(ns::W, "objectLink")
+    };
+    match d.format {
+        Format::Docx => {
+            for part in word::stories(ctx) {
+                let Some(doc) = d.doc(part)? else { continue };
+                doc.root.each(&mut |e| {
+                    if e.is(ns::W, "object") && e.has(&object) {
+                        match e.has(&|s: &El| s.is(VML, "shape")) {
+                            true => pictures += 1,
+                            false => gone += 1,
+                        }
+                    }
+                });
+                d.prune_linked(part, |e| {
+                    e.is(ns::W, "object") && e.has(&object) && !e.has(&|s: &El| s.is(VML, "shape"))
+                })?;
+                d.prune_linked(part, object)?;
+            }
+        }
+        Format::Xlsx => {
+            for sheet in excel::cell_sheets(d) {
+                let mut shapes = HashSet::new();
+                if let Some(doc) = d.doc(&sheet)? {
+                    doc.root.each(&mut |e| {
+                        if e.is(ns::S, "oleObject") {
+                            gone += 1;
+                            shapes.extend(e.attr("", "shapeId").map(|id| format!("_x0000_s{id}")));
+                        }
+                    });
+                }
+                d.prune_linked(&sheet, |e| e.is(ns::S, "oleObjects"))?;
+                drop_vml_shapes(d, &sheet, |e| {
+                    e.attr("", "id").is_some_and(|id| shapes.contains(id))
+                })?;
+            }
+        }
+        _ => {
+            for slide in ctx.slides.clone() {
+                let Some(mut doc) = d.doc(&slide)? else {
+                    continue;
+                };
+                let before = ids(&doc.root);
+                let (p, g) = powerpoint::ole_to_pictures(&mut doc.root);
+                if p + g == 0 {
+                    continue;
+                }
+                (pictures, gone) = (pictures + p, gone + g);
+                d.set(&slide, doc.write());
+                for id in before.difference(&ids(&doc.root)) {
+                    d.unlink(&slide, id)?;
+                }
+            }
+        }
+    }
+    for part in d.names() {
+        if d.content_type(&part).as_deref() == Some(CHART_TYPE) {
+            d.prune_linked(&part, |e| e.is(CHART, "externalData"))?;
+        }
+    }
+    let objects = |n: u64| {
+        if n == 1 {
+            "1 embedded object is"
+        } else {
+            "embedded objects are"
+        }
+    };
+    if pictures > 0 {
+        let what = match pictures {
+            1 => "1 embedded object is now a picture.".to_string(),
+            n => format!("{n} {} now pictures.", objects(n)),
+        };
+        d.changes
+            .push(Change::counted("objects_to_pictures", pictures, what));
+    }
+    if gone > 0 {
+        let what = match gone {
+            1 => "1 embedded object had no picture and was removed.".to_string(),
+            n => format!("{n} embedded objects had no picture and were removed."),
+        };
+        d.changes
+            .push(Change::counted("objects_removed", gone, what));
+    }
+    Ok(())
+}
+
+const CHART_TYPE: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
+
+/// Removes the VML shapes of `sheet`'s drawing that `pick` picks; a drawing left with no shape
+/// goes with the sheet's `legacyDrawing`.
+fn drop_vml_shapes(d: &mut Draft, sheet: &str, pick: impl Fn(&El) -> bool) -> Result<(), Error> {
+    for l in d.linked("vmlDrawing")? {
+        if key(&l.source) != key(sheet) {
+            continue;
+        }
+        let vml = l.part.unwrap_or_default();
+        let left = match d.doc(&vml) {
+            Ok(Some(mut doc)) => {
+                if doc.root.prune(&|e: &El| e.is(VML, "shape") && pick(e)) == 0 {
+                    continue;
+                }
+                let left = doc.root.has(&|e: &El| e.is(VML, "shape"));
+                d.set(&vml, doc.write());
+                left
+            }
+            _ => false,
+        };
+        if !left {
+            let id = l.rel.id.clone();
+            d.prune_linked(&l.source, |e| {
+                e.is(ns::S, "legacyDrawing") && e.attr(ns::R, "id") == Some(&id)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `external-links` in Word and PowerPoint files and in workbook drawings: the template and
+/// mail merge source, fields that read files, links and linked pictures to local files, and
+/// alt text that holds a path.
+fn external_links(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    if d.format == Format::Docx {
+        for l in d.linked("settings")? {
+            let settings = l.part.unwrap_or_default();
+            d.prune_linked(&settings, |e| {
+                e.is(ns::W, "attachedTemplate") || e.is(ns::W, "mailMerge")
+            })?;
+        }
+        for part in word::stories(ctx) {
+            d.edit(part, |root| Ok(word::unlink_fields(root, true, false) > 0))?;
+        }
+    }
+    let mut files: Vec<(String, Vec<String>)> = vec![];
+    for l in d.links()? {
+        let own = common::OWN_LINKS.contains(&l.rel.short());
+        if l.rel.external && !own && common::is_path(&l.rel.target, true) {
+            match files.iter_mut().find(|f| f.0 == l.source) {
+                Some(f) => f.1.push(l.rel.id),
+                None => files.push((l.source, vec![l.rel.id])),
+            }
+        }
+    }
+    for (source, links) in files {
+        let named = |e: &El, a: &str| {
+            e.attr(ns::R, a)
+                .is_some_and(|v| links.iter().any(|l| l == v))
+        };
+        if d.is_xml(&source) {
+            d.edit(&source, |root| {
+                root.unwrap(&|e| e.is(ns::W, "hyperlink") && named(e, "id"));
+                let linked_only = |e: &El| {
+                    e.is(ns::A, "blip") && named(e, "link") && e.attr(ns::R, "embed").is_none()
+                };
+                root.prune(&|e| {
+                    (e.is(ns::A, "hlinkClick")
+                        || e.is(ns::A, "hlinkHover")
+                        || e.is(ns::S, "hyperlink"))
+                        && named(e, "id")
+                        || e.is(OFFICE, "OLEObject") && named(e, "id")
+                        || (e.is(ns::W, "drawing")
+                            || e.is(ns::P, "pic")
+                            || e.local().ends_with("Anchor"))
+                            && e.has(&linked_only)
+                });
+                root.each_mut(&mut |e| {
+                    if e.is(ns::A, "blip") && named(e, "link") {
+                        e.drop_attrs(|a| &*a.ns == ns::R && a.local() == "link");
+                    }
+                });
+                Ok(true)
+            })?;
+        }
+        for id in &links {
+            d.unlink(&source, id)?;
+        }
+    }
+    for part in d.xml_parts() {
+        d.edit(&part, |root| {
+            let mut n = 0;
+            root.each_mut(&mut |e| {
+                for a in &mut e.attrs {
+                    let alt = a.ns.is_empty() && (a.name == "descr" || a.name == "title");
+                    if alt && common::is_path(&a.value, false) {
+                        a.value.clear();
+                        n += 1;
+                    }
+                }
+            });
+            Ok(n > 0)
+        })?;
     }
     Ok(())
 }
@@ -636,28 +885,12 @@ fn comments(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             for short in ["comments", "threadedComment", "person"] {
                 d.delete_linked(short)?;
             }
-            for l in d.linked("vmlDrawing")? {
-                let vml = l.part.unwrap_or_default();
-                let note = |e: &El| {
-                    e.is(VML, "shape")
-                        && e.child(VML_EXCEL, "ClientData")
-                            .is_some_and(|c| c.attr("", "ObjectType") == Some("Note"))
-                };
-                let left = match d.doc(&vml) {
-                    Ok(Some(mut doc)) => {
-                        doc.root.prune(&note);
-                        let left = doc.root.has(&|e: &El| e.is(VML, "shape"));
-                        d.set(&vml, doc.write());
-                        left
-                    }
-                    _ => false,
-                };
-                if !left {
-                    let id = l.rel.id.clone();
-                    d.prune_linked(&l.source, |e| {
-                        e.is(ns::S, "legacyDrawing") && e.attr(ns::R, "id") == Some(&id)
-                    })?;
-                }
+            let note = |e: &El| {
+                e.child(VML_EXCEL, "ClientData")
+                    .is_some_and(|c| c.attr("", "ObjectType") == Some("Note"))
+            };
+            for sheet in excel::cell_sheets(d) {
+                drop_vml_shapes(d, &sheet, note)?;
             }
         }
         _ => {
@@ -707,10 +940,17 @@ fn tracked_changes(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
     Ok(())
 }
 
-/// Removes `ext` elements left with nothing in them, then empty `extLst`s.
+/// Removes the `ext` elements of extension lists left with nothing in them, then empty
+/// `extLst`s.
 fn empty_extensions(root: &mut El) -> usize {
-    let empty = |local: &'static str| move |e: &El| e.local() == local && e.els().next().is_none();
-    root.prune(&empty("ext")) + root.prune(&empty("extLst"))
+    let empty = |e: &El| e.els().next().is_none();
+    let mut n = 0;
+    root.each_mut(&mut |e| {
+        if e.local() == "extLst" {
+            n += e.prune(&|x: &El| x.local() == "ext" && empty(x));
+        }
+    });
+    n + root.prune(&|e: &El| e.local() == "extLst" && empty(e))
 }
 
 /// `custom-data`: custom XML parts, data bindings, document variables, tags, add-in data,

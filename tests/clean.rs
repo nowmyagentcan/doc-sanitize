@@ -605,3 +605,168 @@ fn a_change_that_cant_be_accepted_leaves_no_file() {
     );
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
 }
+
+#[test]
+fn hidden_text_goes_and_dark_text_becomes_bars() {
+    let dir = dir("clean-hidden");
+    put(&dir, &[("a.docx", &leaky_docx("docx"))]);
+    let out = run_in(
+        &dir,
+        &["clean", "a.docx", "--keep", "image-metadata,cropped-images"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let copy = dir.join("a.clean.docx");
+    assert_eq!(
+        paragraphs(&part_of(&copy, "word/document.xml")),
+        [
+            "Agreement between the parties.",
+            "The fee is due monthly.",
+            "Payment termsSECRET-docx-ins-1MovedSECRET-docx-move-1",
+            "Visible ",
+            "",
+            "",
+            "\u{2588}".repeat(19).as_str(),
+            "Kept",
+            "Bound client",
+            "[picture]",
+            "",
+            "",
+        ]
+    );
+    // The accepted insertion and move are the document's text now; nothing else is left.
+    let left: Vec<_> = copy_secrets(&copy).into_iter().collect();
+    assert_eq!(left, ["ins", "move"].map(|k| format!("SECRET-docx-{k}-1")));
+    let doc = String::from_utf8(part_of(&copy, "word/document.xml")).unwrap();
+    assert!(
+        doc.contains("<v:shape id=\"_x0000_i1025\""),
+        "the object keeps its picture"
+    );
+    assert!(!doc.contains("OLEObject"));
+}
+
+/// A document with fields that read files, a DDE field, links and a linked picture to local
+/// files, and alt text that holds a path.
+fn links_docx() -> Vec<u8> {
+    let field = |instr: &str, result: &str| {
+        format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\">{instr}</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>{result}</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        )
+    };
+    let body = [
+        format!("<w:p>{}</w:p>", field(" INCLUDETEXT \"D:\\\\Projects\\\\SECRET-lnk-field-1.docx\" ", "included")),
+        format!("<w:p>{}{}</w:p>", field(" DDEAUTO excel \"\\\\\\\\fileserver\\\\SECRET-lnk-dde-1.xlsx\" A1 ", "42"), field(" PAGE ", "1")),
+        "<w:p><w:hyperlink r:id=\"rId40\"><w:r><w:t>the budget</w:t></w:r></w:hyperlink><w:hyperlink r:id=\"rId41\"><w:r><w:t>web</w:t></w:r></w:hyperlink></w:p>".into(),
+        "<w:p><w:r><w:drawing><wp:inline><wp:extent cx=\"9\" cy=\"9\"/><wp:docPr id=\"1\" name=\"P\" descr=\"/home/avery/SECRET-lnk-alt-1.png\"/><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\"P\"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:link=\"rId42\"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r><w:r><w:t>after</w:t></w:r></w:p>".into(),
+    ]
+    .concat();
+    Pkg::new("docx")
+        .body(&doc_xml(&body))
+        .link(
+            "word/document.xml",
+            external(
+                "rId40",
+                "hyperlink",
+                "file:///D:/Projects/SECRET-lnk-link-1.xlsx",
+            ),
+        )
+        .link(
+            "word/document.xml",
+            external("rId41", "hyperlink", "https://example.com/"),
+        )
+        .link(
+            "word/document.xml",
+            external(
+                "rId42",
+                "image",
+                "\\\\fileserver\\share\\SECRET-lnk-pic-1.png",
+            ),
+        )
+        .zip()
+}
+
+#[test]
+fn fields_links_and_pictures_stop_reading_local_files() {
+    let dir = dir("clean-links");
+    put(&dir, &[("a.docx", &links_docx())]);
+    let out = run_in(&dir, &["clean", "a.docx", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let copy = dir.join("a.clean.docx");
+    assert!(copy_secrets(&copy).is_empty(), "{:?}", copy_secrets(&copy));
+    assert_eq!(
+        paragraphs(&part_of(&copy, "word/document.xml")),
+        ["included", "421", "the budgetweb", "after"]
+    );
+    let rels = String::from_utf8(part_of(&copy, "word/_rels/document.xml.rels")).unwrap();
+    assert!(
+        rels.contains("https://example.com/") && !rels.contains("rId40"),
+        "{rels}"
+    );
+    let doc = String::from_utf8(part_of(&copy, "word/document.xml")).unwrap();
+    assert!(
+        doc.contains("<w:hyperlink r:id=\"rId41\">"),
+        "web links stay"
+    );
+    assert!(doc.contains("PAGE"), "other fields stay");
+}
+
+#[test]
+fn an_imported_document_leaves_no_file() {
+    let body = "<w:altChunk r:id=\"rId20\"/><w:p><w:r><w:t>x</w:t></w:r></w:p>";
+    let doc = Pkg::new("docx")
+        .body(&doc_xml(body))
+        .part(
+            "word/document.xml",
+            "rId20",
+            "aFChunk",
+            "word/afchunk.htm",
+            "text/html",
+            b"<p>imported</p>",
+        )
+        .zip();
+    let dir = dir("clean-chunk");
+    put(&dir, &[("a.docx", &doc)]);
+    let out = run_in(&dir, &["clean", "a.docx", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let f = &json(&out)["files"][0];
+    assert_eq!(f["status"], "not_cleaned");
+    assert_eq!(f["output"], serde_json::Value::Null);
+    assert_eq!(f["error"]["code"], "cannot_clean");
+    assert_eq!(
+        f["error"]["message"],
+        "Can't remove embedded-files from a.docx: it holds an imported document (w:altChunk)."
+    );
+    assert!(
+        f["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .ends_with("or use --keep embedded-files.")
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let out = run_in(&dir, &["clean", "a.docx", "--keep", "embedded-files"]);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn slide_objects_become_their_pictures_and_charts_lose_workbooks() {
+    let dir = dir("clean-ole");
+    put(&dir, &[("a.pptx", &leaky_pptx("pptx"))]);
+    let keep = "hidden-slides,speaker-notes,hidden-objects,image-metadata,cropped-images";
+    let out = run_in(&dir, &["clean", "a.pptx", "--keep", keep]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("  changed  1 embedded object is now a picture.\n"));
+    let copy = dir.join("a.clean.pptx");
+    let left = copy_secrets(&copy);
+    for s in ["ole", "chart", "tag", "addin", "comment"] {
+        assert!(
+            !left.iter().any(|l| l.contains(&format!("-{s}-"))),
+            "{s}: {left:?}"
+        );
+    }
+    let slide = String::from_utf8(part_of(&copy, "ppt/slides/slide1.xml")).unwrap();
+    assert!(
+        slide.contains("<p:pic><p:nvPicPr><p:cNvPr id=\"40\" name=\"Object 1\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed=\"rId6\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic>"),
+        "{slide}"
+    );
+    let chart = String::from_utf8(part_of(&copy, "ppt/charts/chart1.xml")).unwrap();
+    assert!(!chart.contains("externalData"), "{chart}");
+}

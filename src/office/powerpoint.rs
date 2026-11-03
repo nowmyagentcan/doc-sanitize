@@ -2,6 +2,7 @@
 
 use quick_xml::events::Event;
 
+use super::tree::{Attr, El, Node};
 use super::{Ctx, common, ns, xml};
 use crate::report::{CheckId, Error, Finding, Where, plural};
 
@@ -82,4 +83,77 @@ pub fn speaker_notes(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         }
     }
     Ok(found)
+}
+
+/// Turns each OLE object frame of a slide into the picture that previews it: the frame's
+/// `p:cNvPr` and position, the preview's fill. A frame with no preview goes. Gives how many
+/// became pictures and how many went.
+pub fn ole_to_pictures(root: &mut El) -> (u64, u64) {
+    let (mut pictures, mut gone) = (0, 0);
+    convert(root, &mut pictures, &mut gone);
+    (pictures, gone)
+}
+
+fn convert(e: &mut El, pictures: &mut u64, gone: &mut u64) {
+    let ole = |f: &El| f.is(ns::P, "graphicFrame") && f.has(&|o: &El| o.is(ns::P, "oleObj"));
+    let mut kids = Vec::with_capacity(e.kids.len());
+    for k in std::mem::take(&mut e.kids) {
+        match k {
+            Node::El(f) if ole(&f) => match picture_of(&f) {
+                Some(pic) => {
+                    *pictures += 1;
+                    kids.push(Node::El(pic));
+                }
+                None => *gone += 1,
+            },
+            Node::El(mut c) => {
+                convert(&mut c, pictures, gone);
+                kids.push(Node::El(c));
+            }
+            k => kids.push(k),
+        }
+    }
+    e.kids = kids;
+}
+
+/// The `p:pic` that shows an OLE frame: its preview's fill in the frame's place.
+fn picture_of(frame: &El) -> Option<El> {
+    let mut fill = None;
+    frame.each(&mut |e| {
+        if fill.is_none() && e.is(ns::P, "pic") {
+            fill = e.child(ns::P, "blipFill").cloned();
+        }
+    });
+    let fill = fill?;
+    let nv = frame.child(ns::P, "nvGraphicFramePr")?;
+    let xfrm = frame.child(ns::P, "xfrm")?;
+    let a = xfrm.els().next()?;
+    let el = |like: &El, local: &str, kids: Vec<El>| El {
+        kids: kids.into_iter().map(Node::El).collect(),
+        ..El::like(like, local)
+    };
+    let mut c_nv = nv.child(ns::P, "cNvPr")?.clone();
+    c_nv.kids.clear();
+    let nv_pr = nv
+        .child(ns::P, "nvPr")
+        .cloned()
+        .unwrap_or_else(|| El::like(nv, "nvPr"));
+    let mut geometry = El::like(a, "prstGeom");
+    geometry.attrs.push(Attr {
+        name: "prst".into(),
+        ns: "".into(),
+        value: "rect".into(),
+    });
+    geometry.kids.push(Node::El(El::like(a, "avLst")));
+    let shape = el(
+        frame,
+        "spPr",
+        vec![el(a, "xfrm", xfrm.els().cloned().collect()), geometry],
+    );
+    let nv_pic = el(
+        frame,
+        "nvPicPr",
+        vec![c_nv, El::like(frame, "cNvPicPr"), nv_pr],
+    );
+    Some(el(frame, "pic", vec![nv_pic, fill, shape]))
 }

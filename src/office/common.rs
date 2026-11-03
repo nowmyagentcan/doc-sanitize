@@ -811,7 +811,7 @@ pub fn is_path(v: &str, relative: bool) -> bool {
 }
 
 /// Relationship types that `external-links` reports under their own kinds.
-const OWN_LINKS: [&str; 5] = [
+pub const OWN_LINKS: [&str; 5] = [
     "attachedTemplate",
     "mailMergeSource",
     "mailMergeHeaderSource",
