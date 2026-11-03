@@ -12,6 +12,7 @@ const DOCX_CHECKS: &[&str] = &[
     "tracked-changes",
     "hidden-text",
     "fake-redactions",
+    "hidden-objects",
     "leftover-data",
 ];
 const XLSX_CHECKS: &[&str] = &[
@@ -20,9 +21,19 @@ const XLSX_CHECKS: &[&str] = &[
     "tracked-changes",
     "hidden-text",
     "fake-redactions",
+    "hidden-sheets",
+    "hidden-rows-columns",
+    "hidden-objects",
     "leftover-data",
 ];
-const PPTX_CHECKS: &[&str] = &["metadata", "comments", "leftover-data"];
+const PPTX_CHECKS: &[&str] = &[
+    "metadata",
+    "comments",
+    "hidden-slides",
+    "speaker-notes",
+    "hidden-objects",
+    "leftover-data",
+];
 
 const VARIANTS: [&str; 14] = [
     "docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "xltx", "xltm", "pptx", "pptm", "potx", "potm",
@@ -984,7 +995,11 @@ fn a_hidden_sheet_is_named_only_with_values() {
         at(&["h.xlsx", "--json", "--show-values"])["sheet"],
         "Salaries"
     );
-    assert!(stdout(&run_in(&dir, &["h.xlsx"])).contains("  ✗ comments  sheet 1: 1 note\n"));
+    let text = stdout(&run_in(&dir, &["h.xlsx"]));
+    assert!(
+        text.contains("sheet 1: 1 note\n") && !text.contains("Salaries"),
+        "{text}"
+    );
 }
 
 fn doc_xml(body: &str) -> String {
@@ -1372,4 +1387,243 @@ fn hidden_and_same_colour_cells_are_found() {
     assert!(stdout(&run_in(&dir, &["cells.xlsx"])).contains(
         "  ✗ fake-redactions  sheet Data, D5:D6: 2 cells coloured like the dark fill behind them\n"
     ));
+}
+
+#[test]
+fn hidden_sheets_rows_and_columns_are_found() {
+    let summary = format!(
+        "<worksheet xmlns=\"{S}\"><cols><col min=\"2\" max=\"2\" width=\"0.05\" customWidth=\"1\"/><col min=\"6\" max=\"7\" width=\"9\" hidden=\"1\"/></cols><sheetData>\
+         <row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"F1\"><v>11</v></c></row>\
+         <row r=\"2\"><c r=\"B2\" t=\"inlineStr\"><is><t>SECRET-col-1</t></is></c><c r=\"G2\"><v>12</v></c></row>\
+         <row r=\"3\" hidden=\"1\"><c r=\"A3\" t=\"inlineStr\"><is><t>SECRET-row-1</t></is></c><c r=\"C3\"><v>3</v></c></row>\
+         <row r=\"4\" customHeight=\"1\" ht=\"0.2\"><c r=\"A4\"><v>4</v></c></row>\
+         <row r=\"5\" hidden=\"1\"><c r=\"A5\"/></row>\
+         <row r=\"6\" customHeight=\"1\" ht=\"30\"><c r=\"A6\"><v>6</v></c></row>\
+         </sheetData></worksheet>"
+    );
+    let book = workbook(&[
+        ("Summary", "visible", &summary),
+        ("Salaries", "veryHidden", &sheet_xml("")),
+        ("Draft", "hidden", &sheet_xml("")),
+    ])
+    .zip();
+    let f = check_bytes("hidden.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "hidden-sheets"),
+        [
+            found(
+                "hidden_sheet",
+                "xl/worksheets/sheet2.xml",
+                1,
+                "1 very hidden sheet"
+            ),
+            found(
+                "hidden_sheet",
+                "xl/worksheets/sheet3.xml",
+                1,
+                "1 hidden sheet"
+            ),
+        ]
+    );
+    assert_eq!(
+        findings_of(&f, "hidden-sheets")[0]["where"],
+        serde_json::json!({ "part": "xl/worksheets/sheet2.xml", "sheet_index": 2 })
+    );
+    assert_eq!(
+        kinds(&f, "hidden-rows-columns"),
+        [
+            found(
+                "hidden_rows",
+                "xl/worksheets/sheet1.xml",
+                2,
+                "2 hidden rows holding 3 values"
+            ),
+            found(
+                "hidden_columns",
+                "xl/worksheets/sheet1.xml",
+                3,
+                "3 hidden columns holding 3 values"
+            ),
+        ]
+    );
+    let cells: Vec<_> = findings_of(&f, "hidden-rows-columns")
+        .iter()
+        .map(|x| x["where"]["cells"].clone())
+        .collect();
+    assert_eq!(cells, ["A3:C4", "B1:G2"]);
+    assert_eq!(
+        values("hidden.xlsx", &book),
+        ["Salaries", "Draft", "SECRET-row-1", "11"]
+    );
+}
+
+fn shape(id: u32, hidden: bool, xfrm: &str, text: &str) -> String {
+    let hidden = if hidden { " hidden=\"1\"" } else { "" };
+    format!(
+        "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"Shape {id}\"{hidden}/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{xfrm}</p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"
+    )
+}
+
+fn xfrm(x: i64, y: i64, cx: i64, cy: i64) -> String {
+    format!("<a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>")
+}
+
+#[test]
+fn hidden_slides_notes_and_shapes_are_found() {
+    let group = format!(
+        "<p:grpSp><p:nvGrpSpPr><p:cNvPr id=\"10\" name=\"Group\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"100\" cy=\"100\"/><a:chOff x=\"0\" y=\"0\"/><a:chExt cx=\"10\" cy=\"10\"/></a:xfrm></p:grpSpPr>{}{}</p:grpSp>",
+        shape(11, false, &xfrm(2_000_000, 0, 10, 10), "SECRET-offslide-1"),
+        shape(12, false, &xfrm(5, 5, 1, 1), "inside"),
+    );
+    let slide1 = slide_xml(
+        &[
+            shape(2, true, &xfrm(0, 0, 100, 100), "SECRET-shape-1"),
+            shape(3, false, "", "placeholder"),
+            shape(4, false, &xfrm(-500_000, 100, 1_000_000, 100), "partly on"),
+            shape(
+                5,
+                false,
+                &xfrm(-5_000_000, 100, 1_000_000, 100),
+                "left of it",
+            ),
+        ]
+        .concat(),
+    );
+    let slide2 = slide_xml(&shape(2, false, &xfrm(0, 0, 10, 10), "SECRET-slide-1"))
+        .replace("<p:sld ", "<p:sld show=\"0\" ");
+    let slide3 = slide_xml(&group);
+    let notes = |body: &str| {
+        format!(
+            "<p:notes xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><p:cSld><p:spTree>{body}</p:spTree></p:cSld></p:notes>"
+        )
+    };
+    let ph = |kind: &str, text: &str| {
+        format!(
+            "<p:sp><p:nvSpPr><p:cNvPr id=\"2\" name=\"x\"/><p:cNvSpPr/><p:nvPr><p:ph type=\"{kind}\"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"
+        )
+    };
+    let notes1 = notes(&(ph("sldImg", "") + &ph("body", "SECRET-notes-1") + &ph("sldNum", "1")));
+    let notes3 = notes(&(ph("sldImg", "") + &ph("body", " ") + &ph("sldNum", "3")));
+    let pml = |t: &str| format!("{OX}.presentationml.{t}+xml");
+    let deck = presentation(&[&slide1, &slide2, &slide3])
+        .part(
+            "ppt/slides/slide1.xml",
+            "rId9",
+            "notesSlide",
+            "ppt/notesSlides/notesSlide1.xml",
+            &pml("notesSlide"),
+            notes1.as_bytes(),
+        )
+        .part(
+            "ppt/slides/slide3.xml",
+            "rId9",
+            "notesSlide",
+            "ppt/notesSlides/notesSlide3.xml",
+            &pml("notesSlide"),
+            notes3.as_bytes(),
+        )
+        .zip();
+    let f = check_bytes("deck.pptx", &deck);
+    assert_eq!(
+        kinds(&f, "hidden-slides"),
+        [found(
+            "hidden_slide",
+            "ppt/slides/slide2.xml",
+            1,
+            "1 hidden slide"
+        )]
+    );
+    assert_eq!(
+        kinds(&f, "speaker-notes"),
+        [found(
+            "notes",
+            "ppt/notesSlides/notesSlide1.xml",
+            1,
+            "speaker notes with 14 characters"
+        )]
+    );
+    assert_eq!(
+        kinds(&f, "hidden-objects"),
+        [
+            found(
+                "hidden_object",
+                "ppt/slides/slide1.xml",
+                1,
+                "1 hidden object"
+            ),
+            found(
+                "off_slide_object",
+                "ppt/slides/slide1.xml",
+                1,
+                "1 object off the slide"
+            ),
+            found(
+                "off_slide_object",
+                "ppt/slides/slide3.xml",
+                1,
+                "1 object off the slide"
+            ),
+        ]
+    );
+    let slides: Vec<_> = f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["where"]["slide"].clone())
+        .collect();
+    assert_eq!(slides, [2, 1, 1, 1, 3]);
+    assert_eq!(
+        values("deck.pptx", &deck),
+        [
+            "SECRET-slide-1",
+            "SECRET-notes-1",
+            "SECRET-shape-1",
+            "left of it",
+            "SECRET-offslide-1"
+        ]
+    );
+}
+
+#[test]
+fn hidden_shapes_are_found_in_documents_and_sheets() {
+    let body = "".to_string()
+        + "<w:p><w:r><w:drawing><wp:inline><wp:extent cx=\"10\" cy=\"10\"/><wp:docPr id=\"1\" name=\"Picture 1\" hidden=\"1\"/><a:graphic><a:graphicData><pic:pic><pic:nvPicPr><pic:cNvPr id=\"0\" name=\"x\"/><pic:cNvPicPr/></pic:nvPicPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>\
+         <w:r><w:pict><v:shape id=\"t1\" style=\"position:absolute;visibility: hidden\"><v:textbox><w:txbxContent><w:p><w:r><w:t>SECRET-vml-1</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>\
+         <w:r><w:drawing><wp:inline><wp:docPr id=\"2\" name=\"Shown\"/></wp:inline></w:drawing></w:r></w:p>";
+    let doc = Pkg::new("docx").body(&doc_xml(&body)).zip();
+    assert_eq!(
+        kinds(&check_bytes("shapes.docx", &doc), "hidden-objects"),
+        [found(
+            "hidden_object",
+            "word/document.xml",
+            2,
+            "2 hidden objects"
+        )]
+    );
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><xdr:twoCellAnchor><xdr:sp><xdr:nvSpPr><xdr:cNvPr id=\"2\" name=\"Box\" hidden=\"1\"/><xdr:cNvSpPr/></xdr:nvSpPr><xdr:txBody><a:p><a:r><a:t>SECRET-xdr-1</a:t></a:r></a:p></xdr:txBody></xdr:sp></xdr:twoCellAnchor></xdr:wsDr>";
+    let book = workbook(&[("Data", "visible", &sheet_xml(""))])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "drawing",
+            "xl/drawings/drawing1.xml",
+            &format!("{OX}.drawing+xml"),
+            drawing.as_bytes(),
+        )
+        .zip();
+    let f = check_bytes("shapes.xlsx", &book);
+    assert_eq!(
+        kinds(&f, "hidden-objects"),
+        [found(
+            "hidden_object",
+            "xl/drawings/drawing1.xml",
+            1,
+            "1 hidden object"
+        )]
+    );
+    assert_eq!(
+        findings_of(&f, "hidden-objects")[0]["where"]["sheet"],
+        "Data"
+    );
+    assert_eq!(values("shapes.xlsx", &book), ["SECRET-xdr-1"]);
 }

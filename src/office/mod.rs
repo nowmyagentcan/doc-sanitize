@@ -5,7 +5,9 @@
 
 pub mod colour;
 pub mod common;
+pub mod drawing;
 pub mod excel;
+pub mod powerpoint;
 pub mod word;
 pub mod xml;
 pub mod zipscan;
@@ -29,6 +31,7 @@ pub mod ns {
     pub const XR: &str = "http://schemas.microsoft.com/office/spreadsheetml/2014/revision";
     pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
     pub const P14: &str = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+    pub const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
     pub const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     pub const CP: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
     pub const DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -49,6 +52,7 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             TrackedChanges,
             HiddenText,
             FakeRedactions,
+            HiddenObjects,
             LeftoverData,
         ],
         Format::Xlsx => &[
@@ -57,9 +61,19 @@ pub fn checks(format: Format) -> &'static [CheckId] {
             TrackedChanges,
             HiddenText,
             FakeRedactions,
+            HiddenSheets,
+            HiddenRowsColumns,
+            HiddenObjects,
             LeftoverData,
         ],
-        Format::Pptx => &[Metadata, Comments, LeftoverData],
+        Format::Pptx => &[
+            Metadata,
+            Comments,
+            HiddenSlides,
+            SpeakerNotes,
+            HiddenObjects,
+            LeftoverData,
+        ],
         Format::Pdf => &[],
     }
 }
@@ -76,10 +90,16 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
         }
         Format::Xlsx => {
             found.extend(excel::shared_workbook_log(&ctx)?);
-            found.extend(excel::hidden_cells(&ctx)?);
+            found.extend(excel::cells(&ctx)?);
+            found.extend(excel::hidden_sheets(&ctx)?);
         }
-        _ => {}
+        Format::Pptx => {
+            found.extend(powerpoint::hidden_slides(&ctx)?);
+            found.extend(powerpoint::speaker_notes(&ctx)?);
+        }
+        Format::Pdf => {}
     }
+    found.extend(drawing::hidden_objects(&ctx)?);
     found.extend(common::leftover_data(pkg, values)?);
     Ok(found)
 }
@@ -102,6 +122,8 @@ pub struct Ctx<'p> {
     pub sheets: Vec<Sheet>,
     /// Slide parts in the presentation's order.
     pub slides: Vec<String>,
+    /// The slide width and height in EMU.
+    pub slide_size: Option<(i64, i64)>,
 }
 
 impl<'p> Ctx<'p> {
@@ -111,6 +133,7 @@ impl<'p> Ctx<'p> {
             values,
             sheets: vec![],
             slides: vec![],
+            slide_size: None,
         };
         let main = pkg.main.as_str();
         let target = |id: &str| {
@@ -129,6 +152,12 @@ impl<'p> Ctx<'p> {
                 let state = r.attr(e, "state")?.unwrap_or("visible".into()).into_owned();
                 let part = id()?.and_then(|id| target(&id));
                 ctx.sheets.push(Sheet { name, part, state });
+            } else if r.is(e, ns::P, "sldSz") {
+                let num = |a| {
+                    r.attr(e, a)
+                        .map(|v| v.and_then(|v| v.parse().ok()).unwrap_or(0))
+                };
+                ctx.slide_size = Some((num("cx")?, num("cy")?));
             } else if r.is(e, ns::P, "sldId")
                 && let Some(part) = id()?.and_then(|id| target(&id))
             {

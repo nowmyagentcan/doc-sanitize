@@ -1,6 +1,7 @@
 //! Checks that only Excel workbooks have.
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 use quick_xml::events::{BytesStart, Event};
 
@@ -8,7 +9,7 @@ use super::colour::{self, Rgb, Theme};
 use super::common::{CELL_SHEETS, targets};
 use super::xml::{self, Reader};
 use super::{Ctx, ns};
-use crate::report::{CheckId, Error, Finding, plural};
+use crate::report::{CheckId, Error, Finding, Where, counted, plural};
 
 /// `tracked-changes` in a workbook: the revision logs and user list of a shared workbook.
 pub fn shared_workbook_log(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
@@ -246,14 +247,17 @@ fn column(mut col: u32) -> String {
 #[derive(Debug, Default)]
 struct Cells {
     n: usize,
+    /// The distinct rows or columns they are in.
+    lines: HashSet<u32>,
     /// (first column, first row, last column, last row).
     range: Option<(u32, u32, u32, u32)>,
     first: Option<String>,
 }
 
 impl Cells {
-    fn add(&mut self, (col, row): (u32, u32), text: &str) {
+    fn add(&mut self, (col, row): (u32, u32), line: u32, text: &str) {
         self.n += 1;
+        self.lines.insert(line);
         self.first.get_or_insert_with(|| text.to_string());
         let (c0, r0, c1, r1) = self.range.unwrap_or((col, row, col, row));
         self.range = Some((c0.min(col), r0.min(row), c1.max(col), r1.max(row)));
@@ -271,9 +275,25 @@ impl Cells {
     }
 }
 
-/// `hidden-text` and `fake-redactions` in a workbook: cells with a value whose number format
-/// shows nothing, or whose text is coloured like their fill.
-pub fn hidden_cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+/// The cell kinds of hidden-rows-columns, with the noun each counts.
+const LINE_KINDS: [(&str, &str, &str, &str); 2] = [
+    ("hidden_rows", "rows", "hidden row", "hidden rows"),
+    (
+        "hidden_columns",
+        "columns",
+        "hidden column",
+        "hidden columns",
+    ),
+];
+
+fn yes(v: Option<Cow<str>>) -> bool {
+    matches!(v.as_deref(), Some("1" | "true"))
+}
+
+/// `hidden-text`, `fake-redactions` and `hidden-rows-columns` in a workbook: cells with a value
+/// whose number format shows nothing or whose text is coloured like their fill, and values in
+/// hidden rows and columns.
+pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     let pkg = ctx.pkg;
     let styles = cell_styles(ctx)?;
     let strings = shared_strings(ctx)?;
@@ -286,17 +306,33 @@ pub fn hidden_cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
             continue;
         };
         let mut kinds: Vec<Cells> = (0..CELL_KINDS.len()).map(|_| Cells::default()).collect();
+        let mut lines: [Cells; 2] = Default::default();
+        let mut hidden_cols: Vec<(u32, u32)> = vec![];
         // The open cell: where it is, its style, whether it holds a shared string, its text.
         let mut cell: Option<((u32, u32), usize, bool, String)> = None;
-        let (mut row, mut col) = (0u32, 0u32);
+        let (mut row, mut col, mut row_hidden) = (0u32, 0u32, false);
         pkg.walk(part, |r, ev| {
             match ev {
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "col") => {
+                    let num = |a| -> Result<Option<f64>, Error> {
+                        Ok(r.attr(e, a)?.and_then(|v| v.parse().ok()))
+                    };
+                    if yes(r.attr(e, "hidden")?) || num("width")?.is_some_and(|w| w < 0.1) {
+                        let (min, max) = (num("min")?.unwrap_or(0.0), num("max")?.unwrap_or(0.0));
+                        hidden_cols.push((min as u32, max as u32));
+                    }
+                }
                 Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "row") => {
                     row = r
                         .attr(e, "r")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(row + 1);
                     col = 0;
+                    let low = yes(r.attr(e, "customHeight")?)
+                        && r.attr(e, "ht")?
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .is_some_and(|h| h < 0.5);
+                    row_hidden = yes(r.attr(e, "hidden")?) || low;
                 }
                 Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "c") => {
                     let at = r
@@ -312,21 +348,31 @@ pub fn hidden_cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     }
                 }
                 Event::End(_) if r.closes(ns::S, "c") => {
-                    if let Some((at, style, shared, text)) = cell.take()
-                        && !text.is_empty()
-                        && let Some(&Some(kind)) = styles.get(style)
+                    let Some((at, style, shared, text)) = cell.take().filter(|c| !c.3.is_empty())
+                    else {
+                        return Ok(());
+                    };
+                    let text = match shared {
+                        true => text
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .and_then(|i| strings.get(i))
+                            .cloned()
+                            .unwrap_or_default(),
+                        false => text,
+                    };
+                    if let Some(&Some(kind)) = styles.get(style) {
+                        kinds[kind].add(at, at.1, &text);
+                    }
+                    if row_hidden {
+                        lines[0].add(at, at.1, &text);
+                    }
+                    if hidden_cols
+                        .iter()
+                        .any(|&(lo, hi)| (lo..=hi).contains(&at.0))
                     {
-                        let text = match shared {
-                            true => text
-                                .trim()
-                                .parse::<usize>()
-                                .ok()
-                                .and_then(|i| strings.get(i))
-                                .cloned()
-                                .unwrap_or_default(),
-                            false => text,
-                        };
-                        kinds[kind].add(at, &text);
+                        lines[1].add(at, at.0, &text);
                     }
                 }
                 ev if matches!(r.parent(), Some((ns::S, "v" | "t"))) => {
@@ -338,15 +384,68 @@ pub fn hidden_cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
             }
             Ok(())
         })?;
-        for ((check, kind, what), cells) in CELL_KINDS.iter().zip(kinds) {
+        let mut add = |check, kind, cells: &Cells, n: usize, unit, detail: String| {
+            let mut place = ctx.place(part);
+            place.cells = cells.shown();
+            let f = Finding::new(check, kind, place, n as u64, unit, detail);
+            found.push(f.with_value(ctx.values, cells.first.as_deref()));
+        };
+        for ((check, kind, what), cells) in CELL_KINDS.iter().zip(&kinds) {
             if cells.n > 0 {
-                let mut place = ctx.place(part);
-                place.cells = cells.shown();
                 let detail = format!("{} {what}", plural(cells.n as u64, "cell"));
-                let f = Finding::new(*check, kind, place, cells.n as u64, "cells", detail);
-                found.push(f.with_value(ctx.values, cells.first.as_deref()));
+                add(*check, kind, cells, cells.n, "cells", detail);
             }
         }
+        for ((kind, unit, one, many), cells) in LINE_KINDS.iter().zip(&lines) {
+            let n = cells.lines.len();
+            if n > 0 {
+                let detail = format!(
+                    "{} holding {}",
+                    counted(n as u64, one, many),
+                    plural(cells.n as u64, "value")
+                );
+                add(CheckId::HiddenRowsColumns, kind, cells, n, unit, detail);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `hidden-sheets`: hidden and very hidden sheets of any type.
+pub fn hidden_sheets(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+    let mut found = vec![];
+    for (i, sheet) in ctx.sheets.iter().enumerate() {
+        let how = match sheet.state.as_str() {
+            "hidden" => "hidden",
+            "veryHidden" => "very hidden",
+            _ => continue,
+        };
+        let ct = sheet
+            .part
+            .as_deref()
+            .and_then(|p| ctx.pkg.content_type(p))
+            .unwrap_or_default();
+        let what = match ct.rsplit('.').next().unwrap_or_default() {
+            "chartsheet+xml" => "chart sheet",
+            "macrosheet+xml" => "macro sheet",
+            "dialogsheet+xml" => "dialog sheet",
+            _ => "sheet",
+        };
+        let mut place = sheet
+            .part
+            .as_deref()
+            .map_or_else(Where::default, |p| ctx.place(p));
+        place.sheet_index = Some(i + 1);
+        let detail = format!("1 {how} {what}");
+        let f = Finding::new(
+            CheckId::HiddenSheets,
+            "hidden_sheet",
+            place,
+            1,
+            "sheets",
+            detail,
+        );
+        found.push(f.with_value(ctx.values, Some(&sheet.name)));
     }
     Ok(found)
 }
