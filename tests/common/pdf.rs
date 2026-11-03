@@ -421,13 +421,13 @@ pub fn redacted() -> Vec<u8> {
             5 => format!("{hidden}q 230 0 0 20 70 695 cm /Black Do Q\n"),
             6 => format!("1 g {hidden}0 g\n"),
             7 => format!("0 g {box_}{hidden}"),
-            8 => format!("BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj ET\n"),
+            8 => format!("BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj 0 Tr ET\n"),
             9 => format!(
-                "q 595 0 0 842 0 0 cm /Scan Do Q BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj ET 0 g {box_}"
+                "q 595 0 0 842 0 0 cm /Scan Do Q BT 3 Tr /F1 12 Tf 72 700 Td ({secret}) Tj 0 Tr ET 0 g {box_}"
             ),
             10 => text_at(-500, 700, &secret),
             11 => format!("q 0 0 0 0 re W n {hidden}Q\n"),
-            12 => format!("BT /F1 0.5 Tf 72 700 Td ({secret}) Tj ET\n"),
+            12 => format!("BT /F1 0.5 Tf 72 700 Td ({secret}) Tj 0 Tr ET\n"),
             13 => {
                 let quads: Vec<Object> = [70, 715, 300, 715, 70, 695, 300, 695]
                     .map(Object::from)
@@ -441,7 +441,8 @@ pub fn redacted() -> Vec<u8> {
                 hidden
             }
             14 => format!("/OC /draft BDC\n{hidden}EMC\n"),
-            _ => format!("0 g {box_}"),
+            // Big strokes fill their own ink boxes, yet they stand out from the page.
+            _ => format!("0 g {box_}BT /F1 60 Tf 72 300 Td (Ill|-_) Tj ET\n"),
         };
         b.page_with(&format!("{content}{visible}"), extra);
     }
@@ -452,4 +453,45 @@ pub fn redacted() -> Vec<u8> {
         },
     };
     b.bytes()
+}
+
+/// `pages` A4 pages of 58 lines of Helvetica 10 pt, about 95 characters each; the first
+/// `boxed` pages have a black box over two lines.
+pub fn book(pages: usize, boxed: usize) -> Vec<u8> {
+    const WORDS: [&str; 12] = [
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
+        "sed",
+        "eiusmod",
+        "tempor",
+        "labore",
+    ];
+    let mut b = PdfBuilder::new();
+    let mut w = 0;
+    for p in 0..pages {
+        let mut content = String::from("BT /F1 10 Tf 13 TL 56 790 Td\n");
+        for _ in 0..58 {
+            let mut line = String::new();
+            while line.len() < 95 {
+                line += WORDS[w % WORDS.len()];
+                line.push(' ');
+                w += 7;
+            }
+            content += &format!("({line}) '\n");
+        }
+        content += "ET\n";
+        if p < boxed {
+            content += "0 g 100 600 250 22 re f\n";
+        }
+        b.page(&content);
+    }
+    let mut doc = b.finish();
+    doc.compress();
+    save(&mut doc)
 }

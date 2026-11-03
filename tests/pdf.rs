@@ -607,7 +607,7 @@ fn each_redaction_case_gives_exactly_its_kind() {
     let expected: Vec<_> = REDACTED_CASES
         .iter()
         .enumerate()
-        .filter(|(_, (_, kind))| !kind.is_empty() && !["same_colour", "invisible"].contains(kind))
+        .filter(|(_, (_, kind))| !kind.is_empty())
         .map(|(i, (_, kind))| ((i + 1) as u64, kind.to_string()))
         .collect();
     assert_eq!(hidden_kinds(&f), expected, "{f}");
@@ -631,12 +631,14 @@ fn each_redaction_case_gives_exactly_its_kind() {
 /// "text under image") or invisible (as OCRmyPDF's layer).
 fn scanned(invisible: bool, picture: &[u8], size: (i64, i64)) -> Vec<u8> {
     let mut b = PdfBuilder::new();
+    let mut z = flate2::write::ZlibEncoder::new(vec![], flate2::Compression::fast());
+    std::io::Write::write_all(&mut z, picture).unwrap();
     let scan = b.stream(
         dictionary! {
             "Type" => "XObject", "Subtype" => "Image", "Width" => size.0, "Height" => size.1,
-            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "FlateDecode",
         },
-        picture,
+        &z.finish().unwrap(),
     );
     let mode = if invisible { 3 } else { 0 };
     let text: String = (0..5)
@@ -664,4 +666,130 @@ fn visible_text_under_a_page_picture_is_hidden_text() {
         findings_of(&f, "hidden-text")[0]["detail"],
         "115 characters under a picture that covers the page"
     );
+}
+
+/// The page `scanned` draws, as an RGB picture: its text visible, drawn by the renderer.
+fn scan_of_text() -> (Vec<u8>, (i64, i64)) {
+    let text: String = (0..5)
+        .map(|i| text_at(72, 700 - 20 * i, &format!("Scanned line {i} of the letter")))
+        .collect();
+    let pdf = hayro::hayro_syntax::Pdf::new(one_page(&text)).unwrap();
+    let page = &pdf.pages()[0];
+    let settings = hayro::PixmapSettings {
+        x_scale: 1.0,
+        y_scale: 1.0,
+        bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+    };
+    let drawn = hayro::render(
+        page,
+        &hayro::RenderCache::new(),
+        &Default::default(),
+        &Default::default(),
+        &settings,
+    );
+    let rgb = drawn
+        .data_as_u8_slice()
+        .chunks(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    (rgb, (i64::from(drawn.width()), i64::from(drawn.height())))
+}
+
+#[test]
+fn an_ocr_layer_drawn_before_its_scan_is_not_hidden() {
+    let (rgb, size) = scan_of_text();
+    let f = check_pdf("ocr_scan.pdf", &scanned(true, &rgb, size), &[]);
+    assert_eq!(hidden_kinds(&f), [], "{f}");
+    assert_eq!(f["status"], "none_found", "{f}");
+}
+
+#[test]
+fn pages_that_cant_be_drawn_leave_the_rendered_checks_incomplete() {
+    let text = text_at(72, 700, "Some words to check");
+    let huge = stream_body(
+        "/Type /XObject /Subtype /Image /Width 100000 /Height 100000 /ColorSpace /DeviceGray /BitsPerComponent 8",
+        b"\0",
+    );
+    let mut objects = raw_page(
+        "/Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Huge 5 0 R >> >>",
+    );
+    let content = format!("{text}q 10 0 0 10 300 300 cm /Huge Do Q");
+    objects.push((4, stream_body("", content.as_bytes())));
+    objects.push((5, huge));
+    objects.push((
+        6,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ));
+    let f = check_pdf("huge_image.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+    let note =
+        "page 1: a picture on it is over 100 megapixels, so its text wasn't drawn and checked";
+    for id in ["hidden-text", "fake-redactions"] {
+        let check = f["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap();
+        assert_eq!(
+            (check["status"].as_str(), check["note"].as_str()),
+            (Some("incomplete"), Some(note)),
+            "{f}"
+        );
+    }
+    assert_eq!(f["status"], "incomplete");
+
+    let mut objects = raw_page("/Contents 4 0 R");
+    objects.push((4, stream_body("/Filter /FooDecode", text.as_bytes())));
+    let dir = dir("unknown-filter");
+    put(
+        &dir,
+        &[("unknown_filter.pdf", &raw(&objects, "/Root 1 0 R"))],
+    );
+    let out = run_in(&dir, &["unknown_filter.pdf"]);
+    assert_eq!(out.status.code(), Some(1));
+    let note = "page 1: its content couldn't be decoded, so its text wasn't checked";
+    assert!(
+        stdout(&out).starts_with(&format!(
+            "unknown_filter.pdf  13 checks, 2 incomplete\n  ! hidden-text      {note}\n  ! fake-redactions  {note}\n"
+        )),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn a_font_that_cant_be_read_leaves_the_pixel_test_out() {
+    let mut objects = raw_page("/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >>");
+    objects.push((
+        4,
+        stream_body("", b"1 g BT /F1 12 Tf 72 700 Td (White words here) Tj ET"),
+    ));
+    objects.push((
+        5,
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /Broken /Encoding /Identity-H >>".to_vec(),
+    ));
+    let f = check_pdf("bad_font.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+    // hayro draws with a stand-in font, so flat pixels there prove nothing.
+    assert_eq!(hidden_kinds(&f), [], "{f}");
+    let note = "page 1: a font couldn't be read, so some text wasn't checked";
+    assert_eq!(f["checks"][2]["note"], note, "{f}");
+    assert_eq!(f["status"], "incomplete");
+}
+
+/// Prints how long the debug binary takes on book-300.pdf, and writes the file to
+/// `DOC_SANITIZE_BOOK` when set, for timing release builds.
+#[test]
+#[ignore = "timing: run with --ignored --nocapture"]
+fn book_300_timing() {
+    let book = book(300, 10);
+    if let Some(path) = std::env::var_os("DOC_SANITIZE_BOOK") {
+        std::fs::write(path, &book).unwrap();
+    }
+    let dir = dir("book");
+    put(&dir, &[("book-300.pdf", &book)]);
+    let start = Instant::now();
+    let out = run_in(&dir, &["book-300.pdf", "--json"]);
+    println!("book-300.pdf check: {:.1} s", start.elapsed().as_secs_f64());
+    let f = &json(&out)["files"][0];
+    assert_eq!(hidden_kinds(f).len(), 10, "{f}");
 }

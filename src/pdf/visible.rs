@@ -4,21 +4,32 @@
 //! later.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use hayro::hayro_interpret::font::{Glyph, GlyphIdentifier, GlyphRun};
 use hayro::hayro_interpret::hayro_cmap::BfString;
 use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
-    InterpreterCache, InterpreterSettings, Paint, RectExt, SoftMask, interpret_page,
+    InterpreterCache, InterpreterSettings, InterpreterWarning, Paint, RectExt, SoftMask,
+    TransformExt, interpret_page,
 };
 use hayro::hayro_syntax::Pdf as Pages;
+use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, BezPath, Rect, Shape};
+use hayro::vello_cpu::color::palette::css::WHITE;
+use hayro::{PixmapSettings, RenderCache, RenderSettings};
 
 use super::{Ctx, Found, n, pages_text, subtype};
-use crate::report::{CheckId, Where};
+use crate::report::{CheckId, Where, thousands};
 
 /// Rendered checks cover this many pages.
 const MAX_PAGES: usize = 2_000;
+/// Pages stop being drawn after this much drawing per file.
+const BUDGET: Duration = Duration::from_secs(120);
+/// Pages with a picture declaring more pixels than this aren't drawn.
+const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// Both checks this module reports for.
 const CHECKS: [CheckId; 2] = [CheckId::HiddenText, CheckId::FakeRedactions];
@@ -38,15 +49,26 @@ pub(super) fn check(c: &Ctx, bytes: &[u8], found: &mut Found) {
     };
     let pages = pdf.pages();
     let cache = InterpreterCache::new();
-    let settings = InterpreterSettings::default();
+    let render_cache = RenderCache::new();
+    let font_failed = Arc::new(AtomicBool::new(false));
+    let flag = font_failed.clone();
+    let settings = InterpreterSettings {
+        warning_sink: Arc::new(move |w| {
+            if matches!(w, InterpreterWarning::UnsupportedFont) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }),
+        ..InterpreterSettings::default()
+    };
+    let mut rendering = Duration::ZERO;
     let total = c.pdf.pages.len();
     for (i, ((number, dict), page)) in c.pages().zip(pages.iter()).enumerate() {
         if i == MAX_PAGES {
             let note = format!(
-                "pages {}–{} weren't checked: only the first {} are",
-                crate::report::thousands(MAX_PAGES as u64 + 1),
-                crate::report::thousands(total as u64),
-                crate::report::thousands(MAX_PAGES as u64)
+                "pages {}–{}: only the first {} pages were checked",
+                thousands(MAX_PAGES as u64 + 1),
+                thousands(total as u64),
+                thousands(MAX_PAGES as u64)
             );
             incomplete(found, &note);
             break;
@@ -60,6 +82,7 @@ pub(super) fn check(c: &Ctx, bytes: &[u8], found: &mut Found) {
         }
         let crop = page.intersected_crop_box().to_kurbo();
         let mut rec = Recorder::default();
+        font_failed.store(false, Ordering::Relaxed);
         let mut ctx = Context::new(
             Affine::IDENTITY,
             crop,
@@ -69,11 +92,38 @@ pub(super) fn check(c: &Ctx, bytes: &[u8], found: &mut Found) {
         );
         interpret_page(page, &mut ctx, &mut rec);
         let redactions = redactions(c, dict);
-        let outcomes: Vec<_> = rec
+        let mut outcomes: Vec<_> = rec
             .glyphs
             .iter()
             .map(|g| classify(g, &rec, crop, &redactions))
             .collect();
+        if outcomes.contains(&Outcome::Unknown) {
+            if rec.image_pixels > MAX_IMAGE_PIXELS {
+                note(
+                    "a picture on it is over 100 megapixels, so its text wasn't drawn and checked",
+                    number,
+                );
+            } else if font_failed.load(Ordering::Relaxed) {
+                note(
+                    "a font couldn't be read, so some text wasn't checked",
+                    number,
+                );
+            } else if rendering > BUDGET {
+                note(
+                    "drawing pages stopped after 120 seconds, so some text wasn't checked",
+                    number,
+                );
+            } else {
+                let start = Instant::now();
+                let pixels = Pixels::render(page, &render_cache, &settings);
+                for (g, o) in rec.glyphs.iter().zip(&mut outcomes) {
+                    if *o == Outcome::Unknown {
+                        *o = pixels.test(g);
+                    }
+                }
+                rendering += start.elapsed();
+            }
+        }
         report(c, number, &rec, &outcomes, found);
     }
     if total > pages.len() && total <= MAX_PAGES {
@@ -310,6 +360,7 @@ impl<'a> Device<'a> for Recorder {
 enum Outcome {
     /// Whitespace or no outline: neither shown nor hidden.
     Blank,
+    Shown,
     /// Hidden as `kind`; covers and pictures carry which one, so one cover makes one group.
     Hidden(Kind, Option<usize>),
     /// The geometry says nothing; the pixels decide.
@@ -325,12 +376,17 @@ enum Kind {
     UnderBox,
     UnderImage,
     UnderPageImage,
+    Invisible,
+    SameLight,
+    SameDark,
 }
 
 impl Kind {
     fn check(self) -> CheckId {
         match self {
-            Kind::UnappliedRedaction | Kind::UnderBox | Kind::UnderImage => CheckId::FakeRedactions,
+            Kind::UnappliedRedaction | Kind::UnderBox | Kind::UnderImage | Kind::SameDark => {
+                CheckId::FakeRedactions
+            }
             _ => CheckId::HiddenText,
         }
     }
@@ -344,6 +400,8 @@ impl Kind {
             Kind::UnderBox => "text_under_box",
             Kind::UnderImage => "text_under_image",
             Kind::UnderPageImage => "text_under_page_image",
+            Kind::Invisible => "invisible",
+            Kind::SameLight | Kind::SameDark => "same_colour",
         }
     }
 }
@@ -469,7 +527,11 @@ fn report(c: &Ctx, page: usize, rec: &Recorder, outcomes: &[Outcome], found: &mu
             .flat_map(|g| g.text.chars())
             .filter(|c| c.is_alphanumeric())
             .count();
-        if letters >= 1 {
+        let floor = match kind {
+            Kind::Invisible | Kind::SameLight | Kind::SameDark => 2,
+            _ => 1,
+        };
+        if letters >= floor {
             let bbox = hidden
                 .iter()
                 .map(|g| g.ink)
@@ -510,6 +572,21 @@ fn report(c: &Ctx, page: usize, rec: &Recorder, outcomes: &[Outcome], found: &mu
                     "{} under a picture that covers the page",
                     n(count, "character", "characters")
                 ),
+                Kind::Invisible => n(
+                    count,
+                    "character of invisible text",
+                    "characters of invisible text",
+                ),
+                Kind::SameLight => n(
+                    count,
+                    "character the same colour as the background",
+                    "characters the same colour as the background",
+                ),
+                Kind::SameDark => n(
+                    count,
+                    "character the same colour as the dark background under it",
+                    "characters the same colour as the dark background under them",
+                ),
             };
             let text: String = group.iter().map(|g| g.text.as_str()).collect();
             found.findings.push(c.finding(
@@ -524,6 +601,127 @@ fn report(c: &Ctx, page: usize, rec: &Recorder, outcomes: &[Outcome], found: &mu
             ));
         }
         i = end;
+    }
+}
+
+/// A page drawn at up to 144 DPI without anti-aliasing, so flat areas are exactly flat.
+struct Pixels {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+    /// From default user space to pixels.
+    map: Affine,
+}
+
+impl Pixels {
+    fn render<'a>(
+        page: &'a Page<'a>,
+        cache: &RenderCache<'a>,
+        settings: &InterpreterSettings,
+    ) -> Self {
+        let (w, h) = page.render_dimensions();
+        let (w, h) = (f64::from(w), f64::from(h));
+        let scale = 2f64
+            .min((16e6 / (w * h)).sqrt())
+            .min(65_535.0 / w)
+            .min(65_535.0 / h) as f32;
+        let render = RenderSettings {
+            aliasing_threshold: Some(128),
+            ..RenderSettings::default()
+        };
+        let pixmap = PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: WHITE,
+        };
+        let drawn = hayro::render(page, cache, settings, &render, &pixmap);
+        Self {
+            rgba: drawn.data_as_u8_slice().to_vec(),
+            width: usize::from(drawn.width()),
+            height: usize::from(drawn.height()),
+            map: Affine::scale(f64::from(scale)) * page.initial_transform(true).to_kurbo(),
+        }
+    }
+
+    fn at(&self, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * self.width + x) * 4;
+        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2]]
+    }
+
+    /// The pixel columns and rows of `r`, clamped to the page.
+    fn span(&self, r: Rect) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let clamp = |v: f64, max: usize| (v.max(0.0) as usize).min(max);
+        (
+            clamp(r.x0.floor(), self.width)..clamp(r.x1.ceil(), self.width),
+            clamp(r.y0.floor(), self.height)..clamp(r.y1.ceil(), self.height),
+        )
+    }
+
+    /// The share of pixels in `r` (leaving out `hole`) within ±8 of `colour` per channel.
+    fn share(&self, r: Rect, hole: Option<Rect>, colour: [u8; 3]) -> f64 {
+        let (xs, ys) = self.span(r);
+        let hole = hole.map(|h| self.span(h));
+        let (mut near, mut all) = (0usize, 0usize);
+        for y in ys {
+            for x in xs.clone() {
+                if hole
+                    .as_ref()
+                    .is_some_and(|(hx, hy)| hx.contains(&x) && hy.contains(&y))
+                {
+                    continue;
+                }
+                all += 1;
+                near += usize::from(
+                    self.at(x, y)
+                        .iter()
+                        .zip(colour)
+                        .all(|(&a, b)| a.abs_diff(b) <= 8),
+                );
+            }
+        }
+        if all == 0 {
+            0.0
+        } else {
+            near as f64 / all as f64
+        }
+    }
+
+    /// The pixel test: the glyph's ink box, shrunk 10% a side (at least 3×3 px), holds one
+    /// colour, which also is the most common colour around the box, so nothing marks
+    /// the glyph out from its background.
+    fn test(&self, g: &Painted) -> Outcome {
+        let ink = self.map.transform_rect_bbox(g.ink);
+        let (cx, cy) = (ink.center().x, ink.center().y);
+        let (hw, hh) = ((ink.width() * 0.4).max(1.5), (ink.height() * 0.4).max(1.5));
+        let inner = Rect::new(cx - hw, cy - hh, cx + hw, cy + hh);
+        let (xs, ys) = self.span(inner);
+        if xs.is_empty() || ys.is_empty() {
+            return Outcome::Shown;
+        }
+        // The most common colour is almost surely one of these when 98% share it.
+        let picks = [
+            (xs.start, ys.start),
+            ((xs.start + xs.end) / 2, (ys.start + ys.end) / 2),
+            (xs.end - 1, ys.end - 1),
+        ];
+        let Some(colour) = picks
+            .into_iter()
+            .map(|(x, y)| self.at(x, y))
+            .find(|&colour| self.share(inner, None, colour) >= 0.98)
+        else {
+            return Outcome::Shown;
+        };
+        let ring = (ink.height() * 0.15).max(2.0);
+        if self.share(ink.inflate(ring, ring), Some(ink), colour) < 0.5 {
+            return Outcome::Shown;
+        }
+        let rgb = colour.map(|c| f32::from(c) / 255.0);
+        let kind = match () {
+            () if g.invisible => Kind::Invisible,
+            () if luminance(rgb) < 0.4 => Kind::SameDark,
+            () => Kind::SameLight,
+        };
+        Outcome::Hidden(kind, None)
     }
 }
 
