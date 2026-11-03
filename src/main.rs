@@ -132,6 +132,9 @@ fn check(
     code: &mut u8,
 ) -> io::Result<()> {
     let mut files: Vec<FileResult> = vec![];
+    let options = run::Options {
+        show_values: cli.show_values,
+    };
     for (i, input) in inputs.iter().enumerate() {
         let start = Instant::now();
         let (file, panic) = match input {
@@ -139,7 +142,7 @@ fn check(
                 let name = safe(&path.to_string_lossy());
                 (FileResult::failed(name, e.clone()), None)
             }
-            Input::File(path) if cli.json => run::check(path),
+            Input::File(path) if cli.json => run::check(path, &options),
             Input::File(path) => {
                 let name = safe(&path.file_name().unwrap_or_default().to_string_lossy());
                 let label = match inputs.len() {
@@ -149,7 +152,7 @@ fn check(
                         format!("Checking {} of {n} {dot} {name}", i + 1)
                     }
                 };
-                text::spin(err, &label, || run::check(path))
+                text::spin(err, &label, || run::check(path, &options))
             }
         };
         *code = (*code).max(file.exit_code());

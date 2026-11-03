@@ -10,7 +10,7 @@ use std::sync::Once;
 use std::thread;
 
 use crate::input::{self, Kind};
-use crate::office::Package;
+use crate::office::{Package, common};
 use crate::report::{CheckId, Error, FileResult, Format, Warning, safe};
 
 const WORKER: &str = "doc-sanitize-worker";
@@ -21,9 +21,16 @@ thread_local! {
     static PANIC_AT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+/// What the person asked for that changes a check's result.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Put each finding's text in its `value`.
+    pub show_values: bool,
+}
+
 /// Checks the file at `path`. A caught panic comes back as `internal`, with where it happened
 /// as the second value.
-pub fn check(path: &Path) -> (FileResult, Option<String>) {
+pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
     let name = safe(&path.to_string_lossy());
     let result = on_worker(|| {
         let bytes = input::load(path)?;
@@ -32,7 +39,8 @@ pub fn check(path: &Path) -> (FileResult, Option<String>) {
             Kind::Pdf => (Format::Pdf, "pdf", vec![], vec![]),
             Kind::Zip => {
                 let pkg = Package::open(&bytes)?;
-                (pkg.format, pkg.variant, vec![], vec![])
+                let found = common::leftover_data(&pkg, options.show_values)?;
+                (pkg.format, pkg.variant, vec![CheckId::LeftoverData], found)
             }
         };
         let warnings = mismatch(&name, path, variant).into_iter().collect();

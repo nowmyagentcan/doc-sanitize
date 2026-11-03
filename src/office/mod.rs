@@ -3,10 +3,11 @@
 //! relationships, decides the variant from the main part's type and checks that every XML part
 //! is well-formed within the XML limits.
 
+pub mod common;
 pub mod xml;
 pub mod zipscan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
 use flate2::CrcWriter;
@@ -148,6 +149,15 @@ pub fn key(name: &str) -> String {
     String::from_utf8_lossy(&out).to_ascii_lowercase()
 }
 
+/// Whether `name` can be an OPC part name: no backslash, no leading or trailing slash, and no
+/// empty, `.` or `..` segment.
+pub fn part_name(name: &str) -> bool {
+    !name.contains('\\')
+        && name
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != ".." && !s.ends_with('.'))
+}
+
 /// The `.rels` part of `source` ("" for the package itself).
 pub fn rels_name(source: &str) -> String {
     match source.rsplit_once('/') {
@@ -265,7 +275,7 @@ impl<'a> Package<'a> {
             let xml = pkg
                 .content_type(&e.name)
                 .is_some_and(|t| t.ends_with("xml"));
-            if xml || e.name.to_ascii_lowercase().ends_with(".rels") {
+            if part_name(&e.name) && (xml || e.name.to_ascii_lowercase().ends_with(".rels")) {
                 let bytes = pkg.read(&e.name)?;
                 xml::Reader::new(&xml::decode(&bytes, &e.name)?, &e.name).validate()?;
             }
@@ -322,6 +332,29 @@ impl<'a> Package<'a> {
             .get(&k)
             .or_else(|| self.defaults.get(ext?))
             .map(String::as_str)
+    }
+
+    /// The parts reachable from the package's relationships through internal targets, as
+    /// part names in the package's own spelling, in the order they are found.
+    pub fn reachable(&self) -> Result<Vec<String>, Error> {
+        let mut seen = HashSet::new();
+        let mut found = vec![];
+        let mut todo = vec![String::new()];
+        while let Some(source) = todo.pop() {
+            for rel in self.rels(&source)? {
+                let Some(target) = resolve(&source, &rel.target).filter(|_| !rel.external) else {
+                    continue;
+                };
+                if let Some(&i) = self.index.get(&key(&target))
+                    && seen.insert(i)
+                {
+                    let name = self.zip.entries[i].name.clone();
+                    found.push(name.clone());
+                    todo.push(name);
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// The relationships of `source` ("" for the package), or none when it has no `.rels`.

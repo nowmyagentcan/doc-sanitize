@@ -203,6 +203,26 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The text an event stands for: text and CDATA as written, a reference as its character.
+pub fn text<'a>(event: &Event<'a>) -> Option<Cow<'a, str>> {
+    match event {
+        Event::Text(t) => Some(t.xml10_content()),
+        Event::CData(t) => Some(t.xml10_content()),
+        Event::GeneralRef(r) => {
+            let c = match &**r {
+                "lt" => '<',
+                "gt" => '>',
+                "amp" => '&',
+                "apos" => '\'',
+                "quot" => '"',
+                _ => r.resolve_char_ref().ok()??,
+            };
+            Some(Cow::Owned(c.into()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

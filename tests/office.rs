@@ -208,5 +208,281 @@ fn text_names_the_file_and_what_ran() {
     let dir = dir("office-text");
     put(&dir, &[("deck.pptx", &zip(&package("pptx", &[], &[])))]);
     let out = run_in(&dir, &["deck.pptx"]);
-    assert_eq!(stdout(&out), "deck.pptx  nothing found by 0 checks\n");
+    assert_eq!(
+        stdout(&out),
+        "deck.pptx  nothing found by 1 check
+  ✓ 1 check found nothing: leftover-data
+"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The `leftover-data` findings of a package, as (kind, part, count, detail).
+fn leftovers(name: &str, bytes: &[u8]) -> Vec<(String, String, u64, String)> {
+    let f = check_bytes(name, bytes);
+    assert_eq!(
+        f["checks"],
+        serde_json::json!([{ "id": "leftover-data", "status": if f["findings"].as_array().unwrap().is_empty() { "none_found" } else { "found" }, "count": f["findings"].as_array().unwrap().len() }]),
+        "{f}"
+    );
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| {
+            assert_eq!(x["check"], "leftover-data");
+            (
+                s(&x["kind"]),
+                s(&x["where"]["part"]),
+                x["count"].as_u64().unwrap(),
+                s(&x["detail"]),
+            )
+        })
+        .collect()
+}
+
+fn found(kind: &str, part: &str, count: u64, detail: &str) -> (String, String, u64, String) {
+    (kind.into(), part.into(), count, detail.into())
+}
+
+#[test]
+fn a_clean_package_has_no_leftovers() {
+    for variant in ["docx", "xlsx", "pptx"] {
+        assert_eq!(
+            leftovers(
+                &format!("twin.{variant}"),
+                &zip(&package(variant, &[], &[]))
+            ),
+            []
+        );
+    }
+}
+
+#[test]
+fn bytes_outside_the_package_are_found() {
+    let docx = zip(&package("docx", &[], &[]));
+    let prepended = [vec![b'x'; 4096], docx.clone()].concat();
+    assert_eq!(
+        leftovers("prepended.docx", &prepended),
+        [found(
+            "data_outside_package",
+            "",
+            4096,
+            "4,096 bytes before the package"
+        )]
+    );
+    let appended = [
+        zip(&package("xlsx", &[], &[])),
+        b"SECRET-appended-1".to_vec(),
+    ]
+    .concat();
+    assert_eq!(
+        leftovers("appended.xlsx", &appended),
+        [found(
+            "data_outside_package",
+            "",
+            17,
+            "17 bytes after the package"
+        )]
+    );
+}
+
+#[test]
+fn entries_with_no_content_type_are_found_and_never_extracted() {
+    let names = ["../evil", "/abs", "C:/x", r"word\document.xml"];
+    let traversal = package("xlsx", &[], &names.map(|n| entry(n, b"SECRET-traversal-1")));
+    let dir = dir("traversal");
+    put(&dir, &[("traversal.xlsx", &zip(&traversal))]);
+    let out = run_in(&dir, &["traversal.xlsx", "--json"]);
+    let kinds: Vec<_> = json(&out)["files"][0]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["kind"].clone(), f["where"]["part"].clone()))
+        .collect();
+    assert_eq!(
+        kinds,
+        names.map(|n| (serde_json::json!("untyped_entries"), serde_json::json!(n)))
+    );
+    let left: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(!left.iter().any(|n| n == "evil" || n == "abs"));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+    let deck = package("pptx", &[], &[entry("ppt/secret.bin", b"SECRET-untyped-1")]);
+    assert_eq!(
+        leftovers("untyped_part.pptx", &zip(&deck)),
+        [found(
+            "untyped_entries",
+            "ppt/secret.bin",
+            1,
+            "1 ZIP entry with no content type"
+        )]
+    );
+}
+
+#[test]
+fn parts_nothing_links_to_are_found() {
+    let doc = package(
+        "docx",
+        &[],
+        &[entry(
+            "word/old-draft.xml",
+            b"<w:document xmlns:w=\"urn:x\">SECRET-orphan-1</w:document>",
+        )],
+    );
+    assert_eq!(
+        leftovers("orphan.docx", &zip(&doc)),
+        [found(
+            "orphan_parts",
+            "word/old-draft.xml",
+            1,
+            "1 part that nothing in the file links to"
+        )]
+    );
+    // A relationship part counts as used when its own part is reached.
+    let linked = package(
+        "docx",
+        &[],
+        &[
+            entry(
+                "word/_rels/document.xml.rels",
+                rels(&[("rId1", "image", "media/a.png")]).as_bytes(),
+            ),
+            entry("word/media/a.png", b"png"),
+            entry("word/_rels/old.xml.rels", rels(&[]).as_bytes()),
+        ],
+    );
+    assert_eq!(
+        leftovers("linked.docx", &zip(&linked)),
+        [found(
+            "orphan_parts",
+            "word/_rels/old.xml.rels",
+            1,
+            "1 part that nothing in the file links to"
+        )]
+    );
+}
+
+#[test]
+fn the_zip_comment_is_found_and_its_text_shown_only_on_request() {
+    let mut book = zip(&package("xlsx", &[], &[]));
+    let comment = b"SECRET-comment-1";
+    let n = book.len();
+    book[n - 2..].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+    book.extend(comment);
+    assert_eq!(
+        leftovers("zip_comment.xlsx", &book),
+        [found("zip_comment", "", 16, "1 ZIP comment of 16 bytes")]
+    );
+    let dir = dir("comment");
+    put(&dir, &[("zip_comment.xlsx", &book)]);
+    let out = run_in(&dir, &["zip_comment.xlsx"]);
+    assert!(!stdout(&out).contains("SECRET") && !stderr(&out).contains("SECRET"));
+    assert_eq!(out.status.code(), Some(1));
+    let out = run_in(&dir, &["zip_comment.xlsx", "--show-values"]);
+    assert_eq!(
+        stdout(&out),
+        "zip_comment.xlsx  found 1 kind of hidden data\n  ✗ leftover-data  1 ZIP comment of 16 bytes\n                   SECRET-comment-1\n  Remove it: doc-sanitize clean zip_comment.xlsx\n"
+    );
+    let out = run_in(&dir, &["zip_comment.xlsx", "--show-values", "--json"]);
+    assert_eq!(
+        json(&out)["files"][0]["findings"][0]["value"],
+        "SECRET-comment-1"
+    );
+}
+
+#[test]
+fn shared_strings_no_cell_uses_are_found() {
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>1</v></c><c r=\"B1\"><v>0</v></c></row></sheetData></worksheet>"
+    );
+    let sst = format!(
+        "<sst xmlns=\"{S}\" count=\"3\"><si><t>SECRET-sst-1</t></si><si><t>visible</t></si><si><r><t>SECRET</t></r><r><t>-sst-2 &amp; more</t></r></si><si/></sst>"
+    );
+    let ox = "application/vnd.openxmlformats-officedocument.spreadsheetml";
+    let book = package(
+        "xlsx",
+        &[
+            ("xl/worksheets/sheet1.xml", &format!("{ox}.worksheet+xml")),
+            ("xl/sharedStrings.xml", &format!("{ox}.sharedStrings+xml")),
+        ],
+        &[
+            entry(
+                "xl/_rels/workbook.xml.rels",
+                rels(&[
+                    ("rId1", "worksheet", "worksheets/sheet1.xml"),
+                    ("rId2", "sharedStrings", "sharedStrings.xml"),
+                ])
+                .as_bytes(),
+            ),
+            entry("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+            entry("xl/sharedStrings.xml", sst.as_bytes()),
+        ],
+    );
+    let book = zip(&book);
+    assert_eq!(
+        leftovers("strings.xlsx", &book),
+        [found(
+            "unused_strings",
+            "xl/sharedStrings.xml",
+            3,
+            "3 shared strings that no cell uses"
+        )]
+    );
+    let dir = dir("strings");
+    put(&dir, &[("strings.xlsx", &book)]);
+    let out = run_in(&dir, &["strings.xlsx", "--show-values", "--json"]);
+    assert_eq!(
+        json(&out)["files"][0]["findings"][0]["value"],
+        "SECRET-sst-1"
+    );
+}
+
+#[test]
+fn the_glossary_is_found_in_word_files() {
+    let doc = package(
+        "docx",
+        &[(
+            "word/glossary/document.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.glossary+xml",
+        )],
+        &[
+            entry(
+                "word/_rels/document.xml.rels",
+                rels(&[("rId9", "glossaryDocument", "glossary/document.xml")]).as_bytes(),
+            ),
+            entry(
+                "word/glossary/document.xml",
+                format!("<w:glossaryDocument xmlns:w=\"{W}\"/>").as_bytes(),
+            ),
+        ],
+    );
+    assert_eq!(
+        leftovers("glossary.docx", &zip(&doc)),
+        [found(
+            "glossary",
+            "word/glossary/document.xml",
+            1,
+            "1 glossary document (building blocks and AutoText)"
+        )]
+    );
+}
+
+#[test]
+fn part_names_with_control_characters_print_safely() {
+    let deck = package("pptx", &[], &[entry("ppt/\u{1b}[31mx\u{202e}.bin", b"x")]);
+    let dir = dir("controls");
+    put(&dir, &[("controls.pptx", &zip(&deck))]);
+    let out = run_in(&dir, &["controls.pptx"]);
+    assert!(
+        stdout(&out).contains("ppt/<U+001B>[31mx<U+202E>.bin: 1 ZIP entry"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stdout(&out).contains('\u{1b}'));
 }
