@@ -225,7 +225,7 @@ mod tests {
     use super::*;
 
     /// A one-sector-FAT CFB file with a root entry and one stream named `stream`.
-    pub fn cfb(stream: &str) -> Vec<u8> {
+    fn cfb(stream: &str) -> Vec<u8> {
         let mut b = vec![0u8; 512 * 3];
         b[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
         b[30] = 9;

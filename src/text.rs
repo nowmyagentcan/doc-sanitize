@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use doc_sanitize::report::{FileResult, Finding, Status, Where, plural};
+use doc_sanitize::report::{FileResult, Finding, Status, plural};
 
 const BOLD: &str = "1";
 const DIM: &str = "2";
@@ -117,11 +117,6 @@ impl<W: Write> Out<W> {
     }
 }
 
-/// The place a finding is in, as the page shows it: the part name for now.
-fn place(w: &Where) -> Option<&str> {
-    w.part.as_deref()
-}
-
 /// One file's report: its line, a line per check that found something, the checks that found
 /// nothing, its warnings and the clean hint; or its error, on stderr. `first` leaves out the
 /// blank line that separates files.
@@ -161,7 +156,7 @@ pub fn file(
         n => look.paint(RED, &format!("found {n} kinds of hidden data")),
     };
     out.line(&format!("{}  {status}", look.paint(BOLD, &f.path)))?;
-    let shown = |x: &Finding| match place(&x.place) {
+    let shown = |x: &Finding| match &x.place.part {
         Some(p) => format!("{}: ", look.paint(DIM, p)),
         None => String::new(),
     };
@@ -282,7 +277,7 @@ fn spinner(mut w: impl Write, look: Look, line: &str, stopped: Receiver<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use doc_sanitize::report::{CheckId, Error, Format, Warning};
+    use doc_sanitize::report::{CheckId, Error, Format, Warning, Where};
 
     const COLOUR: Look = Look {
         ansi: true,

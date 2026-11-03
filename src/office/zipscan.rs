@@ -71,19 +71,21 @@ fn index() -> Error {
     Error::ambiguous("its file index doesn't match its contents")
 }
 
-/// The central directory an end record at `p` describes: (start, end, entry count), or None
-/// when the record doesn't lead to one.
-fn directory(b: &[u8], p: usize) -> Option<(usize, usize, u64)> {
+/// The central directory an end record at `p` describes: (start, end, entry count, declared
+/// offset), or None when the record doesn't lead to one.
+fn directory(b: &[u8], p: usize) -> Option<(usize, usize, u64, u64)> {
     let mut count = u16_at(b, p + 10)?;
     let mut size = u32_at(b, p + 12)?;
+    let mut offset = u32_at(b, p + 16)?;
     let mut end = p;
-    if count == 0xFFFF || size == MAX32 || u32_at(b, p + 16)? == MAX32 {
+    if count == 0xFFFF || size == MAX32 || offset == MAX32 {
         let record = p.checked_sub(20 + 56)?;
         if !at(b, p - 20, LOCATOR) || !at(b, record, END64) {
             return None;
         }
         count = u64_at(b, record + 32)?;
         size = u64_at(b, record + 40)?;
+        offset = u64_at(b, record + 48)?;
         end = record;
     }
     let start = end.checked_sub(usize::try_from(size).ok()?)?;
@@ -92,16 +94,7 @@ fn directory(b: &[u8], p: usize) -> Option<(usize, usize, u64)> {
     } else {
         at(b, start, CENTRAL)
     };
-    listed.then_some((start, end, count))
-}
-
-/// The declared directory offset of the end record at `p`, for working out prepended bytes.
-fn declared_offset(b: &[u8], p: usize) -> Option<u64> {
-    let offset = u32_at(b, p + 16)?;
-    if offset != MAX32 && u16_at(b, p + 10)? != 0xFFFF && u32_at(b, p + 12)? != MAX32 {
-        return Some(offset);
-    }
-    u64_at(b, p.checked_sub(20 + 56)? + 48)
+    listed.then_some((start, end, count, offset))
 }
 
 pub fn scan(b: &[u8]) -> Result<Zip, Error> {
@@ -114,12 +107,13 @@ pub fn scan(b: &[u8]) -> Result<Zip, Error> {
         [] => return Err(Error::unsupported_format()),
         _ => return Err(index()),
     };
-    let (start, end, count) = directory(b, p).ok_or_else(structure)?;
+    let (start, end, count, offset) = directory(b, p).ok_or_else(structure)?;
     if count > MAX_ENTRIES {
         return Err(Error::too_large("its entry count", "10,000"));
     }
-    let shift = declared_offset(b, p)
-        .and_then(|o| start.checked_sub(usize::try_from(o).ok()?))
+    let shift = usize::try_from(offset)
+        .ok()
+        .and_then(|o| start.checked_sub(o))
         .ok_or_else(structure)?;
     let comment_len = u16_at(b, p + 20).ok_or_else(structure)? as usize;
     let comment = p + 22..(p + 22 + comment_len).min(b.len());
