@@ -56,6 +56,10 @@ pub struct Reader<'a> {
     part: &'a str,
     depth: usize,
     root: bool,
+    /// The elements around the current event, outermost first, as (namespace, local name).
+    stack: Vec<(String, String)>,
+    /// The element the last `Start` opened; it joins `stack` on the next event.
+    opened: Option<(String, String)>,
 }
 
 impl<'a> Reader<'a> {
@@ -69,7 +73,13 @@ impl<'a> Reader<'a> {
             part,
             depth: 0,
             root: false,
+            stack: vec![],
+            opened: None,
         }
+    }
+
+    pub fn part(&self) -> &'a str {
+        self.part
     }
 
     fn too_large(&self, what: &str, limit: &str) -> Error {
@@ -78,6 +88,9 @@ impl<'a> Reader<'a> {
 
     /// The next event; `Eof` once the root element has closed.
     pub fn event(&mut self) -> Result<Event<'a>, Error> {
+        if let Some(open) = self.opened.take() {
+            self.stack.push(open);
+        }
         let event = match self.inner.read_event() {
             Ok(e) => e,
             Err(XmlError::Namespace(NamespaceError::TooManyBindings(_))) => {
@@ -102,9 +115,13 @@ impl<'a> Reader<'a> {
                 self.attributes(e)?;
                 if matches!(event, Event::Start(_)) {
                     self.depth += 1;
+                    self.opened = Some((self.ns(e).into(), local(e)));
                 }
             }
-            Event::End(_) => self.depth -= 1,
+            Event::End(_) => {
+                self.depth -= 1;
+                self.stack.pop();
+            }
             Event::Text(t) if t.len() > MAX_VALUE => {
                 return Err(self.too_large("a text value", "32 MiB"));
             }
@@ -179,6 +196,21 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// How many elements are around the current event: 0 for the root.
+    pub fn level(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Whether an element around the current event is `local` in namespace `ns`.
+    pub fn within(&self, ns: &str, local: &str) -> bool {
+        self.stack.iter().any(|(n, l)| n == ns && l == local)
+    }
+
+    /// The element around the current event, as (namespace, local name).
+    pub fn parent(&self) -> Option<(&str, &str)> {
+        self.stack.last().map(|(n, l)| (n.as_str(), l.as_str()))
+    }
+
     /// Whether `e` is the element `local` in namespace `ns`.
     pub fn is(&self, e: &BytesStart, ns: &str, local: &str) -> bool {
         e.local_name().as_ref() == local && self.ns(e) == ns
@@ -196,11 +228,51 @@ impl<'a> Reader<'a> {
         Ok(None)
     }
 
+    /// The value of the attribute `local` in namespace `ns`, with references replaced.
+    pub fn attr_ns<'e>(
+        &self,
+        e: &'e BytesStart,
+        ns: &str,
+        local: &str,
+    ) -> Result<Option<Cow<'e, str>>, Error> {
+        let mut attrs = self.attrs(e)?.into_iter();
+        Ok(attrs.find_map(|(n, l, v)| (n == ns && l == local).then_some(v)))
+    }
+
+    /// Every attribute of `e` but namespace declarations, as (namespace, local name, value).
+    pub fn attrs<'e>(&self, e: &'e BytesStart) -> Result<Vec<Attr<'e>>, Error> {
+        let mut out = vec![];
+        for a in e.attributes().with_checks(false) {
+            let a = a.map_err(|_| Error::bad_xml(self.part))?;
+            if a.key.as_namespace_binding().is_some() {
+                continue;
+            }
+            let (ns, name) = self.inner.resolver().resolve_attribute(a.key);
+            let ns = match ns {
+                ResolveResult::Bound(ns) => ns.0.to_string(),
+                _ => String::new(),
+            };
+            let value = a
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|_| Error::bad_xml(self.part))?;
+            out.push((ns, name.as_ref().to_string(), value));
+        }
+        Ok(out)
+    }
+
     /// Reads to the end, checking every event.
     pub fn validate(mut self) -> Result<(), Error> {
         while !matches!(self.event()?, Event::Eof) {}
         Ok(())
     }
+}
+
+/// An attribute as (namespace, local name, value).
+pub type Attr<'e> = (String, String, Cow<'e, str>);
+
+/// An element's local name.
+pub fn local(e: &BytesStart) -> String {
+    e.local_name().as_ref().to_string()
 }
 
 /// The text an event stands for: text and CDATA as written, a reference as its character.

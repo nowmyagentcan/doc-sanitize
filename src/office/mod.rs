@@ -7,6 +7,42 @@ pub mod common;
 pub mod xml;
 pub mod zipscan;
 
+/// The namespaces the checks read, by their usual prefixes.
+pub mod ns {
+    pub const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    pub const W14: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+    pub const W15: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+    pub const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    pub const XR: &str = "http://schemas.microsoft.com/office/spreadsheetml/2014/revision";
+    pub const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+    pub const P14: &str = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+    pub const CP: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+    pub const DC: &str = "http://purl.org/dc/elements/1.1/";
+    pub const DCTERMS: &str = "http://purl.org/dc/terms/";
+    pub const APP: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+    pub const CUSTOM: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
+}
+
+use crate::report::{CheckId, Finding};
+
+/// The checks of each format, in check order.
+pub fn checks(format: Format) -> &'static [CheckId] {
+    use CheckId::*;
+    match format {
+        Format::Docx | Format::Xlsx | Format::Pptx => &[Metadata, LeftoverData],
+        Format::Pdf => &[],
+    }
+}
+
+/// Runs every check of the package's format.
+pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
+    let mut found = common::metadata(pkg, values)?;
+    found.extend(common::leftover_data(pkg, values)?);
+    Ok(found)
+}
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 
@@ -111,6 +147,23 @@ pub struct Rel {
     pub external: bool,
 }
 
+impl Rel {
+    /// The last segment of the relationship type, e.g. `comments`.
+    pub fn short(&self) -> &str {
+        self.kind.rsplit('/').next().unwrap_or_default()
+    }
+}
+
+/// A relationship of a part reachable from the package.
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// The part whose `.rels` holds it ("" for the package).
+    pub source: String,
+    pub rel: Rel,
+    /// The internal target in the package's own spelling, when the package has it.
+    pub part: Option<String>,
+}
+
 /// An opened package.
 pub struct Package<'a> {
     bytes: &'a [u8],
@@ -123,6 +176,12 @@ pub struct Package<'a> {
     overrides: HashMap<String, String>,
     pub format: Format,
     pub variant: &'static str,
+    /// The main part (document, workbook or presentation).
+    pub main: String,
+    /// Every relationship of every reachable part, found breadth first from the package.
+    pub links: Vec<Link>,
+    /// The reachable parts, in the order they are found.
+    pub parts: Vec<String>,
 }
 
 /// How part names compare: percent-escapes decoded, ASCII case folded (OPC part names are
@@ -240,6 +299,9 @@ impl<'a> Package<'a> {
             overrides: HashMap::new(),
             format: Format::Docx,
             variant: "",
+            main: String::new(),
+            links: vec![],
+            parts: vec![],
         };
         if !pkg.has("[Content_Types].xml") || !pkg.has("_rels/.rels") {
             return Err(Error::unsupported_format());
@@ -280,7 +342,72 @@ impl<'a> Package<'a> {
                 xml::Reader::new(&xml::decode(&bytes, &e.name)?, &e.name).validate()?;
             }
         }
+        pkg.main = pkg.name(&part);
+        pkg.follow()?;
         Ok(pkg)
+    }
+
+    /// The part's name in the package's own spelling.
+    fn name(&self, part: &str) -> String {
+        self.index
+            .get(&key(part))
+            .map_or(part, |&i| &self.zip.entries[i].name)
+            .to_string()
+    }
+
+    /// Fills `links` and `parts` by following relationships from the package.
+    fn follow(&mut self) -> Result<(), Error> {
+        let mut seen = HashSet::new();
+        let mut pending = std::collections::VecDeque::from([String::new()]);
+        while let Some(source) = pending.pop_front() {
+            for rel in self.rels(&source)? {
+                let part = resolve(&source, &rel.target)
+                    .filter(|t| !rel.external && self.has(t))
+                    .map(|t| self.name(&t));
+                if let Some(p) = &part
+                    && seen.insert(key(p))
+                {
+                    self.parts.push(p.clone());
+                    pending.push_back(p.clone());
+                }
+                self.links.push(Link {
+                    source: source.clone(),
+                    rel,
+                    part,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The reachable parts of content type `ct`.
+    pub fn typed<'s>(&'s self, ct: &'s str) -> impl Iterator<Item = &'s str> {
+        self.parts
+            .iter()
+            .map(String::as_str)
+            .filter(move |p| self.content_type(p) == Some(ct))
+    }
+
+    /// The relationships whose type ends in `/{short}`.
+    pub fn linked<'s>(&'s self, short: &'s str) -> impl Iterator<Item = &'s Link> {
+        self.links.iter().filter(move |l| l.rel.short() == short)
+    }
+
+    /// Streams the XML part `name`, handing every event but the end to `f`.
+    pub fn walk(
+        &self,
+        name: &str,
+        mut f: impl FnMut(&xml::Reader, &Event) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let bytes = self.read(name)?;
+        let text = xml::decode(&bytes, name)?;
+        let mut r = xml::Reader::new(&text, name);
+        loop {
+            match r.event()? {
+                Event::Eof => return Ok(()),
+                ev => f(&r, &ev)?,
+            }
+        }
     }
 
     /// Whether the package has the part `name`.
@@ -332,29 +459,6 @@ impl<'a> Package<'a> {
             .get(&k)
             .or_else(|| self.defaults.get(ext?))
             .map(String::as_str)
-    }
-
-    /// The parts reachable from the package's relationships through internal targets, as
-    /// part names in the package's own spelling, in the order they are found.
-    pub fn reachable(&self) -> Result<Vec<String>, Error> {
-        let mut seen = HashSet::new();
-        let mut found = vec![];
-        let mut pending = vec![String::new()];
-        while let Some(source) = pending.pop() {
-            for rel in self.rels(&source)? {
-                let Some(target) = resolve(&source, &rel.target).filter(|_| !rel.external) else {
-                    continue;
-                };
-                if let Some(&i) = self.index.get(&key(&target))
-                    && seen.insert(i)
-                {
-                    let name = self.zip.entries[i].name.clone();
-                    found.push(name.clone());
-                    pending.push(name);
-                }
-            }
-        }
-        Ok(found)
     }
 
     /// The relationships of `source` ("" for the package), or none when it has no `.rels`.

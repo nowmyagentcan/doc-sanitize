@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use quick_xml::events::Event;
 
-use super::{Package, key, part_name, xml};
+use super::{Package, key, ns, part_name, xml};
 use crate::report::{CheckId, Error, Finding, Format, Where, plural, safe, value};
 
 const SHARED_STRINGS: &str =
@@ -29,6 +29,7 @@ fn finding(
         kind,
         place: Where {
             part: part.map(safe),
+            ..Where::default()
         },
         count,
         unit,
@@ -48,7 +49,7 @@ fn rels_source(name: &str) -> Option<String> {
 /// `leftover-data`: parts nothing links to, entries with no content type, unused shared
 /// strings, the glossary, the ZIP comment and bytes outside the package.
 pub fn leftover_data(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
-    let reachable = pkg.reachable()?;
+    let reachable = &pkg.parts;
     let reached: HashSet<String> = reachable.iter().map(|n| key(n)).collect();
     let mut orphans = vec![];
     let mut untyped = vec![];
@@ -224,6 +225,328 @@ fn unused_strings<'n>(
     let mut f = finding("unused_strings", Some(sst), unused, "strings", detail);
     f.value = first.filter(|_| values).map(|t| value(&t));
     Ok(Some(f))
+}
+
+/// The distinct parts that relationships of type `short` point at.
+pub fn targets<'p>(pkg: &'p Package, short: &str) -> Vec<&'p str> {
+    let mut seen = HashSet::new();
+    pkg.links
+        .iter()
+        .filter(|l| l.rel.short() == short)
+        .filter_map(|l| l.part.as_deref())
+        .filter(|p| seen.insert(key(p)))
+        .collect()
+}
+
+/// `name=value` pairs joined by `; `.
+fn pairs(fields: &[(String, String)]) -> String {
+    let shown: Vec<_> = fields.iter().map(|(n, v)| format!("{n}={v}")).collect();
+    shown.join("; ")
+}
+
+/// The root's children that hold text or elements, as (namespace, local name, text); the text
+/// of separate elements inside one child is joined by `, `.
+fn fields(pkg: &Package, part: &str) -> Result<Vec<(String, String, String)>, Error> {
+    let mut out = vec![];
+    let mut open: Option<(String, String, String, bool)> = None;
+    let mut fresh = true;
+    pkg.walk(part, |r, ev| {
+        match ev {
+            Event::Start(e) if r.level() == 1 => {
+                open = Some((r.ns(e).into(), xml::local(e), String::new(), false));
+                fresh = true;
+            }
+            Event::End(_) if r.level() == 1 => {
+                if let Some((ns, local, text, child)) = open.take()
+                    && (child || !text.trim().is_empty())
+                {
+                    out.push((ns, local, text));
+                }
+            }
+            Event::Start(_) | Event::Empty(_) | Event::End(_) if r.level() >= 2 => {
+                if let Some(o) = &mut open {
+                    o.3 |= !matches!(ev, Event::End(_));
+                }
+                fresh = true;
+            }
+            ev => {
+                if let (Some(o), Some(t)) = (&mut open, xml::text(ev)) {
+                    if fresh && !o.2.is_empty() {
+                        o.2 += ", ";
+                    }
+                    o.2 += &t;
+                    fresh = false;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// app.xml fields that say nothing about the people or places behind a file.
+const PLAIN_APP_FIELDS: [&str; 14] = [
+    "DocSecurity",
+    "ScaleCrop",
+    "LinksUpToDate",
+    "SharedDoc",
+    "HyperlinksChanged",
+    "Pages",
+    "Words",
+    "Characters",
+    "CharactersWithSpaces",
+    "Lines",
+    "Paragraphs",
+    "Slides",
+    "Notes",
+    "HiddenSlides",
+];
+
+/// `metadata`: document, application and custom properties, sensitivity labels, thumbnails,
+/// printer settings, tracking ids and editor names.
+pub fn metadata(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
+    let mut found = vec![];
+    let mut add = |kind, part: &str, n: usize, unit, detail: String, text: Option<String>| {
+        let f = Finding::new(
+            CheckId::Metadata,
+            kind,
+            Where::part(part),
+            n as u64,
+            unit,
+            detail,
+        );
+        found.push(f.with_value(values, text.as_deref()));
+    };
+    let props = |n| if n == 1 { "property" } else { "properties" };
+    for part in targets(pkg, "core-properties") {
+        let set: Vec<_> = fields(pkg, part)?
+            .into_iter()
+            .map(|(ns, local, text)| {
+                let prefix = match ns.as_str() {
+                    ns::DC => "dc:",
+                    ns::DCTERMS => "dcterms:",
+                    ns::CP => "cp:",
+                    _ => "",
+                };
+                (format!("{prefix}{local}"), text)
+            })
+            .collect();
+        if !set.is_empty() {
+            let author = set
+                .iter()
+                .any(|(n, _)| n == "dc:creator" || n == "cp:lastModifiedBy");
+            let including = if author { ", including the author" } else { "" };
+            let detail = format!("{} document {}{including}", set.len(), props(set.len()));
+            add(
+                "core_properties",
+                part,
+                set.len(),
+                "fields",
+                detail,
+                Some(pairs(&set)),
+            );
+        }
+    }
+    for part in targets(pkg, "extended-properties") {
+        let set: Vec<_> = fields(pkg, part)?
+            .into_iter()
+            .filter(|(ns, local, _)| ns == ns::APP && !PLAIN_APP_FIELDS.contains(&local.as_str()))
+            .map(|(_, local, text)| (local, text))
+            .collect();
+        if !set.is_empty() {
+            let detail = format!("{} application {}", set.len(), props(set.len()));
+            add(
+                "app_properties",
+                part,
+                set.len(),
+                "fields",
+                detail,
+                Some(pairs(&set)),
+            );
+        }
+    }
+    for part in targets(pkg, "custom-properties") {
+        let (labels, custom): (Vec<_>, Vec<_>) = custom_properties(pkg, part)?
+            .into_iter()
+            .partition(|(name, _)| name.starts_with("MSIP_Label_"));
+        if !custom.is_empty() {
+            let detail = format!("{} custom {}", custom.len(), props(custom.len()));
+            add(
+                "custom_properties",
+                part,
+                custom.len(),
+                "fields",
+                detail,
+                Some(pairs(&custom)),
+            );
+        }
+        if !labels.is_empty() {
+            let detail = plural(labels.len() as u64, "sensitivity label field");
+            add(
+                "sensitivity_label",
+                part,
+                labels.len(),
+                "fields",
+                detail,
+                Some(pairs(&labels)),
+            );
+        }
+    }
+    for part in targets(pkg, "classificationlabels") {
+        let mut labels = vec![];
+        pkg.walk(part, |r, ev| {
+            if let Event::Start(e) | Event::Empty(e) = ev
+                && e.local_name().as_ref() == "label"
+            {
+                labels.push(pairs(&[(
+                    "id".into(),
+                    r.attr(e, "id")?.unwrap_or_default().into(),
+                )]));
+            }
+            Ok(())
+        })?;
+        let n = labels.len().max(1);
+        let detail = plural(n as u64, "sensitivity label");
+        add(
+            "sensitivity_label",
+            part,
+            n,
+            "fields",
+            detail,
+            labels.into_iter().next(),
+        );
+    }
+    for (short, kind, detail) in [
+        (
+            "thumbnail",
+            "thumbnail",
+            "1 thumbnail picture of the first page",
+        ),
+        (
+            "printerSettings",
+            "printer_settings",
+            "1 printer settings part",
+        ),
+    ] {
+        for part in targets(pkg, short) {
+            add(kind, part, 1, "parts", detail.into(), None);
+        }
+    }
+    let revision_info = targets(pkg, "revisionInfo");
+    for part in &pkg.parts {
+        let xml = pkg.content_type(part).is_some_and(|t| t.ends_with("+xml"));
+        if !xml {
+            continue;
+        }
+        let revision = revision_info.contains(&part.as_str());
+        let (mut ids, names) = tracking_ids(pkg, part, revision)?;
+        if revision {
+            ids = ids.max(1);
+        }
+        if ids > 0 {
+            let what = match pkg.format {
+                Format::Docx => "editing-session id",
+                _ => "tracking id",
+            };
+            add(
+                "tracking_ids",
+                part,
+                ids,
+                "ids",
+                plural(ids as u64, what),
+                None,
+            );
+        }
+        if !names.is_empty() {
+            let detail = plural(names.len() as u64, "editor name");
+            add(
+                "editor_names",
+                part,
+                names.len(),
+                "names",
+                detail,
+                names.first().cloned(),
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// The custom properties of a custom.xml part, as (name, value).
+fn custom_properties(pkg: &Package, part: &str) -> Result<Vec<(String, String)>, Error> {
+    let mut out: Vec<(String, String)> = vec![];
+    pkg.walk(part, |r, ev| {
+        match ev {
+            Event::Start(e) | Event::Empty(e)
+                if r.level() == 1 && r.is(e, ns::CUSTOM, "property") =>
+            {
+                out.push((r.attr(e, "name")?.unwrap_or_default().into(), String::new()));
+            }
+            ev if r.level() >= 2 => {
+                if let (Some(p), Some(t)) = (out.last_mut(), xml::text(ev)) {
+                    p.1 += &t;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The tracking ids in one part and the editor names it holds.
+fn tracking_ids(pkg: &Package, part: &str, revision: bool) -> Result<(usize, Vec<String>), Error> {
+    let (mut ids, mut names) = (0, vec![]);
+    let format = pkg.format;
+    pkg.walk(part, |r, ev| {
+        let (Event::Start(e) | Event::Empty(e)) = ev else {
+            return Ok(());
+        };
+        let raw = e.attributes_raw();
+        match format {
+            Format::Docx => {
+                if raw.contains("rsid") {
+                    let attrs = r.attrs(e)?;
+                    ids += attrs
+                        .iter()
+                        .filter(|(n, l, _)| n == ns::W && l.starts_with("rsid"))
+                        .count();
+                }
+                let id = r.is(e, ns::W, "rsid") || r.is(e, ns::W, "rsidRoot");
+                if id || r.is(e, ns::W14, "docId") || r.is(e, ns::W15, "docId") {
+                    ids += 1;
+                }
+                if r.is(e, ns::W, "permStart")
+                    && let Some(ed) = r.attr_ns(e, ns::W, "ed")?
+                {
+                    names.push(ed.into_owned());
+                }
+            }
+            Format::Xlsx => {
+                if raw.contains("uid") && r.attr_ns(e, ns::XR, "uid")?.is_some() {
+                    ids += 1;
+                }
+                if r.is(e, ns::XR, "revisionPtr") {
+                    ids += 1;
+                }
+                if r.is(e, ns::S, "fileSharing")
+                    && let Some(user) = r.attr(e, "userName")?.filter(|u| !u.is_empty())
+                {
+                    names.push(user.into_owned());
+                }
+            }
+            Format::Pptx => {
+                if r.is(e, ns::P14, "creationId")
+                    || (revision && e.local_name().as_ref() == "client")
+                {
+                    ids += 1;
+                }
+            }
+            Format::Pdf => {}
+        }
+        Ok(())
+    })?;
+    Ok((ids, names))
 }
 
 #[cfg(test)]

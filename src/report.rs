@@ -118,10 +118,59 @@ pub enum Status {
 }
 
 /// Where a finding is. Every field is a place in the file's structure, never a found value.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct Where {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+    /// 1-based position in the workbook's sheet list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<String>,
+    /// The A1 range of the found cells.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<String>,
+    /// 1-based position in the presentation's slide list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slide: Option<usize>,
+    /// A property or key name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
+impl Where {
+    /// In the part `name`.
+    pub fn part(name: &str) -> Self {
+        Self {
+            part: Some(safe(name)),
+            ..Self::default()
+        }
+    }
+
+    /// How people read the place: `slide 2`, `sheet Summary, F1:F40`, `sheet 3`, the field,
+    /// or the part when there is no slide or sheet.
+    pub fn shown(&self) -> String {
+        let sheet = match (&self.sheet, self.sheet_index) {
+            (Some(name), _) => Some(format!("sheet {name}")),
+            (None, Some(i)) => Some(format!("sheet {i}")),
+            _ => None,
+        };
+        let part = self
+            .part
+            .clone()
+            .filter(|_| self.slide.is_none() && self.sheet_index.is_none());
+        [
+            self.slide.map(|s| format!("slide {s}")),
+            sheet,
+            self.cells.clone(),
+            self.field.clone(),
+            part,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +184,38 @@ pub struct Finding {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+
+impl Finding {
+    pub fn new(
+        check: CheckId,
+        kind: &'static str,
+        place: Where,
+        count: u64,
+        unit: &'static str,
+        detail: String,
+    ) -> Self {
+        Self {
+            check,
+            kind,
+            place,
+            count,
+            unit,
+            detail,
+            value: None,
+        }
+    }
+
+    /// The finding with `text` as its value when values are shown.
+    pub fn with_value(mut self, values: bool, text: Option<&str>) -> Self {
+        self.value = text.filter(|_| values).map(value);
+        self
+    }
+}
+
+/// The order of a finding's place: slide or sheet first.
+fn position(f: &Finding) -> usize {
+    f.place.slide.or(f.place.sheet_index).unwrap_or(0)
 }
 
 #[derive(Debug, Serialize)]
@@ -328,7 +409,7 @@ impl FileResult {
         mut findings: Vec<Finding>,
         warnings: Vec<Warning>,
     ) -> Self {
-        findings.sort_by_key(|f| f.check);
+        findings.sort_by_key(|f| (f.check, position(f)));
         let checks: Vec<_> = ran
             .iter()
             .map(|&id| {
@@ -472,7 +553,12 @@ pub fn thousands(n: u64) -> String {
 
 /// `1 string`, `2 strings`, `1,284 strings`.
 pub fn plural(n: u64, word: &str) -> String {
-    format!("{} {word}{}", thousands(n), if n == 1 { "" } else { "s" })
+    counted(n, word, &format!("{word}s"))
+}
+
+/// `n` with the singular or plural word: `1 property`, `3 properties`.
+pub fn counted(n: u64, one: &str, many: &str) -> String {
+    format!("{} {}", thousands(n), if n == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -485,6 +571,7 @@ mod tests {
             kind: "orphan_parts",
             place: Where {
                 part: part.map(Into::into),
+                ..Where::default()
             },
             count: 1,
             unit: "parts",
@@ -578,6 +665,30 @@ mod tests {
         let cut = value(&"\u{1}".repeat(100));
         assert_eq!(cut.chars().count(), 193);
         assert!(cut.ends_with("<U+0001>…"));
+    }
+
+    #[test]
+    fn places_read_like_the_page_shows_them() {
+        let at = |w: Where| w.shown();
+        assert_eq!(at(Where::part("word/document.xml")), "word/document.xml");
+        let sheet = Where {
+            sheet_index: Some(3),
+            part: Some("xl/worksheets/sheet3.xml".into()),
+            ..Where::default()
+        };
+        assert_eq!(at(sheet.clone()), "sheet 3");
+        let named = Where {
+            sheet: Some("Summary".into()),
+            cells: Some("F1:F40".into()),
+            ..sheet
+        };
+        assert_eq!(at(named), "sheet Summary, F1:F40");
+        let slide = Where {
+            slide: Some(2),
+            ..Where::part("ppt/slides/slide2.xml")
+        };
+        assert_eq!(at(slide), "slide 2");
+        assert_eq!(at(Where::default()), "");
     }
 
     #[test]

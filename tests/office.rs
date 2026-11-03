@@ -5,6 +5,11 @@ mod common;
 
 use common::*;
 
+/// The checks each format lists, in order.
+const DOCX_CHECKS: &[&str] = &["metadata", "leftover-data"];
+const XLSX_CHECKS: &[&str] = &["metadata", "leftover-data"];
+const PPTX_CHECKS: &[&str] = &["metadata", "leftover-data"];
+
 const VARIANTS: [&str; 14] = [
     "docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "xltx", "xltm", "pptx", "pptm", "potx", "potm",
     "ppsx", "ppsm",
@@ -30,6 +35,16 @@ fn every_variant_is_recognised_by_its_main_part() {
         assert_eq!(f["variant"], variant);
         assert_eq!(f["warnings"], serde_json::json!([]), "{variant}");
         assert_eq!(f["error"], serde_json::Value::Null);
+        let ids = match format {
+            "docx" => DOCX_CHECKS,
+            "xlsx" => XLSX_CHECKS,
+            _ => PPTX_CHECKS,
+        };
+        let listed: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "status": "none_found", "count": 0 }))
+            .collect();
+        assert_eq!(f["checks"], serde_json::Value::from(listed), "{variant}");
     }
 }
 
@@ -208,42 +223,22 @@ fn text_names_the_file_and_what_ran() {
     let dir = dir("office-text");
     put(&dir, &[("deck.pptx", &zip(&package("pptx", &[], &[])))]);
     let out = run_in(&dir, &["deck.pptx"]);
+    let n = PPTX_CHECKS.len();
     assert_eq!(
         stdout(&out),
-        "deck.pptx  nothing found by 1 check
-  ✓ 1 check found nothing: leftover-data
-"
+        format!(
+            "deck.pptx  nothing found by {n} checks
+  ✓ {n} checks found nothing: {}
+",
+            PPTX_CHECKS.join(", ")
+        )
     );
     assert_eq!(out.status.code(), Some(0));
 }
 
 /// The `leftover-data` findings of a package, as (kind, part, count, detail).
 fn leftovers(name: &str, bytes: &[u8]) -> Vec<(String, String, u64, String)> {
-    let f = check_bytes(name, bytes);
-    assert_eq!(
-        f["checks"],
-        serde_json::json!([{ "id": "leftover-data", "status": if f["findings"].as_array().unwrap().is_empty() { "none_found" } else { "found" }, "count": f["findings"].as_array().unwrap().len() }]),
-        "{f}"
-    );
-    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
-    f["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|x| {
-            assert_eq!(x["check"], "leftover-data");
-            (
-                s(&x["kind"]),
-                s(&x["where"]["part"]),
-                x["count"].as_u64().unwrap(),
-                s(&x["detail"]),
-            )
-        })
-        .collect()
-}
-
-fn found(kind: &str, part: &str, count: u64, detail: &str) -> (String, String, u64, String) {
-    (kind.into(), part.into(), count, detail.into())
+    kinds(&check_bytes(name, bytes), "leftover-data")
 }
 
 #[test]
@@ -385,9 +380,19 @@ fn the_zip_comment_is_found_and_its_text_shown_only_on_request() {
     assert!(!stdout(&out).contains("SECRET") && !stderr(&out).contains("SECRET"));
     assert_eq!(out.status.code(), Some(1));
     let out = run_in(&dir, &["zip_comment.xlsx", "--show-values"]);
+    let shown: Vec<_> = stdout(&out)
+        .lines()
+        .filter(|l| !l.contains("found nothing"))
+        .map(String::from)
+        .collect();
     assert_eq!(
-        stdout(&out),
-        "zip_comment.xlsx  found 1 kind of hidden data\n  ✗ leftover-data  1 ZIP comment of 16 bytes\n                   SECRET-comment-1\n  Remove it: doc-sanitize clean zip_comment.xlsx\n"
+        shown,
+        [
+            "zip_comment.xlsx  found 1 kind of hidden data",
+            "  ✗ leftover-data  1 ZIP comment of 16 bytes",
+            "                   SECRET-comment-1",
+            "  Remove it: doc-sanitize clean zip_comment.xlsx",
+        ]
     );
     let out = run_in(&dir, &["zip_comment.xlsx", "--show-values", "--json"]);
     assert_eq!(
@@ -485,4 +490,246 @@ fn part_names_with_control_characters_print_safely() {
         stdout(&out)
     );
     assert!(!stdout(&out).contains('\u{1b}'));
+}
+
+const CORE: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+const CORE_TYPE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
+const APP_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+
+fn core_xml(fields: &str) -> String {
+    format!(
+        "<cp:coreProperties xmlns:cp=\"{CORE}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">{fields}</cp:coreProperties>"
+    )
+}
+
+/// A document with every kind of metadata, each field holding a planted secret.
+fn metadata_docx() -> Vec<u8> {
+    let core = core_xml(
+        "<dc:title></dc:title><dc:creator>Avery Example SECRET-meta-1</dc:creator><cp:lastModifiedBy>Sam Sample</cp:lastModifiedBy><dc:description>SECRET-meta-2</dc:description><dcterms:created xsi:type=\"dcterms:W3CDTF\">2026-01-02T03:04:05Z</dcterms:created>",
+    );
+    let app = format!(
+        "<Properties xmlns=\"{APP_NS}\" xmlns:vt=\"urn:vt\"><Template>D:\\Projects\\avery\\SECRET-meta-3.dotx</Template><Pages>3</Pages><Words>40</Words><Company>SECRET-meta-4</Company><DocSecurity>0</DocSecurity><TitlesOfParts><vt:vector size=\"2\" baseType=\"lpstr\"><vt:lpstr>One</vt:lpstr><vt:lpstr>SECRET-meta-5</vt:lpstr></vt:vector></TitlesOfParts><Manager/></Properties>"
+    );
+    let custom = "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties\" xmlns:vt=\"urn:vt\"><property pid=\"2\" name=\"Client\"><vt:lpwstr>SECRET-meta-6</vt:lpwstr></property><property pid=\"3\" name=\"MSIP_Label_1234_Name\"><vt:lpwstr>SECRET-meta-7</vt:lpwstr></property></Properties>";
+    let body = format!(
+        "<w:document xmlns:w=\"{W}\"><w:body><w:p w:rsidR=\"00A1\" w:rsidRDefault=\"00A1\"><w:permStart w:id=\"1\" w:ed=\"SECRET-meta-8\"/><w:r w:rsidRPr=\"00B2\"><w:t>Hello</w:t></w:r><w:permEnd w:id=\"1\"/></w:p></w:body></w:document>"
+    );
+    let settings = format!(
+        "<w:settings xmlns:w=\"{W}\" xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"><w:rsids><w:rsidRoot w:val=\"00A1\"/><w:rsid w:val=\"00A1\"/><w:rsid w:val=\"00B2\"/></w:rsids><w14:docId w14:val=\"1A2B\"/><w15:docId w15:val=\"{{0000}}\"/></w:settings>"
+    );
+    let labels = "<clbl:labelList xmlns:clbl=\"http://schemas.microsoft.com/office/2020/mipLabelMetadata\"><clbl:label id=\"{SECRET-meta-9}\" enabled=\"1\" method=\"Standard\"/></clbl:labelList>";
+    Pkg::new("docx")
+        .body(&body)
+        .part(
+            "",
+            "rId2",
+            &format!("{PKG_RELS}/metadata/core-properties"),
+            "docProps/core.xml",
+            CORE_TYPE,
+            core.as_bytes(),
+        )
+        .part(
+            "",
+            "rId3",
+            "extended-properties",
+            "docProps/app.xml",
+            &format!("{OX}.extended-properties+xml"),
+            app.as_bytes(),
+        )
+        .part(
+            "",
+            "rId4",
+            "custom-properties",
+            "docProps/custom.xml",
+            &format!("{OX}.custom-properties+xml"),
+            custom.as_bytes(),
+        )
+        .part(
+            "",
+            "rId5",
+            &format!("{PKG_RELS}/metadata/thumbnail"),
+            "docProps/thumbnail.jpeg",
+            "",
+            b"\xFF\xD8\xFF\xD9",
+        )
+        .part(
+            "",
+            "rId6",
+            "http://schemas.microsoft.com/office/2020/02/relationships/classificationlabels",
+            "docMetadata/LabelInfo.xml",
+            "application/vnd.ms-office.classificationlabels+xml",
+            labels.as_bytes(),
+        )
+        .part(
+            "word/document.xml",
+            "rId1",
+            "settings",
+            "word/settings.xml",
+            &format!("{OX}.wordprocessingml.settings+xml"),
+            settings.as_bytes(),
+        )
+        .zip()
+}
+
+/// Every finding's value (empty when it has none) with `--show-values`, and checks that
+/// none is printed without it.
+fn values(name: &str, bytes: &[u8]) -> Vec<String> {
+    let dir = dir("values");
+    put(&dir, &[(name, bytes)]);
+    for args in [&[name][..], &[name, "--json"]] {
+        let plain = run_in(&dir, args);
+        assert!(!stdout(&plain).contains("SECRET"), "{}", stdout(&plain));
+        assert!(!stderr(&plain).contains("SECRET"), "{}", stderr(&plain));
+    }
+    let out = run_in(&dir, &[name, "--show-values", "--json"]);
+    json(&out)["files"][0]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["value"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn every_kind_of_office_metadata_is_found() {
+    let f = check_bytes("meta.docx", &metadata_docx());
+    assert_eq!(
+        kinds(&f, "metadata"),
+        [
+            found(
+                "core_properties",
+                "docProps/core.xml",
+                4,
+                "4 document properties, including the author"
+            ),
+            found(
+                "app_properties",
+                "docProps/app.xml",
+                3,
+                "3 application properties"
+            ),
+            found(
+                "custom_properties",
+                "docProps/custom.xml",
+                1,
+                "1 custom property"
+            ),
+            found(
+                "sensitivity_label",
+                "docProps/custom.xml",
+                1,
+                "1 sensitivity label field"
+            ),
+            found(
+                "sensitivity_label",
+                "docMetadata/LabelInfo.xml",
+                1,
+                "1 sensitivity label"
+            ),
+            found(
+                "thumbnail",
+                "docProps/thumbnail.jpeg",
+                1,
+                "1 thumbnail picture of the first page"
+            ),
+            found(
+                "tracking_ids",
+                "word/document.xml",
+                3,
+                "3 editing-session ids"
+            ),
+            found("editor_names", "word/document.xml", 1, "1 editor name"),
+            found(
+                "tracking_ids",
+                "word/settings.xml",
+                5,
+                "5 editing-session ids"
+            ),
+        ]
+    );
+    let values = values("meta.docx", &metadata_docx());
+    assert_eq!(
+        values,
+        [
+            "dc:creator=Avery Example SECRET-meta-1; cp:lastModifiedBy=Sam Sample; dc:description=SECRET-meta-2; dcterms:created=2026-01-02T03:04:05Z",
+            "Template=D:\\Projects\\avery\\SECRET-meta-3.dotx; Company=SECRET-meta-4; TitlesOfParts=One, SECRET-meta-5",
+            "Client=SECRET-meta-6",
+            "MSIP_Label_1234_Name=SECRET-meta-7",
+            "id={SECRET-meta-9}",
+            "",
+            "",
+            "SECRET-meta-8",
+            "",
+        ]
+    );
+}
+
+#[test]
+fn workbook_and_deck_ids_and_printer_settings_are_found() {
+    let book = Pkg::new("xlsx")
+        .body(&format!("<workbook xmlns=\"{S}\" xmlns:xr=\"http://schemas.microsoft.com/office/spreadsheetml/2014/revision\"><fileSharing userName=\"SECRET-meta-10\"/><xr:revisionPtr revIDLastSave=\"0\" documentId=\"8_{{1}}\"/><sheets/><extLst><ext xr:uid=\"{{AB}}\"/></extLst></workbook>"))
+        .part(
+            "xl/workbook.xml",
+            "rId9",
+            "printerSettings",
+            "xl/printerSettings/printerSettings1.bin",
+            &format!("{OX}.spreadsheetml.printerSettings"),
+            b"\0\0SECRET-meta-11",
+        )
+        .zip();
+    assert_eq!(
+        kinds(&check_bytes("ids.xlsx", &book), "metadata"),
+        [
+            found(
+                "printer_settings",
+                "xl/printerSettings/printerSettings1.bin",
+                1,
+                "1 printer settings part"
+            ),
+            found("tracking_ids", "xl/workbook.xml", 2, "2 tracking ids"),
+            found("editor_names", "xl/workbook.xml", 1, "1 editor name"),
+        ]
+    );
+    assert_eq!(values("ids.xlsx", &book), ["", "", "SECRET-meta-10"]);
+    let deck = Pkg::new("pptx")
+        .body(&format!("<p:presentation xmlns:p=\"{P}\"><p:extLst><p:ext><p14:creationId xmlns:p14=\"http://schemas.microsoft.com/office/powerpoint/2010/main\" val=\"123\"/></p:ext></p:extLst></p:presentation>"))
+        .part(
+            "ppt/presentation.xml",
+            "rId9",
+            "http://schemas.microsoft.com/office/2015/10/relationships/revisionInfo",
+            "ppt/revisionInfo.xml",
+            "application/vnd.ms-powerpoint.revisioninfo+xml",
+            b"<p1510:revInfo xmlns:p1510=\"urn:p1510\"><p1510:revLst><p1510:client id=\"{A}\" v=\"1\"/><p1510:client id=\"{B}\" v=\"2\"/></p1510:revLst></p1510:revInfo>",
+        )
+        .zip();
+    assert_eq!(
+        kinds(&check_bytes("ids.pptx", &deck), "metadata"),
+        [
+            found("tracking_ids", "ppt/presentation.xml", 1, "1 tracking id"),
+            found("tracking_ids", "ppt/revisionInfo.xml", 2, "2 tracking ids"),
+        ]
+    );
+}
+
+#[test]
+fn empty_properties_are_not_metadata() {
+    let doc = Pkg::new("docx")
+        .part(
+            "",
+            "rId2",
+            &format!("{PKG_RELS}/metadata/core-properties"),
+            "docProps/core.xml",
+            CORE_TYPE,
+            core_xml("<dc:title/><dc:creator> </dc:creator>").as_bytes(),
+        )
+        .part(
+            "",
+            "rId3",
+            "extended-properties",
+            "docProps/app.xml",
+            &format!("{OX}.extended-properties+xml"),
+            format!("<Properties xmlns=\"{APP_NS}\"><Pages>1</Pages><Words>2</Words><ScaleCrop>false</ScaleCrop><SharedDoc>false</SharedDoc></Properties>").as_bytes(),
+        )
+        .zip();
+    assert_eq!(kinds(&check_bytes("plain.docx", &doc), "metadata"), []);
 }

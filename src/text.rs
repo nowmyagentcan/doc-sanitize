@@ -156,9 +156,9 @@ pub fn file(
         n => look.paint(RED, &format!("found {n} kinds of hidden data")),
     };
     out.line(&format!("{}  {status}", look.paint(BOLD, &f.path)))?;
-    let shown = |x: &Finding| match &x.place.part {
-        Some(p) => format!("{}: ", look.paint(DIM, p)),
-        None => String::new(),
+    let shown = |x: &Finding| match x.place.shown() {
+        p if p.is_empty() => p,
+        p => format!("{}: ", look.paint(DIM, &p)),
     };
     for c in &found {
         let fs: Vec<_> = f.findings.iter().filter(|x| x.check == c.id).collect();
@@ -296,6 +296,7 @@ mod tests {
             kind: "untyped_entries",
             place: Where {
                 part: part.map(Into::into),
+                ..Where::default()
             },
             count: 1,
             unit: "parts",

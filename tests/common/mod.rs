@@ -2,6 +2,10 @@
 
 #![allow(dead_code)]
 
+pub mod pkg;
+#[allow(unused_imports)]
+pub use pkg::*;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -349,13 +353,34 @@ pub fn package(variant: &str, types: &[(&str, &str)], parts: &[Entry]) -> Vec<En
 /// A `.rels` part with one relationship per (id, type under the officeDocument namespace,
 /// target).
 pub fn rels(rels: &[(&str, &str, &str)]) -> String {
-    let body: String = rels
+    let body: Vec<_> = rels
         .iter()
-        .map(|(id, kind, target)| {
-            format!("<Relationship Id=\"{id}\" Type=\"{R}/{kind}\" Target=\"{target}\"/>")
-        })
+        .map(|&(id, kind, target)| rel(id, kind, target))
         .collect();
-    format!("<Relationships xmlns=\"{REL}\">{body}</Relationships>")
+    rels_of(&body)
+}
+
+/// A `.rels` part holding `rels` made by [`rel`] or [`external`].
+pub fn rels_of(rels: &[String]) -> String {
+    format!(
+        "<Relationships xmlns=\"{REL}\">{}</Relationships>",
+        rels.concat()
+    )
+}
+
+/// One relationship; a `kind` with no scheme is a type under the officeDocument namespace.
+pub fn rel(id: &str, kind: &str, target: &str) -> String {
+    let kind = if kind.contains("://") {
+        kind.to_string()
+    } else {
+        format!("{R}/{kind}")
+    };
+    format!("<Relationship Id=\"{id}\" Type=\"{kind}\" Target=\"{target}\"/>")
+}
+
+/// One relationship to a target outside the package.
+pub fn external(id: &str, kind: &str, target: &str) -> String {
+    rel(id, kind, target).replace("/>", " TargetMode=\"External\"/>")
 }
 
 /// `entries` with the part `name` replaced by `data`, or added.
@@ -392,4 +417,50 @@ pub fn cfb(stream: &str) -> Vec<u8> {
         b[e + 66] = *kind;
     }
     b
+}
+
+/// The findings of `check` in a file's JSON entry, after checking that its `checks` entry
+/// agrees with them.
+pub fn findings_of<'v>(f: &'v serde_json::Value, check: &str) -> Vec<&'v serde_json::Value> {
+    let found: Vec<_> = f["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no findings: {f}"))
+        .iter()
+        .filter(|x| x["check"] == check)
+        .collect();
+    let entry = f["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == check)
+        .unwrap_or_else(|| panic!("{check} didn't run: {f}"));
+    let status = if found.is_empty() {
+        "none_found"
+    } else {
+        "found"
+    };
+    assert_eq!(entry["status"], status, "{check}: {f}");
+    assert_eq!(entry["count"], found.len(), "{check}: {f}");
+    found
+}
+
+/// Each finding of `check` as (kind, part, count, detail).
+pub fn kinds(f: &serde_json::Value, check: &str) -> Vec<(String, String, u64, String)> {
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    findings_of(f, check)
+        .into_iter()
+        .map(|x| {
+            let count = x["count"].as_u64().unwrap();
+            (
+                s(&x["kind"]),
+                s(&x["where"]["part"]),
+                count,
+                s(&x["detail"]),
+            )
+        })
+        .collect()
+}
+
+pub fn found(kind: &str, part: &str, count: u64, detail: &str) -> (String, String, u64, String) {
+    (kind.into(), part.into(), count, detail.into())
 }

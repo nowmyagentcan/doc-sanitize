@@ -10,7 +10,7 @@ use std::sync::Once;
 use std::thread;
 
 use crate::input::{self, Kind};
-use crate::office::{Package, common};
+use crate::office::{self, Package};
 use crate::report::{CheckId, Error, FileResult, Format, Warning, safe};
 
 const WORKER: &str = "doc-sanitize-worker";
@@ -39,8 +39,13 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
             Kind::Pdf => (Format::Pdf, "pdf", vec![], vec![]),
             Kind::Zip => {
                 let pkg = Package::open(&bytes)?;
-                let found = common::leftover_data(&pkg, options.show_values)?;
-                (pkg.format, pkg.variant, vec![CheckId::LeftoverData], found)
+                let found = office::check(&pkg, options.show_values)?;
+                (
+                    pkg.format,
+                    pkg.variant,
+                    office::checks(pkg.format).to_vec(),
+                    found,
+                )
             }
         };
         let warnings = mismatch(&name, path, variant).into_iter().collect();
