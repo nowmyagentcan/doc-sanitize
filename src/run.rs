@@ -44,7 +44,7 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
                 if pdf.repaired {
                     warnings.push(Warning::repaired());
                 }
-                let found = pdf::check(&pdf, options.show_values);
+                let found = pdf::check(&pdf, &bytes, options.show_values);
                 (Format::Pdf, "pdf", &pdf::CHECKS, found)
             }
             Kind::Zip => {

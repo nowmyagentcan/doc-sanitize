@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
+use doc_sanitize::report::thousands;
 use lopdf::encryption::crypt_filters::{Aes256CryptFilter, CryptFilter};
-use lopdf::{EncryptionState, EncryptionVersion, Permissions};
+use lopdf::{EncryptionState, EncryptionVersion, Permissions, dictionary};
 
 /// Checks `bytes` saved as `name`, with `args`, giving the file's JSON entry. Every PDF
 /// fixture must finish within 10 s.
@@ -390,4 +391,136 @@ fn structure_leaks_are_found_and_their_values_stay_out() {
 
     let f = &json(&run_in(&dir, &["plain.pdf", "--json"]))["files"][0];
     assert_eq!(f["status"], "none_found", "{f}");
+}
+
+/// A PDF whose second revision removes a sentence from the page and the author from its
+/// properties.
+fn incremental() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let page = b.page(&format!(
+        "{}{}",
+        text_at(72, 720, "Kept sentence."),
+        text_at(72, 700, "SECRET-pdf-removed-1")
+    ));
+    let info = b.add(dictionary! {
+        "Author" => lopdf::Object::string_literal("SECRET-pdf-author-1"),
+        "Title" => lopdf::Object::string_literal("Draft"),
+    });
+    let mut doc = b.finish();
+    doc.trailer.set("Info", info);
+    let first = save(&mut doc);
+    let old = lopdf::Document::load_mem(&first).unwrap();
+    let contents = old.get_page_contents(page)[0];
+    let mut update = lopdf::IncrementalDocument::create_from(first, old);
+    let new = &mut update.new_document;
+    let content = text_at(72, 720, "Kept sentence.").into_bytes();
+    new.set_object(
+        contents,
+        lopdf::Stream::new(lopdf::Dictionary::new(), content),
+    );
+    new.set_object(
+        info,
+        dictionary! { "Title" => lopdf::Object::string_literal("Draft") },
+    );
+    let mut out = vec![];
+    update.save_to(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn earlier_revisions_name_what_changed_after_them() {
+    let f = check_pdf("incremental.pdf", &incremental(), &[]);
+    assert_eq!(
+        pdf_kinds(&f, "old-revisions"),
+        [k(
+            "earlier_revision",
+            r#"{"revision":1}"#,
+            1,
+            "1 earlier revision; 2 objects were changed or removed after it, including page content and document properties"
+        )]
+    );
+    assert_eq!(pdf_kinds(&f, "leftover-data"), []);
+
+    // Made from a one-page PDF with `qpdf --linearize --object-streams=disable
+    // --deterministic-id`: its first-page section isn't a revision.
+    let f = check_pdf(
+        "linearized.pdf",
+        include_bytes!("fixtures/linearized.pdf"),
+        &[],
+    );
+    assert_eq!(pdf_kinds(&f, "old-revisions"), []);
+    assert_eq!(pdf_kinds(&f, "leftover-data"), []);
+}
+
+#[test]
+fn leftovers_are_found_in_the_bytes_and_the_objects() {
+    let mut polyglot = one_page(&text_at(72, 720, "Front"));
+    let zip = zip(&package("docx", &[], &[]));
+    polyglot.extend(&zip);
+    polyglot.extend(b"\n\0\n");
+    let f = check_pdf("polyglot.pdf", &polyglot, &[]);
+    // The ZIP ends in zeros (an empty comment length), which aren't counted.
+    let size = zip.iter().rposition(|&b| b != 0).unwrap() + 1;
+    let after = format!("{} bytes after the PDF ends", thousands(size as u64));
+    assert_eq!(
+        pdf_kinds(&f, "leftover-data"),
+        [k("data_outside_pdf", "{}", size as u64, &after)]
+    );
+    let mut before = b"%!PS junk\n".to_vec();
+    before.extend(one_page(""));
+    let f = check_pdf("before.pdf", &before, &[]);
+    assert_eq!(
+        pdf_kinds(&f, "leftover-data"),
+        [k(
+            "data_outside_pdf",
+            "{}",
+            10,
+            "10 bytes before the PDF starts"
+        )]
+    );
+
+    // An object body in the bytes that no cross-reference table lists, an object nothing
+    // uses, and an image the page never draws.
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut objects = raw_page("/Resources << /XObject << /Im1 5 0 R >> >> /Contents 6 0 R");
+    objects.push((5, stream_body("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\0")));
+    objects.push((6, stream_body("", b"q Q")));
+    objects.push((7, b"(SECRET-pdf-unused-1)".to_vec()));
+    let at = write_objects(&mut out, &objects);
+    write_objects(&mut out, &[(9, b"(SECRET-pdf-unlisted-1)".to_vec())]);
+    let xref = out.len();
+    out.extend(b"xref\n0 8\n0000000000 65535 f \n");
+    for n in 1..8u32 {
+        match objects.iter().position(|o| o.0 == n) {
+            Some(i) => out.extend(format!("{:010} 00000 n \n", at[i]).as_bytes()),
+            None => out.extend(b"0000000000 65535 f \n"),
+        }
+    }
+    out.extend(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    let f = check_pdf("unlisted.pdf", &out, &[]);
+    assert_eq!(
+        pdf_kinds(&f, "leftover-data"),
+        [
+            k(
+                "unused_objects",
+                "{}",
+                1,
+                "1 object that nothing in the file uses"
+            ),
+            k(
+                "unlisted_objects",
+                "{}",
+                1,
+                "1 object body that no cross-reference table lists"
+            ),
+            k(
+                "unused_resources",
+                r#"{"page":1}"#,
+                1,
+                "1 picture or drawing that nothing on the page shows"
+            ),
+        ]
+    );
 }

@@ -1,9 +1,12 @@
 //! PDF files: opening them with lopdf under limits on objects, pages and decoded streams.
 
+mod bytes;
+
 use std::collections::HashSet;
 use std::io::{self, Write};
 
 use flate2::write::{DeflateDecoder, ZlibDecoder};
+use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
 
 use crate::pictures;
@@ -185,13 +188,15 @@ pub fn name(dict: &Dictionary, key: &[u8]) -> Option<String> {
 }
 
 /// The checks every PDF gets, in report order.
-pub const CHECKS: [CheckId; 8] = [
+pub const CHECKS: [CheckId; 10] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::EmbeddedFiles,
     CheckId::Macros,
     CheckId::ExternalLinks,
     CheckId::ImageMetadata,
+    CheckId::OldRevisions,
+    CheckId::LeftoverData,
     CheckId::Signatures,
     CheckId::FormData,
 ];
@@ -204,7 +209,7 @@ pub struct Found {
 }
 
 /// Runs every PDF check on `pdf`.
-pub fn check(pdf: &Pdf, values: bool) -> Found {
+pub fn check(pdf: &Pdf, bytes: &[u8], values: bool) -> Found {
     let c = Ctx { pdf, values };
     let mut found = Found::default();
     found.findings.extend(metadata(&c));
@@ -213,6 +218,7 @@ pub fn check(pdf: &Pdf, values: bool) -> Found {
     found.findings.extend(actions(&c));
     found.findings.extend(fields(&c));
     image_metadata(&c, &mut found);
+    bytes::check(&c, bytes, &mut found);
     found
 }
 
@@ -905,4 +911,111 @@ fn image_metadata(c: &Ctx, found: &mut Found) {
             )),
         }
     }
+}
+
+/// A page's content streams decoded and joined, or None when one can't be decoded.
+fn page_content(c: &Ctx, page: &Dictionary) -> Option<Vec<u8>> {
+    let streams: Vec<&Object> = match c.get(page, b"Contents") {
+        Some(Object::Array(a)) => a.iter().collect(),
+        Some(o) => vec![o],
+        None => vec![],
+    };
+    let mut content = vec![];
+    for s in streams {
+        if let Object::Stream(s) = c.resolve(s) {
+            content.extend(s.decompressed_content_with_limit(STREAM_LIMIT).ok()?);
+            content.push(b'\n');
+        }
+    }
+    Some(content)
+}
+
+/// A page's resources, inherited from its ancestors when it has none.
+fn page_resources<'a>(c: &Ctx<'a>, page: &'a Dictionary) -> Option<&'a Dictionary> {
+    let mut node = page;
+    for _ in 0..64 {
+        if let Some(r) = c.dict(node, b"Resources") {
+            return Some(r);
+        }
+        node = c.dict(node, b"Parent")?;
+    }
+    None
+}
+
+/// Calls `visit` with each operator of `content` and the forms it draws, in drawing order,
+/// with the resources it was drawn with. A form drawn twice is walked once.
+fn walk<'a>(
+    c: &Ctx<'a>,
+    content: &[u8],
+    resources: Option<&'a Dictionary>,
+    visit: &mut impl FnMut(&Operation, Option<&'a Dictionary>),
+) {
+    let mut seen = HashSet::new();
+    walk_from(c, content, resources, visit, &mut seen, 0);
+}
+
+fn walk_from<'a>(
+    c: &Ctx<'a>,
+    content: &[u8],
+    resources: Option<&'a Dictionary>,
+    visit: &mut impl FnMut(&Operation, Option<&'a Dictionary>),
+    seen: &mut HashSet<ObjectId>,
+    depth: usize,
+) {
+    for op in Content::decode_iter(content).map_while(Result::ok) {
+        visit(&op, resources);
+        if op.operator != "Do" || depth > 32 {
+            continue;
+        }
+        let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+            continue;
+        };
+        let Some(Object::Reference(id)) = resources
+            .and_then(|r| c.dict(r, b"XObject"))
+            .and_then(|x| x.get(name).ok())
+        else {
+            continue;
+        };
+        if let Ok(Object::Stream(form)) = c.doc().get_object(*id)
+            && subtype(&form.dict) == b"Form"
+            && seen.insert(*id)
+            && let Ok(inner) = form.decompressed_content_with_limit(STREAM_LIMIT)
+        {
+            let own = c.dict(&form.dict, b"Resources").or(resources);
+            walk_from(c, &inner, own, visit, seen, depth + 1);
+        }
+    }
+}
+
+/// XObjects a page's or a drawn form's resources name that no `Do` draws.
+fn unused_resources<'a>(c: &Ctx<'a>, page: &'a Dictionary) -> usize {
+    let Some(content) = page_content(c, page) else {
+        return 0;
+    };
+    let resources = page_resources(c, page);
+    let mut named: Vec<_> = resources.map(|r| xobjects(c, r)).unwrap_or_default();
+    let mut drawn = HashSet::new();
+    walk(c, &content, resources, &mut |op, resources| {
+        let Some(r) = resources else { return };
+        let key = std::ptr::from_ref(r);
+        if !named.iter().any(|n| n.0 == key) {
+            named.extend(xobjects(c, r));
+        }
+        if op.operator == "Do"
+            && let Some(name) = op.operands.first().and_then(|o| o.as_name().ok())
+        {
+            drawn.insert((key, name.to_vec()));
+        }
+    });
+    named.iter().filter(|n| !drawn.contains(n)).count()
+}
+
+/// The XObject names of `r`, keyed by its address so a form's own resources are told from
+/// the page's.
+fn xobjects<'a>(c: &Ctx<'a>, r: &'a Dictionary) -> Vec<(*const Dictionary, Vec<u8>)> {
+    let key = std::ptr::from_ref(r);
+    let names = c
+        .dict(r, b"XObject")
+        .map(|x| x.iter().map(|(k, _)| (key, k.clone())));
+    names.into_iter().flatten().collect()
 }
