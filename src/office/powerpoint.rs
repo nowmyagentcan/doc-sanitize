@@ -2,25 +2,8 @@
 
 use quick_xml::events::Event;
 
-use super::{Ctx, ns, xml};
+use super::{Ctx, common, ns, xml};
 use crate::report::{CheckId, Error, Finding, Where, plural};
-
-/// A slide's text, its runs joined by spaces.
-fn text_of(ctx: &Ctx, part: &str) -> Result<String, Error> {
-    let mut text = String::new();
-    ctx.pkg.walk(part, |r, ev| {
-        if r.parent() == Some((ns::A, "t"))
-            && let Some(t) = xml::text(ev)
-        {
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text += &t;
-        }
-        Ok(())
-    })?;
-    Ok(text)
-}
 
 /// `hidden-slides`: slides left out of the show.
 pub fn hidden_slides(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
@@ -48,7 +31,7 @@ pub fn hidden_slides(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 "slides",
                 "1 hidden slide".into(),
             );
-            found.push(f.with_value(ctx.values, Some(&text_of(ctx, part)?)));
+            found.push(f.with_value(ctx.values, Some(&common::all_text(ctx.pkg, part)?)));
         }
     }
     Ok(found)

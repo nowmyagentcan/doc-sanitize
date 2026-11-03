@@ -286,10 +286,6 @@ const LINE_KINDS: [(&str, &str, &str, &str); 2] = [
     ),
 ];
 
-fn yes(v: Option<Cow<str>>) -> bool {
-    matches!(v.as_deref(), Some("1" | "true"))
-}
-
 /// `hidden-text`, `fake-redactions` and `hidden-rows-columns` in a workbook: cells with a value
 /// whose number format shows nothing or whose text is coloured like their fill, and values in
 /// hidden rows and columns.
@@ -330,7 +326,7 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     let num = |a| -> Result<Option<f64>, Error> {
                         Ok(r.attr(e, a)?.and_then(|v| v.parse().ok()))
                     };
-                    if yes(r.attr(e, "hidden")?) || num("width")?.is_some_and(|w| w < 0.1) {
+                    if xml::yes(r.attr(e, "hidden")?) || num("width")?.is_some_and(|w| w < 0.1) {
                         let (min, max) = (num("min")?.unwrap_or(0.0), num("max")?.unwrap_or(0.0));
                         hidden_cols.push((min as u32, max as u32));
                     }
@@ -341,11 +337,11 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(row + 1);
                     col = 0;
-                    let low = yes(r.attr(e, "customHeight")?)
+                    let low = xml::yes(r.attr(e, "customHeight")?)
                         && r.attr(e, "ht")?
                             .and_then(|v| v.parse::<f64>().ok())
                             .is_some_and(|h| h < 0.5);
-                    row_hidden = yes(r.attr(e, "hidden")?) || low;
+                    row_hidden = xml::yes(r.attr(e, "hidden")?) || low;
                 }
                 Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "c") => {
                     let at = r

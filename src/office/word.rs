@@ -32,6 +32,15 @@ pub fn stories<'p>(ctx: &Ctx<'p>) -> Vec<&'p str> {
     parts
 }
 
+/// The parts whose text shows on pages: stories but comments and the glossary.
+pub fn pages<'p>(ctx: &Ctx<'p>) -> impl Iterator<Item = &'p str> {
+    let pkg = ctx.pkg;
+    stories(ctx).into_iter().filter(move |p| {
+        let ct = pkg.content_type(p).unwrap_or_default();
+        !ct.ends_with("comments+xml") && !ct.ends_with("glossary+xml")
+    })
+}
+
 /// The kind of tracked change an element is, from its name and the element around it.
 fn change(local: &str, parent: Option<(&str, &str)>) -> Option<&'static str> {
     let in_row = parent == Some((ns::W, "trPr"));
@@ -320,11 +329,7 @@ pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     let styles = Styles::read(ctx, &theme)?;
     let page = page_colour(ctx)?;
     let mut found = vec![];
-    for part in stories(ctx) {
-        let ct = pkg.content_type(part).unwrap_or_default();
-        if ct.ends_with("comments+xml") || ct.ends_with("glossary+xml") {
-            continue;
-        }
+    for part in pages(ctx) {
         // Per kind: characters, the first group's text and whether that group has ended.
         let mut seen = vec![(0usize, String::new(), false); HIDDEN_RUNS.len()];
         let (mut paras, mut runs, mut behind) = (vec![Para::default()], vec![], vec![]);

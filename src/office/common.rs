@@ -745,7 +745,7 @@ pub fn linked_parts(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
 }
 
 /// Every text of an XML part, each element's text separated by a space.
-fn all_text(pkg: &Package, part: &str) -> Result<String, Error> {
+pub fn all_text(pkg: &Package, part: &str) -> Result<String, Error> {
     let mut text = String::new();
     if pkg.content_type(part).is_some_and(|t| t.ends_with("xml")) {
         pkg.walk(part, |_, ev| {

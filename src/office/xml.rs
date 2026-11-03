@@ -89,10 +89,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub fn part(&self) -> &'a str {
-        self.part
-    }
-
     fn too_large(&self, what: &str, limit: &str) -> Error {
         Error::too_large(&format!("{what} in part {}", safe(self.part)), limit)
     }
@@ -309,6 +305,11 @@ impl<'a> Reader<'a> {
         while !matches!(self.event()?, Event::Eof) {}
         Ok(())
     }
+}
+
+/// Whether an on/off attribute is on.
+pub fn yes(v: Option<Cow<str>>) -> bool {
+    matches!(v.as_deref(), Some("1" | "true"))
 }
 
 /// An attribute as (namespace, local name, value).

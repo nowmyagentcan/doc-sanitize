@@ -26,13 +26,7 @@ const OBJECTS: [&str; 10] = [
 pub fn drawing_parts<'c>(ctx: &'c Ctx) -> Vec<&'c str> {
     let pkg = ctx.pkg;
     match pkg.format {
-        Format::Docx => word::stories(ctx)
-            .into_iter()
-            .filter(|p| {
-                !pkg.content_type(p)
-                    .is_some_and(|t| t.ends_with("comments+xml") || t.ends_with("glossary+xml"))
-            })
-            .collect(),
+        Format::Docx => word::pages(ctx).collect(),
         Format::Xlsx => pkg.typed(DRAWING_PART).collect(),
         _ => ctx.slides.iter().map(String::as_str).collect(),
     }
@@ -66,9 +60,6 @@ pub fn hidden_objects(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     let local = e.local_name();
                     let local = local.as_ref();
                     let start = matches!(ev, Event::Start(_));
-                    let yes = |v: Option<std::borrow::Cow<str>>| {
-                        matches!(v.as_deref(), Some("1" | "true"))
-                    };
                     let inside_hidden = open.iter().any(|o| o.hidden);
                     if r.ns(e) == VML
                         && r.attr(e, "style")?
@@ -91,7 +82,7 @@ pub fn hidden_objects(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                             ..Object::default()
                         });
                     } else if (local == "cNvPr" || local == "docPr")
-                        && yes(r.attr(e, "hidden")?)
+                        && xml::yes(r.attr(e, "hidden")?)
                         && !inside_hidden
                     {
                         if let Some(o) = open.last_mut() {

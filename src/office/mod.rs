@@ -560,11 +560,6 @@ impl<'a> Package<'a> {
             .filter(move |p| self.content_type(p) == Some(ct))
     }
 
-    /// The relationships whose type ends in `/{short}`.
-    pub fn linked<'s>(&'s self, short: &'s str) -> impl Iterator<Item = &'s Link> {
-        self.links.iter().filter(move |l| l.rel.short() == short)
-    }
-
     /// Streams the XML part `name`, handing every event but the end to `f`.
     pub fn walk(
         &self,
