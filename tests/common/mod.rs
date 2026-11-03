@@ -508,16 +508,21 @@ pub fn unzip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The planted secrets (each starts with SECRET) anywhere in `bytes`, in order.
+/// The planted secrets (each starts with SECRET and ends with its number) anywhere in
+/// `bytes`, in order.
 pub fn secrets_in(bytes: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(bytes);
     let mut out: Vec<String> = text
         .match_indices("SECRET")
         .map(|(i, _)| {
-            text[i..]
+            let s: String = text[i..]
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-                .collect()
+                .collect();
+            // A secret ends with its number: `SECRET-case-1`, even when bytes follow.
+            let dash = s.rfind('-').map_or(s.len(), |d| d + 1);
+            let digits = s[dash..].chars().take_while(char::is_ascii_digit).count();
+            s[..dash + digits].to_string()
         })
         .collect();
     out.dedup();

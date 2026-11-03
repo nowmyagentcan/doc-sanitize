@@ -355,3 +355,154 @@ fn unused_shared_strings_are_dropped_and_cells_renumbered() {
         "<c r=\"A1\" t=\"s\"><v>1</v></c><c r=\"B1\" t=\"s\"><v>0</v></c><c r=\"C1\"><v>0</v></c>"
     ));
 }
+
+/// The planted secrets left in a copy: in its bytes and in every inflated entry.
+fn copy_secrets(path: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let bytes = fs::read(path).unwrap();
+    let mut out: std::collections::BTreeSet<_> = secrets_in(&bytes).into_iter().collect();
+    for (_, data) in unzip(&bytes) {
+        out.extend(secrets_in(&data));
+    }
+    out
+}
+
+#[test]
+fn properties_comments_custom_data_and_macros_are_removed() {
+    let docx_keep = "tracked-changes,hidden-text,fake-redactions,embedded-files,external-links,image-metadata,cropped-images";
+    let pptx_keep = "hidden-slides,speaker-notes,hidden-objects,embedded-files,external-links,image-metadata,cropped-images";
+    let cases = [
+        (
+            "leaky.docm",
+            leaky_docx("docm"),
+            docx_keep,
+            &[
+                "docx-comment-1",
+                "docx-ed-1",
+                "docx-company-1",
+                "docx-custom-1",
+                "docx-var-1",
+                "docx-xml-1",
+                "docm-vba-1",
+            ][..],
+            "docx",
+        ),
+        (
+            "leaky.pptm",
+            leaky_pptx("pptm"),
+            pptx_keep,
+            &[
+                "pptx-comment-1",
+                "pptx-comment-2",
+                "pptx-tag-1",
+                "pptx-addin-1",
+                "pptm-vba-1",
+            ][..],
+            "pptx",
+        ),
+    ];
+    for (name, bytes, keep, gone, ext) in cases {
+        let dir = dir("clean-parts");
+        put(&dir, &[(name, &bytes)]);
+        let out = run_in(&dir, &["clean", name, "--keep", keep, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", stdout(&out));
+        let f = &json(&out)["files"][0];
+        let stem = name.split('.').next().unwrap();
+        assert_eq!(f["output"], format!("{stem}.clean.{ext}"));
+        assert_eq!(f["changes"][0]["code"], "extension_changed");
+        let copy = dir.join(format!("{stem}.clean.{ext}"));
+        let left = copy_secrets(&copy);
+        for s in gone {
+            assert!(
+                !left.contains(&format!("SECRET-{s}")),
+                "{name}: SECRET-{s} left"
+            );
+        }
+        let check = json(&run_in(&dir, &[copy.to_str().unwrap(), "--json"]));
+        assert_eq!(check["files"][0]["variant"], ext, "{name}");
+        assert_eq!(check["files"][0]["warnings"], serde_json::json!([]));
+        for id in [
+            "metadata",
+            "comments",
+            "custom-data",
+            "macros",
+            "leftover-data",
+            "signatures",
+        ] {
+            let c = check["files"][0]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap();
+            assert_eq!(c["status"], "none_found", "{name}: {id}");
+        }
+    }
+}
+
+/// A macro document with a VBA project, an ActiveX control in the text, a custom ribbon, a
+/// package signature and document variables.
+fn macro_docm() -> Vec<u8> {
+    let body = "<w:p><w:r><w:object><w:control r:id=\"rId6\" w:name=\"CheckBox1\"/></w:object></w:r></w:p>";
+    let settings = format!(
+        "<w:settings xmlns:w=\"{W}\"><w:docVars><w:docVar w:name=\"Client\" w:val=\"SECRET-mac-var-1\"/></w:docVars></w:settings>"
+    );
+    let ms = "http://schemas.microsoft.com/office";
+    Pkg::new("docm")
+        .body(&doc_xml(body))
+        .part("word/document.xml", "rId1", "settings", "word/settings.xml", &format!("{OX}.wordprocessingml.settings+xml"), settings.as_bytes())
+        .part("word/document.xml", "rId5", &format!("{ms}/2006/relationships/vbaProject"), "word/vbaProject.bin", "application/vnd.ms-office.vbaProject", b"\xCC\x61SECRET-mac-vba-1")
+        .part("word/vbaProject.bin", "rId1", &format!("{ms}/2006/relationships/wordVbaData"), "word/vbaData.xml", "application/vnd.ms-word.vbaData+xml", b"<wne:vbaSuppData xmlns:wne=\"http://schemas.microsoft.com/office/word/2006/wordml\"><wne:mcds><wne:mcd wne:macroName=\"SECRET-mac-name-1\"/></wne:mcds></wne:vbaSuppData>")
+        .part("word/document.xml", "rId6", "control", "word/activeX/activeX1.xml", "application/vnd.ms-office.activeX+xml", b"<ax:ocx xmlns:ax=\"http://schemas.microsoft.com/office/2006/activeX\" ax:classid=\"{8BD21D40}\" ax:name=\"SECRET-mac-ax-1\"/>")
+        .part("", "rId7", &format!("{ms}/2007/relationships/ui/extensibility"), "customUI/customUI14.xml", "", b"<customUI xmlns=\"http://schemas.microsoft.com/office/2009/07/customui\" onLoad=\"SECRET-mac-ui-1\"/>")
+        .part("", "rId8", &format!("{PKG_RELS}/digital-signature/origin"), "_xmlsignatures/origin.sigs", "application/vnd.openxmlformats-package.digital-signature-origin", b"")
+        .part("_xmlsignatures/origin.sigs", "rId1", &format!("{PKG_RELS}/digital-signature/signature"), "_xmlsignatures/sig1.xml", "application/vnd.openxmlformats-package.digital-signature-xmlsignature+xml", b"<Signature xmlns=\"http://www.w3.org/2000/09/xmldsig#\">SECRET-mac-sig-1</Signature>")
+        .zip()
+}
+
+#[test]
+fn macros_go_with_the_macro_type_unless_kept() {
+    let dir = dir("clean-macros");
+    put(&dir, &[("m.docm", &macro_docm())]);
+    assert_eq!(
+        copy_secrets(&dir.join("m.docm")).len(),
+        6,
+        "{:?}",
+        copy_secrets(&dir.join("m.docm"))
+    );
+    let out = run_in(&dir, &["clean", "m.docm"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "m.docm → m.clean.docx\n  removed  custom-data (1 field), macros (2 parts, 1 object), signatures (1 signature)\n  changed  Macros were removed, so the copy is .docx.\n           The digital signature was removed; no signature survives a change.\n  ✓ re-checked: 14 checks, nothing left\n"
+    );
+    assert_eq!(copy_secrets(&dir.join("m.clean.docx")).len(), 0);
+    let copy = unzip(&fs::read(dir.join("m.clean.docx")).unwrap());
+    let doc = String::from_utf8(
+        copy.iter()
+            .find(|e| e.0 == "word/document.xml")
+            .unwrap()
+            .1
+            .clone(),
+    )
+    .unwrap();
+    assert!(doc.contains("<w:object/>"), "{doc}");
+    let types = String::from_utf8(copy[0].1.clone()).unwrap();
+    assert!(
+        types.contains("wordprocessingml.document.main+xml"),
+        "{types}"
+    );
+    let out = run_in(&dir, &["clean", "m.docm", "--keep", "macros", "--json"]);
+    let f = &json(&out)["files"][0];
+    assert_eq!(f["output"], "m.clean.docm");
+    assert_eq!(f["kept"], serde_json::json!(["macros"]));
+    let left = copy_secrets(&dir.join("m.clean.docm"));
+    assert_eq!(
+        left.into_iter().collect::<Vec<_>>(),
+        [
+            "SECRET-mac-ax-1",
+            "SECRET-mac-name-1",
+            "SECRET-mac-ui-1",
+            "SECRET-mac-vba-1"
+        ]
+    );
+}

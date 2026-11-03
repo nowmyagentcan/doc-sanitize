@@ -284,6 +284,43 @@ impl Draft {
         Ok(())
     }
 
+    /// The XML parts but relationships and content types.
+    pub fn xml_parts(&self) -> Vec<String> {
+        let mut names = self.names();
+        names.retain(|n| !n.to_ascii_lowercase().ends_with(".rels") && self.is_xml(n));
+        names
+    }
+
+    /// Removes the elements of `part` that `pick` picks (see [`El::prune`]) and the
+    /// relationships only they named; the sweep then takes the parts nothing else reaches.
+    pub fn prune_linked(&mut self, part: &str, pick: impl Fn(&El) -> bool) -> Result<usize, Error> {
+        let Some(mut doc) = self.doc(part)? else {
+            return Ok(0);
+        };
+        let before = ids(&doc.root);
+        let n = doc.root.prune(&pick);
+        if n == 0 {
+            return Ok(0);
+        }
+        self.set(part, doc.write());
+        let after = ids(&doc.root);
+        for id in before.difference(&after) {
+            self.unlink(part, id)?;
+        }
+        Ok(n)
+    }
+
+    /// Deletes every part that a relationship of type `short` reaches.
+    pub fn delete_linked(&mut self, short: &str) -> Result<usize, Error> {
+        let links = self.linked(short)?;
+        for l in &links {
+            if let Some(p) = &l.part {
+                self.delete(p)?;
+            }
+        }
+        Ok(links.len())
+    }
+
     /// The parts reachable from the package's relationships.
     pub fn reachable(&self) -> Result<HashSet<String>, Error> {
         let mut seen = HashSet::new();
@@ -433,14 +470,44 @@ pub struct Cleaned {
     pub changes: Vec<Change>,
 }
 
+/// The relationship ids an element and everything in it name.
+fn ids(root: &El) -> HashSet<String> {
+    let mut out = HashSet::new();
+    root.each(&mut |e| {
+        out.extend(
+            e.attrs
+                .iter()
+                .filter(|a| &*a.ns == ns::R && !a.declares())
+                .map(|a| a.value.clone()),
+        )
+    });
+    out
+}
+
+/// What clean can't remove yet: (check, kind, what it is).
+const NOT_YET: [(CheckId, &str); 2] = [
+    (CheckId::Macros, "macro_sheet"),
+    (CheckId::Macros, "dde_field"),
+];
+
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 1] = [CheckId::LeftoverData];
+const CLEANABLE: [CheckId; 6] = [
+    CheckId::Metadata,
+    CheckId::Comments,
+    CheckId::CustomData,
+    CheckId::Macros,
+    CheckId::LeftoverData,
+    CheckId::Signatures,
+];
 
 /// Why each check in `remove` can't be removed: (check, reason, hint).
 fn blocking(found: &[Finding], remove: &[CheckId]) -> Vec<(CheckId, String, String)> {
     let mut out = vec![];
     for &c in remove {
-        if found.iter().any(|f| f.check == c) && !CLEANABLE.contains(&c) {
+        let not_yet = found
+            .iter()
+            .any(|f| f.check == c && NOT_YET.iter().any(|n| n.0 == c && n.1 == f.kind));
+        if found.iter().any(|f| f.check == c) && (!CLEANABLE.contains(&c) || not_yet) {
             out.push((
                 c,
                 "this version can't remove it yet".into(),
@@ -460,8 +527,28 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     let ctx = Ctx::new(pkg, false)?;
     let before: HashSet<String> = pkg.parts.iter().map(|p| key(p)).collect();
     let mut d = Draft::new(pkg)?;
+    let has = |c: CheckId| remove.contains(&c) && found.iter().any(|f| f.check == c);
+    if remove.contains(&CheckId::Macros) {
+        macros(&mut d)?;
+    }
+    if has(CheckId::Signatures) {
+        d.delete_linked("origin")?;
+        d.changes.push(Change::new(
+            "signatures_removed",
+            "The digital signature was removed; no signature survives a change.",
+        ));
+    }
+    if has(CheckId::Comments) {
+        comments(&ctx, &mut d)?;
+    }
+    if has(CheckId::CustomData) {
+        custom_data(&mut d)?;
+    }
+    if has(CheckId::Metadata) {
+        metadata(&mut d)?;
+    }
     let leftovers = remove.contains(&CheckId::LeftoverData);
-    if leftovers {
+    if leftovers && has(CheckId::LeftoverData) {
         leftover_data(&ctx, &mut d, found)?;
     }
     d.sweep(leftovers, &before)?;
@@ -474,6 +561,197 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
         variant,
         changes,
     })
+}
+
+/// The non-macro variant of each macro-enabled one.
+const MACRO_FREE: [(&str, &str); 7] = [
+    ("docm", "docx"),
+    ("dotm", "dotx"),
+    ("xlsm", "xlsx"),
+    ("xltm", "xltx"),
+    ("pptm", "pptx"),
+    ("potm", "potx"),
+    ("ppsm", "ppsx"),
+];
+
+const VML: &str = "urn:schemas-microsoft-com:vml";
+const VML_EXCEL: &str = "urn:schemas-microsoft-com:office:excel";
+const P188: &str = "http://schemas.microsoft.com/office/powerpoint/2018/8/main";
+
+/// `macros`: VBA projects, custom ribbons and ActiveX controls; a macro-enabled main part
+/// becomes the plain type of its kind, and the copy takes that extension.
+fn macros(d: &mut Draft) -> Result<(), Error> {
+    d.delete_linked("vbaProject")?;
+    d.delete_linked("extensibility")?;
+    let controls =
+        |e: &El| e.is(ns::W, "control") || e.is(ns::S, "controls") || e.is(ns::P, "controls");
+    for part in d.xml_parts() {
+        d.prune_linked(&part, controls)?;
+    }
+    d.delete_linked("control")?;
+    if let Some(&(_, plain)) = MACRO_FREE.iter().find(|m| m.0 == d.variant) {
+        let (ct, ..) = MAIN_TYPES
+            .iter()
+            .find(|t| t.2 == plain)
+            .expect("every plain variant has a type");
+        let main = d.main.clone();
+        d.set_type(&main, ct);
+        d.variant = plain;
+        d.changes.push(Change::new(
+            "extension_changed",
+            format!("Macros were removed, so the copy is .{plain}."),
+        ));
+    }
+    Ok(())
+}
+
+/// `comments`: comment and author parts, and what points at them in the text.
+fn comments(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    match d.format {
+        Format::Docx => {
+            let marks = |e: &El| {
+                e.is(ns::W, "commentRangeStart")
+                    || e.is(ns::W, "commentRangeEnd")
+                    || (e.is(ns::W, "r") && e.child(ns::W, "commentReference").is_some())
+            };
+            for part in word::stories(ctx) {
+                d.prune_linked(part, marks)?;
+            }
+            for short in [
+                "comments",
+                "commentsExtended",
+                "commentsIds",
+                "commentsExtensible",
+                "people",
+                "documenttasks",
+            ] {
+                d.delete_linked(short)?;
+            }
+        }
+        Format::Xlsx => {
+            for short in ["comments", "threadedComment", "person"] {
+                d.delete_linked(short)?;
+            }
+            for l in d.linked("vmlDrawing")? {
+                let vml = l.part.unwrap_or_default();
+                let note = |e: &El| {
+                    e.is(VML, "shape")
+                        && e.child(VML_EXCEL, "ClientData")
+                            .is_some_and(|c| c.attr("", "ObjectType") == Some("Note"))
+                };
+                let left = match d.doc(&vml) {
+                    Ok(Some(mut doc)) => {
+                        doc.root.prune(&note);
+                        let left = doc.root.has(&|e: &El| e.is(VML, "shape"));
+                        d.set(&vml, doc.write());
+                        left
+                    }
+                    _ => false,
+                };
+                if !left {
+                    let id = l.rel.id.clone();
+                    d.prune_linked(&l.source, |e| {
+                        e.is(ns::S, "legacyDrawing") && e.attr(ns::R, "id") == Some(&id)
+                    })?;
+                }
+            }
+        }
+        _ => {
+            for short in ["comments", "commentAuthors", "authors"] {
+                d.delete_linked(short)?;
+            }
+            for slide in &ctx.slides {
+                d.prune_linked(slide, |e| {
+                    e.local() == "ext" && e.child(P188, "commentRel").is_some()
+                })?;
+                d.edit(slide, |root| Ok(empty_extensions(root) > 0))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes `ext` elements left with nothing in them, then empty `extLst`s.
+fn empty_extensions(root: &mut El) -> usize {
+    let empty = |local: &'static str| move |e: &El| e.local() == local && e.els().next().is_none();
+    root.prune(&empty("ext")) + root.prune(&empty("extLst"))
+}
+
+/// `custom-data`: custom XML parts, data bindings, document variables, tags, add-in data,
+/// scenarios and custom sheet properties.
+fn custom_data(d: &mut Draft) -> Result<(), Error> {
+    d.delete_linked("customXml")?;
+    d.delete_linked("webextensiontaskpanes")?;
+    d.delete_linked("webextension")?;
+    let pick = |e: &El| {
+        e.is(ns::W, "dataBinding")
+            || e.is(ns::W, "docVars")
+            || e.is(ns::P, "tags")
+            || e.is(ns::S, "scenarios")
+            || e.is(ns::S, "customProperties")
+    };
+    for part in d.xml_parts() {
+        d.prune_linked(&part, pick)?;
+    }
+    let empty_tags = |e: &El| e.is(ns::P, "custDataLst") && e.els().next().is_none();
+    for part in d.xml_parts() {
+        d.prune_linked(&part, empty_tags)?;
+    }
+    d.delete_linked("tags")?;
+    Ok(())
+}
+
+/// `metadata`: the property, label, thumbnail and printer settings parts, tracking ids and
+/// editor names.
+fn metadata(d: &mut Draft) -> Result<(), Error> {
+    for short in [
+        "core-properties",
+        "extended-properties",
+        "custom-properties",
+        "classificationlabels",
+        "thumbnail",
+        "printerSettings",
+        "revisionInfo",
+    ] {
+        d.delete_linked(short)?;
+    }
+    let format = d.format;
+    for part in d.xml_parts() {
+        d.edit(&part, |root| {
+            let mut n = 0;
+            match format {
+                Format::Docx => {
+                    root.each_mut(&mut |e| {
+                        n += e.drop_attrs(|a| &*a.ns == ns::W && a.local().starts_with("rsid"))
+                    });
+                    n += root.prune(&|e: &El| {
+                        e.is(ns::W, "rsids")
+                            || e.is(ns::W14, "docId")
+                            || e.is(ns::W15, "docId")
+                            || e.is(ns::W, "permStart")
+                            || e.is(ns::W, "permEnd")
+                    });
+                }
+                Format::Xlsx => {
+                    root.each_mut(&mut |e| {
+                        n += e.drop_attrs(|a| &*a.ns == ns::XR && a.local() == "uid");
+                        if e.is(ns::S, "fileSharing") {
+                            n += e.drop_attrs(|a| a.name == "userName");
+                        }
+                    });
+                    n += root.prune(&|e: &El| e.is(ns::XR, "revisionPtr"));
+                }
+                _ => {
+                    n += root.prune(&|e: &El| e.is(ns::P14, "creationId"));
+                    if n > 0 {
+                        empty_extensions(root);
+                    }
+                }
+            }
+            Ok(n > 0)
+        })?;
+    }
+    Ok(())
 }
 
 /// `leftover-data`: the glossary and unused shared strings; the sweep takes the rest.
