@@ -1,0 +1,593 @@
+//! The report every face prints: what each check found in each file, as one JSON shape.
+
+use serde::{Serialize, Serializer};
+
+/// The checks, in the order every `checks` array and every report lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckId {
+    Metadata,
+    Comments,
+    TrackedChanges,
+    HiddenText,
+    FakeRedactions,
+    HiddenLayers,
+    HiddenSheets,
+    HiddenRowsColumns,
+    HiddenSlides,
+    SpeakerNotes,
+    HiddenObjects,
+    EmbeddedFiles,
+    CustomData,
+    Macros,
+    ExternalLinks,
+    ImageMetadata,
+    CroppedImages,
+    PivotCaches,
+    OldRevisions,
+    LeftoverData,
+    Signatures,
+    FormData,
+}
+
+/// Each check's id and the line `--help` gives it, in check order.
+pub const CHECKS: [(&str, &str); 22] = [
+    (
+        "metadata",
+        "properties, author names, thumbnails, editing ids",
+    ),
+    ("comments", "comments and annotations, and their authors"),
+    (
+        "tracked-changes",
+        "insertions and deletions (with the deleted text), shared-workbook logs",
+    ),
+    (
+        "hidden-text",
+        "hidden, white, tiny, clipped or off-page text",
+    ),
+    (
+        "fake-redactions",
+        "text still under black boxes, images or unapplied redaction marks",
+    ),
+    ("hidden-layers", "PDF layers that are switched off"),
+    ("hidden-sheets", "hidden and very hidden sheets"),
+    (
+        "hidden-rows-columns",
+        "hidden rows and columns that hold values",
+    ),
+    ("hidden-slides", "slides hidden from the show"),
+    ("speaker-notes", "notes under slides"),
+    ("hidden-objects", "hidden shapes, and shapes off the slide"),
+    (
+        "embedded-files",
+        "attachments, OLE objects, chart workbooks",
+    ),
+    (
+        "custom-data",
+        "custom XML, document variables, tags, add-in data",
+    ),
+    (
+        "macros",
+        "VBA, ActiveX, Excel 4.0 sheets, DDE fields, PDF scripts and actions",
+    ),
+    (
+        "external-links",
+        "paths to local or network files, templates, data connections",
+    ),
+    ("image-metadata", "EXIF, GPS, XMP and comments in pictures"),
+    ("cropped-images", "picture areas hidden by cropping"),
+    ("pivot-caches", "pivot table source data and data models"),
+    ("old-revisions", "earlier saved versions inside a PDF"),
+    (
+        "leftover-data",
+        "unused objects, orphan parts, bytes outside the file",
+    ),
+    (
+        "signatures",
+        "digital signatures (any change breaks them, so clean removes them)",
+    ),
+    ("form-data", "XFA forms and values of hidden form fields"),
+];
+
+impl CheckId {
+    pub fn id(self) -> &'static str {
+        CHECKS[self as usize].0
+    }
+}
+
+impl Serialize for CheckId {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.id())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    Pdf,
+    Docx,
+    Xlsx,
+    Pptx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Found,
+    NoneFound,
+    Error,
+}
+
+/// Where a finding is. Every field is a place in the file's structure, never a found value.
+#[derive(Debug, Default, Serialize)]
+pub struct Where {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Finding {
+    pub check: CheckId,
+    pub kind: &'static str,
+    #[serde(rename = "where")]
+    pub place: Where,
+    pub count: u64,
+    pub unit: &'static str,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CheckResult {
+    pub id: CheckId,
+    pub status: Status,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Warning {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// A file that couldn't be checked, or a usage error. Messages name the file as `{name}`
+/// until [`Error::named`] fills it in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Error {
+    pub code: &'static str,
+    pub message: String,
+    pub hint: String,
+}
+
+const REPORT_BUG: &str =
+    "Run again with --debug and report it at https://github.com/nowmyagentcan/doc-sanitize/issues.";
+const NEW_COPY: &str = "Open it in the app that made it and save a new copy.";
+
+impl Error {
+    fn new(code: &'static str, message: impl Into<String>, hint: &str) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            hint: hint.into(),
+        }
+    }
+
+    /// The message with the file's name in place of `{name}`.
+    pub fn named(mut self, name: &str) -> Self {
+        self.message = self.message.replacen("{name}", name, 1);
+        self
+    }
+
+    pub fn not_found() -> Self {
+        Self::new("not_found", "Can't find {name}.", "Check the path.")
+    }
+
+    pub fn unreadable(reason: impl std::fmt::Display) -> Self {
+        let message = format!("Can't read {{name}}: {}.", safe(&reason.to_string()));
+        Self::new("unreadable", message, "Check that you can open the file.")
+    }
+
+    pub fn unsupported_format() -> Self {
+        Self::new(
+            "unsupported_format",
+            "{name} isn't a PDF, Word, Excel or PowerPoint file.",
+            "doc-sanitize reads .pdf, .docx, .xlsx and .pptx files, and their macro and template versions.",
+        )
+    }
+
+    pub fn empty_folder() -> Self {
+        Self::new(
+            "unsupported_format",
+            "No PDF, Word, Excel or PowerPoint files in {name}.",
+            "Pass files directly, or use -r for subfolders.",
+        )
+    }
+
+    pub fn legacy_office() -> Self {
+        Self::new(
+            "legacy_office",
+            "{name} is an older Office file (.doc, .xls or .ppt).",
+            "Save it as .docx, .xlsx or .pptx in Office, then check the new file.",
+        )
+    }
+
+    pub fn strict() -> Self {
+        Self::new(
+            "unsupported_variant",
+            "{name} is saved as Strict Open XML, which this version can't read.",
+            "Save it in Office as a normal .docx, .xlsx or .pptx.",
+        )
+    }
+
+    pub fn xlsb() -> Self {
+        Self::new(
+            "unsupported_variant",
+            "{name} is a binary Excel workbook (.xlsb).",
+            "Save it as .xlsx in Excel.",
+        )
+    }
+
+    pub fn office_password() -> Self {
+        Self::new(
+            "password_required",
+            "{name} is password-protected.",
+            "Remove the password in Office (File › Info › Protect), save, and check again.",
+        )
+    }
+
+    pub fn damaged(reason: &str) -> Self {
+        Self::new(
+            "damaged",
+            format!("{{name}} is damaged: {reason}."),
+            NEW_COPY,
+        )
+    }
+
+    /// `damaged` because a part is not well-formed XML.
+    pub fn bad_xml(part: &str) -> Self {
+        Self::damaged(&format!("part {} isn't valid XML", safe(part)))
+    }
+
+    pub fn ambiguous(how: &str) -> Self {
+        Self::new(
+            "ambiguous_file",
+            format!("{{name}} is ambiguous: {how}."),
+            "This file may have been altered to hide content. Ask for a fresh copy.",
+        )
+    }
+
+    pub fn two_versions(part: &str) -> Self {
+        Self {
+            message: format!(
+                "{{name}} holds two different versions of {}, so apps may show either one.",
+                safe(part)
+            ),
+            ..Self::ambiguous("")
+        }
+    }
+
+    pub fn too_large(what: &str, limit: &str) -> Self {
+        Self::new(
+            "too_large",
+            format!("{{name}} is too large to check ({what} is over {limit})."),
+            "Check a smaller copy, or split the file.",
+        )
+    }
+
+    pub fn internal() -> Self {
+        Self::new(
+            "internal",
+            "Something went wrong inside doc-sanitize while reading {name}.",
+            REPORT_BUG,
+        )
+    }
+
+    pub fn usage(message: impl Into<String>, hint: &str) -> Self {
+        Self::new("usage", message, hint)
+    }
+
+    pub fn exit_code(&self) -> u8 {
+        match self.code {
+            "usage" => 2,
+            "internal" | "write_failed" => 3,
+            _ => 1,
+        }
+    }
+
+    /// A usage error as `--json` prints it.
+    pub fn to_json(&self) -> String {
+        #[derive(Serialize)]
+        struct Usage<'a> {
+            error: &'a Error,
+        }
+        serde_json::to_string_pretty(&Usage { error: self }).expect("an error always serialises")
+    }
+}
+
+/// One checked file.
+#[derive(Debug, Serialize)]
+pub struct FileResult {
+    pub path: String,
+    pub format: Option<Format>,
+    pub variant: Option<&'static str>,
+    pub status: Status,
+    pub checks: Vec<CheckResult>,
+    pub findings: Vec<Finding>,
+    pub warnings: Vec<Warning>,
+    pub error: Option<Error>,
+}
+
+impl FileResult {
+    /// A file whose checks ran: `ran` lists them in check order, `findings` holds what they
+    /// found in any order.
+    pub fn checked(
+        path: String,
+        format: Format,
+        variant: &'static str,
+        ran: &[CheckId],
+        mut findings: Vec<Finding>,
+        warnings: Vec<Warning>,
+    ) -> Self {
+        findings.sort_by_key(|f| f.check);
+        let checks: Vec<_> = ran
+            .iter()
+            .map(|&id| {
+                let count = findings.iter().filter(|f| f.check == id).count();
+                let status = if count > 0 {
+                    Status::Found
+                } else {
+                    Status::NoneFound
+                };
+                CheckResult { id, status, count }
+            })
+            .collect();
+        let status = if findings.is_empty() {
+            Status::NoneFound
+        } else {
+            Status::Found
+        };
+        Self {
+            path,
+            format: Some(format),
+            variant: Some(variant),
+            status,
+            checks,
+            findings,
+            warnings,
+            error: None,
+        }
+    }
+
+    /// A file that couldn't be checked; the error's `{name}` becomes `path`.
+    pub fn failed(path: String, error: Error) -> Self {
+        Self {
+            error: Some(error.named(&path)),
+            path,
+            format: None,
+            variant: None,
+            status: Status::Error,
+            checks: vec![],
+            findings: vec![],
+            warnings: vec![],
+        }
+    }
+
+    /// 0 when every check is complete and found nothing, 3 for an internal error, else 1.
+    pub fn exit_code(&self) -> u8 {
+        match &self.error {
+            Some(e) => e.exit_code(),
+            None if self.status == Status::NoneFound => 0,
+            None => 1,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct Summary {
+    pub files: usize,
+    pub with_findings: usize,
+    pub incomplete: usize,
+    pub failed: usize,
+}
+
+/// The whole run, as `--json` prints it.
+#[derive(Debug, Serialize)]
+pub struct Report<'a> {
+    pub version: &'static str,
+    pub command: &'static str,
+    pub files: &'a [FileResult],
+    pub summary: Summary,
+}
+
+impl<'a> Report<'a> {
+    pub fn check(files: &'a [FileResult]) -> Self {
+        let count = |s| files.iter().filter(|f| f.status == s).count();
+        Self {
+            version: env!("CARGO_PKG_VERSION"),
+            command: "check",
+            files,
+            summary: Summary {
+                files: files.len(),
+                with_findings: count(Status::Found),
+                // No check can be incomplete yet: the rendered PDF checks bring the first.
+                incomplete: 0,
+                failed: count(Status::Error),
+            },
+        }
+    }
+}
+
+/// `s` safe for a terminal: control characters (tab and newline aside) and the bidi controls
+/// that can disguise text as `<U+XXXX>`.
+pub fn safe(s: &str) -> String {
+    s.chars().map(shown).collect()
+}
+
+fn shown(c: char) -> String {
+    match c {
+        '\n' | '\t' => c.into(),
+        '\0'..='\x1F'
+        | '\x7F'..='\u{9F}'
+        | '\u{61C}'
+        | '\u{200E}'
+        | '\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}' => format!("<U+{:04X}>", c as u32),
+        c => c.into(),
+    }
+}
+
+/// A found value as `--show-values` prints it: terminal-safe, at most 200 characters, cut on a
+/// character boundary with `…`.
+pub fn value(s: &str) -> String {
+    const MAX: usize = 200;
+    let shown: Vec<String> = s.chars().map(shown).collect();
+    if shown.iter().map(|t| t.chars().count()).sum::<usize>() <= MAX {
+        return shown.concat();
+    }
+    let mut out = String::new();
+    let mut len = 0;
+    for t in shown {
+        len += t.chars().count();
+        if len > MAX - 1 {
+            break;
+        }
+        out += &t;
+    }
+    out + "…"
+}
+
+/// `n` with thousands separators: 1284 → `1,284`.
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// `1 string`, `2 strings`, `1,284 strings`.
+pub fn plural(n: u64, word: &str) -> String {
+    format!("{} {word}{}", thousands(n), if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(check: CheckId, part: Option<&str>, value: Option<&str>) -> Finding {
+        Finding {
+            check,
+            kind: "orphan_parts",
+            place: Where {
+                part: part.map(Into::into),
+            },
+            count: 1,
+            unit: "parts",
+            detail: "1 part that nothing in the file links to".into(),
+            value: value.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn json_keeps_spec_key_order_and_leaves_out_empty_fields() {
+        let file = FileResult::checked(
+            "a.docx".into(),
+            Format::Docx,
+            "docm",
+            &[CheckId::LeftoverData],
+            vec![finding(CheckId::LeftoverData, None, None)],
+            vec![],
+        );
+        let files = [file];
+        let json = serde_json::to_string(&Report::check(&files)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"version":"0.1.0","command":"check","files":[{"path":"a.docx","format":"docx","variant":"docm","status":"found","checks":[{"id":"leftover-data","status":"found","count":1}],"findings":[{"check":"leftover-data","kind":"orphan_parts","where":{},"count":1,"unit":"parts","detail":"1 part that nothing in the file links to"}],"warnings":[],"error":null}],"summary":{"files":1,"with_findings":1,"incomplete":0,"failed":0}}"#
+        );
+    }
+
+    #[test]
+    fn a_failed_file_names_itself_and_has_no_checks() {
+        let f = FileResult::failed("x.odt".into(), Error::unsupported_format());
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["format"], serde_json::Value::Null);
+        assert_eq!(json["status"], "error");
+        assert_eq!(
+            json["error"]["message"],
+            "x.odt isn't a PDF, Word, Excel or PowerPoint file."
+        );
+        assert_eq!(f.exit_code(), 1);
+        let f = FileResult::failed("{name}.docx".into(), Error::internal());
+        assert_eq!(
+            f.error.as_ref().unwrap().message,
+            "Something went wrong inside doc-sanitize while reading {name}.docx."
+        );
+        assert_eq!(f.exit_code(), 3);
+    }
+
+    #[test]
+    fn values_and_parts_are_found_and_the_status_follows() {
+        let none = FileResult::checked(
+            "a.pptx".into(),
+            Format::Pptx,
+            "pptx",
+            &[CheckId::LeftoverData],
+            vec![],
+            vec![],
+        );
+        assert_eq!((none.status, none.exit_code()), (Status::NoneFound, 0));
+        let f = finding(CheckId::LeftoverData, Some("ppt/x.bin"), Some("v"));
+        assert_eq!(
+            serde_json::to_string(&f).unwrap(),
+            r#"{"check":"leftover-data","kind":"orphan_parts","where":{"part":"ppt/x.bin"},"count":1,"unit":"parts","detail":"1 part that nothing in the file links to","value":"v"}"#
+        );
+    }
+
+    #[test]
+    fn usage_errors_print_as_one_error_object() {
+        let e = Error::usage("No file given.", "Try: doc-sanitize contract.docx");
+        assert_eq!(
+            e.to_json(),
+            "{\n  \"error\": {\n    \"code\": \"usage\",\n    \"message\": \"No file given.\",\n    \"hint\": \"Try: doc-sanitize contract.docx\"\n  }\n}"
+        );
+        assert_eq!(e.exit_code(), 2);
+    }
+
+    #[test]
+    fn controls_and_bidi_characters_show_as_code_points() {
+        assert_eq!(
+            safe("a\x1b[31m\r\0\x7f\u{9b}\u{202e}b\u{61c}\u{2069}\tc\n"),
+            "a<U+001B>[31m<U+000D><U+0000><U+007F><U+009B><U+202E>b<U+061C><U+2069>\tc\n"
+        );
+        assert_eq!(safe("Grüße 東京 ✓"), "Grüße 東京 ✓");
+    }
+
+    #[test]
+    fn values_are_cut_at_200_characters() {
+        assert_eq!(value("short"), "short");
+        let exact = "é".repeat(200);
+        assert_eq!(value(&exact), exact);
+        let cut = value(&"é".repeat(201));
+        assert_eq!(cut.chars().count(), 200);
+        assert!(cut.ends_with("é…"));
+        let cut = value(&"\u{1}".repeat(100));
+        assert_eq!(cut.chars().count(), 193);
+        assert!(cut.ends_with("<U+0001>…"));
+    }
+
+    #[test]
+    fn numbers_get_thousands_separators() {
+        let shown: Vec<_> = [0, 7, 999, 1000, 1284, 1_000_000]
+            .map(thousands)
+            .into_iter()
+            .collect();
+        assert_eq!(shown, ["0", "7", "999", "1,000", "1,284", "1,000,000"]);
+        assert_eq!(plural(1, "string"), "1 string");
+        assert_eq!(plural(4096, "byte"), "4,096 bytes");
+    }
+}
