@@ -17,7 +17,7 @@ use super::{
     part_name, powerpoint, rels_name, resolve, revisions, word,
 };
 use crate::pictures;
-use crate::report::{Change, CheckId, Error, Finding, Format, counted, safe};
+use crate::report::{Change, CheckId, Cleaned, Error, Finding, Format, counted, safe};
 use quick_xml::events::Event;
 
 const TYPES: &str = "[Content_Types].xml";
@@ -532,13 +532,6 @@ impl Draft {
     }
 }
 
-/// A cleaned copy.
-pub struct Cleaned {
-    pub bytes: Vec<u8>,
-    pub variant: &'static str,
-    pub changes: Vec<Change>,
-}
-
 /// The relationship ids an element and everything in it name.
 fn ids(root: &El) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -749,6 +742,7 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
         bytes: d.finish()?,
         variant,
         changes,
+        ..Cleaned::default()
     })
 }
 

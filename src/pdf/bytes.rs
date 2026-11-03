@@ -319,9 +319,8 @@ fn bodies(pdf: &[u8]) -> Vec<(u32, usize)> {
     out
 }
 
-/// Objects that nothing reachable from the trailer refers to, leaving out the file's own
-/// machinery (cross-reference and object streams, the linearization dictionary and hints).
-fn unused_objects(doc: &Document) -> usize {
+/// The objects reachable from the trailer.
+pub(super) fn reachable(doc: &Document) -> HashSet<ObjectId> {
     let mut seen = HashSet::new();
     let mut pending: Vec<&Object> = doc.trailer.iter().map(|(_, v)| v).collect();
     while let Some(o) = pending.pop() {
@@ -339,6 +338,13 @@ fn unused_objects(doc: &Document) -> usize {
             _ => {}
         }
     }
+    seen
+}
+
+/// Objects that nothing reachable from the trailer refers to, leaving out the file's own
+/// machinery (cross-reference and object streams, the linearization dictionary and hints).
+fn unused_objects(doc: &Document) -> usize {
+    let seen = reachable(doc);
     doc.objects
         .iter()
         .filter(|(id, o)| {

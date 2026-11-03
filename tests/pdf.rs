@@ -442,12 +442,42 @@ fn earlier_revisions_name_what_changed_after_them() {
     assert_eq!(pdf_kinds(&f, "leftover-data"), []);
 }
 
-#[test]
-fn leftovers_are_found_in_the_bytes_and_the_objects() {
+/// A one-page PDF with a ZIP after its end, and the ZIP.
+fn polyglot() -> (Vec<u8>, Vec<u8>) {
     let mut polyglot = one_page(&text_at(72, 720, "Front"));
     let zip = zip(&package("docx", &[], &[]));
     polyglot.extend(&zip);
     polyglot.extend(b"\n\0\n");
+    (polyglot, zip)
+}
+
+/// An object body in the bytes that no cross-reference table lists, an object nothing uses,
+/// and an image the page never draws.
+fn unlisted() -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut objects = raw_page("/Resources << /XObject << /Im1 5 0 R >> >> /Contents 6 0 R");
+    objects.push((5, stream_body("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\0")));
+    objects.push((6, stream_body("", b"q Q")));
+    objects.push((7, b"(SECRET-pdf-unused-1)".to_vec()));
+    let at = write_objects(&mut out, &objects);
+    write_objects(&mut out, &[(9, b"(SECRET-pdf-unlisted-1)".to_vec())]);
+    let xref = out.len();
+    out.extend(b"xref\n0 8\n0000000000 65535 f \n");
+    for n in 1..8u32 {
+        match objects.iter().position(|o| o.0 == n) {
+            Some(i) => out.extend(format!("{:010} 00000 n \n", at[i]).as_bytes()),
+            None => out.extend(b"0000000000 65535 f \n"),
+        }
+    }
+    out.extend(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+#[test]
+fn leftovers_are_found_in_the_bytes_and_the_objects() {
+    let (polyglot, zip) = polyglot();
     let f = check_pdf("polyglot.pdf", &polyglot, &[]);
     // The ZIP ends in zeros (an empty comment length), which aren't counted.
     let size = zip.iter().rposition(|&b| b != 0).unwrap() + 1;
@@ -469,27 +499,7 @@ fn leftovers_are_found_in_the_bytes_and_the_objects() {
         )]
     );
 
-    // An object body in the bytes that no cross-reference table lists, an object nothing
-    // uses, and an image the page never draws.
-    let mut out = b"%PDF-1.7\n".to_vec();
-    let mut objects = raw_page("/Resources << /XObject << /Im1 5 0 R >> >> /Contents 6 0 R");
-    objects.push((5, stream_body("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\0")));
-    objects.push((6, stream_body("", b"q Q")));
-    objects.push((7, b"(SECRET-pdf-unused-1)".to_vec()));
-    let at = write_objects(&mut out, &objects);
-    write_objects(&mut out, &[(9, b"(SECRET-pdf-unlisted-1)".to_vec())]);
-    let xref = out.len();
-    out.extend(b"xref\n0 8\n0000000000 65535 f \n");
-    for n in 1..8u32 {
-        match objects.iter().position(|o| o.0 == n) {
-            Some(i) => out.extend(format!("{:010} 00000 n \n", at[i]).as_bytes()),
-            None => out.extend(b"0000000000 65535 f \n"),
-        }
-    }
-    out.extend(
-        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
-    );
-    let f = check_pdf("unlisted.pdf", &out, &[]);
+    let f = check_pdf("unlisted.pdf", &unlisted(), &[]);
     assert_eq!(
         pdf_kinds(&f, "leftover-data"),
         [
@@ -849,4 +859,308 @@ fn write_pdf_fixtures() {
     for (name, bytes) in files {
         std::fs::write(out.join(name), bytes).unwrap();
     }
+}
+
+/// Cleans `bytes` saved as `name`, with `args`: the file's JSON entry and the copy's bytes.
+fn clean_pdf(name: &str, bytes: &[u8], args: &[&str]) -> (serde_json::Value, Vec<u8>) {
+    let dir = dir("pdf-clean");
+    put(&dir, &[(name, bytes)]);
+    let out = run_in(&dir, &[&["clean", name, "--json"], args].concat());
+    let f = json(&out)["files"][0].clone();
+    let copy = f["output"]
+        .as_str()
+        .map_or(vec![], |o| std::fs::read(dir.join(o)).unwrap());
+    (f, copy)
+}
+
+/// What every cleaned PDF is: one revision, no /Info unless `info`, no /Encrypt, a new /ID.
+fn assert_rewritten(copy: &[u8], input: &[u8], info: bool) -> lopdf::Document {
+    assert_eq!(copy.windows(9).filter(|w| w == b"startxref").count(), 1);
+    assert_eq!(copy.windows(5).filter(|w| w == b"%%EOF").count(), 1);
+    let doc = lopdf::Document::load_mem(copy).unwrap();
+    assert_eq!(doc.trailer.has(b"Info"), info);
+    assert!(!doc.trailer.has(b"Encrypt") && !doc.trailer.has(b"Prev"));
+    let id = doc.trailer.get(b"ID").unwrap().as_array().unwrap();
+    assert_eq!(id.len(), 2);
+    let was = lopdf::Document::load_mem(input).ok();
+    assert_ne!(
+        Some(id),
+        was.as_ref()
+            .and_then(|d| d.trailer.get(b"ID").ok()?.as_array().ok())
+    );
+    doc
+}
+
+/// The planted secrets in a PDF's bytes and in every stream decoded.
+fn pdf_secrets(copy: &[u8]) -> Vec<String> {
+    let mut found = secrets_in(copy);
+    let doc = lopdf::Document::load_mem(copy).unwrap();
+    for o in doc.objects.values() {
+        if let lopdf::Object::Stream(s) = o
+            && let Ok(plain) = s.decompressed_content()
+        {
+            found.extend(secrets_in(&plain));
+        }
+    }
+    found
+}
+
+/// The ids of the checks that found something.
+fn found_ids(f: &serde_json::Value) -> Vec<String> {
+    f["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "found")
+        .map(|c| c["id"].as_str().unwrap().into())
+        .collect()
+}
+
+#[test]
+fn structure_leaks_go_and_what_shows_stays() {
+    let input = leaky_structure();
+    let (f, copy) = clean_pdf("leaky.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(f["recheck"]["status"], "none_found", "{f}");
+    let codes: Vec<_> = f["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| &c["code"])
+        .collect();
+    assert_eq!(codes, ["signatures_removed"]);
+    let doc = assert_rewritten(&copy, &input, false);
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    let page = doc.page_iter().next().unwrap();
+    let text = doc.extract_text(&[1]).unwrap();
+    assert!(text.contains("Visible text"), "{text}");
+    // The web link stays, with the widget of the field whose value went.
+    let dict = doc.get_dictionary(page).unwrap();
+    let annots = dict.get(b"Annots").unwrap().as_array().unwrap();
+    let links = annots
+        .iter()
+        .filter_map(|a| {
+            a.as_reference()
+                .ok()
+                .map_or(a.as_dict().ok(), |id| doc.get_dictionary(id).ok())
+        })
+        .filter(|a| a.get(b"Subtype").and_then(lopdf::Object::as_name).ok() == Some(b"Link"))
+        .count();
+    assert_eq!(links, 1, "{annots:?}");
+    assert!(!dict.has(b"PieceInfo") && !dict.has(b"Thumb"));
+    let catalog = doc.catalog().unwrap();
+    for key in [
+        b"OpenAction".as_slice(),
+        b"Perms",
+        b"AF",
+        b"Collection",
+        b"Metadata",
+    ] {
+        assert!(!catalog.has(key));
+    }
+}
+
+#[test]
+fn the_jpeg_in_a_pdf_keeps_its_scan_and_length() {
+    let mut b = PdfBuilder::new();
+    let image = b.stream(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+        },
+        &jpeg(&[0x010F, 0x8825], b""),
+    );
+    b.page_with(
+        "q 10 0 0 10 50 50 cm /Im1 Do Q
+",
+        dictionary! { "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image } } },
+    );
+    let input = b.bytes();
+    let (f, copy) = clean_pdf("photo.pdf", &input, &["--keep", "image-metadata"]);
+    assert_eq!(f["kept"], serde_json::json!(["image-metadata"]), "{f}");
+    assert!(copy.windows(4).any(|w| w == b"Exif"));
+    let (f, copy) = clean_pdf("photo.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    let image = doc
+        .objects
+        .values()
+        .find_map(|o| o.as_stream().ok().filter(|s| s.dict.has_type(b"XObject")))
+        .unwrap();
+    assert_eq!(
+        image.dict.get(b"Length").unwrap().as_i64().unwrap() as usize,
+        image.content.len()
+    );
+    assert_eq!(
+        doc_sanitize::pictures::metadata(&image.content),
+        Some(vec![])
+    );
+    assert!(
+        image
+            .content
+            .ends_with(&[0xFF, 0xDA, 0, 2, 0x12, 0x34, 0xFF, 0xD9])
+    );
+}
+
+#[test]
+fn every_kept_pdf_check_survives() {
+    let input = leaky_structure();
+    let ids = found_ids(&check_pdf("leaky.pdf", &input, &[]));
+    assert!(ids.len() >= 8, "{ids:?}");
+    // The fixture's picture is drawn nowhere, so it goes as a leftover whatever is kept.
+    let not_keepable = ["signatures", "old-revisions", "image-metadata"];
+    for id in ids.iter().filter(|i| !not_keepable.contains(&i.as_str())) {
+        let (f, copy) = clean_pdf("leaky.pdf", &input, &["--keep", id]);
+        assert_eq!(f["status"], "cleaned", "{id}: {f}");
+        assert_eq!(f["kept"], serde_json::json!([id]), "{id}");
+        let left = found_ids(&check_pdf("copy.pdf", &copy, &[]));
+        assert_eq!(left, [id.as_str()], "{id}");
+    }
+}
+
+#[test]
+fn old_revisions_and_outside_bytes_never_survive() {
+    let input = incremental();
+    let (f, copy) = clean_pdf("incremental.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_rewritten(&copy, &input, false);
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+
+    let (input, _) = polyglot();
+    let (f, copy) = clean_pdf("polyglot.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert!(copy.ends_with(b"%%EOF"));
+    assert_rewritten(&copy, &input, false);
+
+    let input = unlisted();
+    let (f, copy) = clean_pdf("unlisted.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    let doc = assert_rewritten(&copy, &input, false);
+    let image = |o: &lopdf::Object| o.as_stream().is_ok_and(|s| s.dict.has_type(b"XObject"));
+    assert!(!doc.objects.values().any(image));
+
+    // Kept leftovers: what nothing used stays; the unlisted body can't survive a rewrite.
+    let (f, copy) = clean_pdf("unlisted.pdf", &input, &["--keep", "leftover-data"]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(pdf_secrets(&copy), ["SECRET-pdf-unused-1"]);
+    assert_eq!(f["kept"], serde_json::json!(["leftover-data"]));
+}
+
+#[test]
+fn encrypted_files_lose_their_password_with_a_warning() {
+    let input = aes256("owner-secret", "");
+    let (f, copy) = clean_pdf("owner.pdf", &input, &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let w = &f["warnings"][0];
+    assert_eq!(w["code"], "encryption_removed");
+    assert_eq!(
+        w["message"],
+        "The copy has no password or permission settings; the original had them."
+    );
+    assert_rewritten(&copy, &input, false);
+    let input = aes256("o", "open-sesame");
+    let (f, copy) = clean_pdf("user.pdf", &input, &["--password", "open-sesame"]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(f["warnings"][0]["code"], "encryption_removed");
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    assert!(doc.extract_text(&[1]).unwrap().contains("Locked away"));
+}
+
+/// A PDF/A file (with PDF/UA when `ua`) whose XMP also names its author.
+fn pdfa(ua: bool) -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.page(&text_at(72, 720, "Archived"));
+    let ua = if ua { " pdfuaid:part=\"1\"" } else { "" };
+    let xmp = format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\" pdfaid:part=\"2\" pdfaid:conformance=\"B\"{ua}><dc:creator><rdf:Seq><rdf:li>SECRET-pdf-pdfa-1</rdf:li></rdf:Seq></dc:creator></rdf:Description></rdf:RDF></x:xmpmeta>"
+    );
+    let meta = b.stream(
+        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        xmp.as_bytes(),
+    );
+    b.catalog = dictionary! { "Metadata" => meta };
+    b.bytes()
+}
+
+#[test]
+fn a_pdfa_file_keeps_only_its_identification() {
+    let (f, copy) = clean_pdf("a.pdf", &pdfa(false), &[]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(f["warnings"], serde_json::json!([]));
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    let meta = doc.catalog().unwrap().get(b"Metadata").unwrap();
+    let stream = doc
+        .get_object(meta.as_reference().unwrap())
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    assert!(!stream.dict.has(b"Filter"));
+    let xmp = String::from_utf8(stream.content.clone()).unwrap();
+    assert!(
+        xmp.contains("pdfaid:part=\"2\"") && xmp.contains("pdfaid:conformance=\"B\""),
+        "{xmp}"
+    );
+    let (f, _) = clean_pdf("ua.pdf", &pdfa(true), &[]);
+    assert_eq!(f["warnings"][0]["code"], "pdfa_title_removed");
+}
+
+#[test]
+fn a_dynamic_xfa_form_leaves_no_file() {
+    let mut b = PdfBuilder::new();
+    b.page(&text_at(72, 720, "Please wait"));
+    b.catalog = dictionary! {
+        "NeedsRendering" => true,
+        "AcroForm" => dictionary! {
+            "Fields" => Vec::<lopdf::Object>::new(),
+            "XFA" => lopdf::Object::string_literal("<xdp/>"),
+        },
+    };
+    let input = b.bytes();
+    let (f, _) = clean_pdf("xfa.pdf", &input, &[]);
+    assert_eq!(f["status"], "not_cleaned", "{f}");
+    assert_eq!(f["output"], serde_json::Value::Null);
+    assert_eq!(f["error"]["code"], "cannot_clean");
+    assert_eq!(
+        f["error"]["message"],
+        "Can't remove form-data from xfa.pdf: it is a dynamic XFA form."
+    );
+    let (f, _) = clean_pdf("xfa.pdf", &input, &["--keep", "form-data"]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+}
+
+#[test]
+fn a_comment_over_text_a_kept_check_found_stays() {
+    let square = dictionary! {
+        "Type" => "Annot", "Subtype" => "Square",
+        "Rect" => vec![60.into(), 700.into(), 300.into(), 740.into()],
+        "T" => lopdf::Object::string_literal("Sam Sample"),
+    };
+    let elsewhere = dictionary! {
+        "Type" => "Annot", "Subtype" => "Text",
+        "Rect" => vec![400.into(), 100.into(), 420.into(), 120.into()],
+        "Contents" => lopdf::Object::string_literal("SECRET-pdf-note-1"),
+    };
+    let mut b = PdfBuilder::new();
+    b.page_with(
+        &format!(
+            "{}0 g 60 700 240 40 re f\n",
+            text_at(72, 720, "Under the box")
+        ),
+        dictionary! { "Annots" => vec![square.into(), elsewhere.into()] },
+    );
+    let input = b.bytes();
+    let (f, copy) = clean_pdf("a.pdf", &input, &["--keep", "fake-redactions"]);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert_eq!(
+        f["kept"],
+        serde_json::json!(["comments", "fake-redactions"]),
+        "{f}"
+    );
+    assert_eq!(pdf_secrets(&copy), Vec::<String>::new());
+    let doc = lopdf::Document::load_mem(&copy).unwrap();
+    let page = doc.page_iter().next().unwrap();
+    let annots = doc.get_dictionary(page).unwrap().get(b"Annots").unwrap();
+    assert_eq!(annots.as_array().unwrap().len(), 1);
 }

@@ -11,12 +11,11 @@ use std::sync::Once;
 use std::thread;
 
 use crate::input::{self, Kind};
-use crate::office::clean::Cleaned;
 use crate::office::{self, Package};
 use crate::pdf;
 use crate::report::{
-    CheckId, CleanResult, CleanStatus, Error, FileResult, Format, Recheck, Status, Warning,
-    removed, safe,
+    CheckId, CleanResult, CleanStatus, Cleaned, Error, FileResult, Format, Recheck, Status,
+    Warning, removed, safe,
 };
 
 const WORKER: &str = "doc-sanitize-worker";
@@ -53,7 +52,7 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
 
 /// A file opened for its checks.
 enum Opened<'b> {
-    Pdf,
+    Pdf(Box<pdf::Pdf>),
     Office(Box<Package<'b>>),
 }
 
@@ -74,7 +73,8 @@ fn examine<'b>(
                 warnings.push(Warning::repaired());
             }
             let found = pdf::check(&pdf, bytes, options.show_values);
-            (Format::Pdf, "pdf", &pdf::CHECKS, found, Opened::Pdf)
+            let opened = Opened::Pdf(Box::new(pdf));
+            (Format::Pdf, "pdf", &pdf::CHECKS, found, opened)
         }
         Kind::Zip => {
             let pkg = Package::open(bytes)?;
@@ -153,11 +153,7 @@ pub fn clean(path: &Path, options: &CleanOptions) -> (CleanResult, Option<String
         let remove: Vec<CheckId> = ran.iter().copied().filter(|c| !keep.contains(c)).collect();
         let cleaned = match opened {
             Opened::Office(pkg) => office::clean::clean(&pkg, &checked.findings, &remove),
-            Opened::Pdf => Err(Error::cannot_clean(&[(
-                CheckId::Metadata,
-                "this version can't clean PDF files yet".into(),
-                "Check it with doc-sanitize check instead.".into(),
-            )])),
+            Opened::Pdf(pdf) => pdf::clean::clean(&pdf, &checked.findings, &remove),
         };
         let cleaned = match cleaned {
             Ok(c) => c,
@@ -178,9 +174,10 @@ fn conclude(
     path: &Path,
     checked: FileResult,
     keep: &[CheckId],
-    cleaned: Cleaned,
+    mut cleaned: Cleaned,
     options: &CleanOptions,
 ) -> CleanResult {
+    let keep = &[keep, &cleaned.kept].concat();
     let recheck = match examine(&checked.path, None, &cleaned.bytes, &options.check) {
         Ok((copy, _)) => Recheck::of(copy, keep),
         Err(_) => return CleanResult::failed(checked, Error::internal()),
@@ -196,10 +193,15 @@ fn conclude(
             _ => CleanStatus::Cleaned,
         },
         removed: removed(&checked.findings, keep),
-        kept: keep.iter().copied().filter(found).collect(),
+        kept: checked
+            .checks
+            .iter()
+            .map(|c| c.id)
+            .filter(|c| keep.contains(c) && found(c))
+            .collect(),
         changes: cleaned.changes,
         recheck: None,
-        warnings: checked.warnings,
+        warnings: [checked.warnings, std::mem::take(&mut cleaned.warnings)].concat(),
         error: None,
     };
     let error = match recheck.findings.first() {
@@ -389,7 +391,7 @@ trailer
         let held = Cleaned {
             bytes: bytes.to_vec(),
             variant: "pdf",
-            changes: vec![],
+            ..Cleaned::default()
         };
         let r = conclude(&input, checked, &[], held, &options);
         assert_eq!(r.status, CleanStatus::NotCleaned);

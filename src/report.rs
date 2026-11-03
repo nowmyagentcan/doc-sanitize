@@ -301,7 +301,18 @@ pub struct CheckResult {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// A cleaned copy, before the re-check.
+#[derive(Default)]
+pub struct Cleaned {
+    pub bytes: Vec<u8>,
+    pub variant: &'static str,
+    pub changes: Vec<Change>,
+    pub warnings: Vec<Warning>,
+    /// Checks the clean had to leave in place beyond the kept ones.
+    pub kept: Vec<CheckId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Warning {
     pub code: &'static str,
     pub message: String,
@@ -312,6 +323,23 @@ impl Warning {
         Self {
             code: "repaired",
             message: "The file's cross-reference table was damaged and was rebuilt; other apps may show different content.".into(),
+        }
+    }
+
+    pub fn encryption_removed() -> Self {
+        Self {
+            code: "encryption_removed",
+            message: "The copy has no password or permission settings; the original had them."
+                .into(),
+        }
+    }
+
+    pub fn pdfa_title_removed() -> Self {
+        Self {
+            code: "pdfa_title_removed",
+            message:
+                "The copy is still marked PDF/A, but its title was removed, which PDF/UA requires."
+                    .into(),
         }
     }
 }

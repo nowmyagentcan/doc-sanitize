@@ -1,6 +1,7 @@
 //! PDF files: opening them with lopdf under limits on objects, pages and decoded streams.
 
 mod bytes;
+pub mod clean;
 mod layers;
 mod visible;
 
@@ -28,6 +29,8 @@ pub struct Pdf {
     pub password: String,
     /// lopdf rebuilt its cross-reference table.
     pub repaired: bool,
+    /// It had /Encrypt, with or without a user password.
+    pub encrypted: bool,
 }
 
 /// Opens `bytes`: the empty password first, then `password`. Every stream must decode within
@@ -45,6 +48,7 @@ pub fn open(bytes: &[u8], password: Option<&str>) -> Result<Pdf, Error> {
     };
     let mut doc = load(None).map_err(load_error)?;
     let mut used = String::new();
+    let encrypted = doc.trailer.has(b"Encrypt") || doc.was_encrypted();
     if doc.trailer.has(b"Encrypt") {
         handler(&doc)?;
         let password = password.ok_or_else(Error::pdf_password)?;
@@ -69,6 +73,7 @@ pub fn open(bytes: &[u8], password: Option<&str>) -> Result<Pdf, Error> {
         pages: pages(&doc)?,
         repaired: doc.xref_recovery.is_some(),
         password: used,
+        encrypted,
         doc,
     })
 }
@@ -759,6 +764,7 @@ fn triggers<'a>(c: &Ctx<'a>, d: &'a Dictionary) -> Vec<&'a Object> {
 
 /// A terminal form field with its inherited type and value, and its widgets.
 struct Field<'a> {
+    id: Option<ObjectId>,
     dict: &'a Dictionary,
     kind: &'a [u8],
     value: Option<&'a Object>,
@@ -799,6 +805,7 @@ fn form_fields<'a>(c: &Ctx<'a>) -> Vec<Field<'a>> {
                 own.push((o.as_reference().ok(), dict));
             }
             fields.push(Field {
+                id: o.as_reference().ok(),
                 dict,
                 kind,
                 value,
@@ -1025,6 +1032,91 @@ fn xobjects<'a>(c: &Ctx<'a>, r: &'a Dictionary) -> Vec<(*const Dictionary, Vec<u
         .dict(r, b"XObject")
         .map(|x| x.iter().map(|(k, _)| (key, k.clone())));
     names.into_iter().flatten().collect()
+}
+
+/// The XObject names `content` and the forms it draws reach with `Do`, keyed by the resources
+/// that name them.
+fn drawn<'a>(
+    c: &Ctx<'a>,
+    content: &[u8],
+    resources: Option<&'a Dictionary>,
+) -> HashSet<(*const Dictionary, Vec<u8>)> {
+    let mut drawn = HashSet::new();
+    walk(c, content, resources, &mut |op, resources| {
+        if let Some(r) = resources
+            && op.operator == "Do"
+            && let Some(name) = op.operands.first().and_then(|o| o.as_name().ok())
+        {
+            drawn.insert((std::ptr::from_ref(r), name.to_vec()));
+        }
+    });
+    drawn
+}
+
+/// Each page whose resources name XObjects it never draws, with resources of its own that
+/// name only what it draws (other pages may share the ones it has).
+fn undrawn_on_pages(c: &Ctx) -> Vec<(ObjectId, Dictionary)> {
+    let mut out = vec![];
+    for &id in &c.pdf.pages {
+        let Ok(page) = c.doc().get_dictionary(id) else {
+            continue;
+        };
+        let (Some(content), Some(r)) = (page_content(c, page), page_resources(c, page)) else {
+            continue;
+        };
+        let Some(named) = c.dict(r, b"XObject") else {
+            continue;
+        };
+        let drawn = drawn(c, &content, Some(r));
+        let is_drawn = |k: &Vec<u8>| drawn.contains(&(std::ptr::from_ref(r), k.clone()));
+        if named.iter().all(|(k, _)| is_drawn(k)) {
+            continue;
+        }
+        let mut kept = Dictionary::new();
+        for (k, v) in named.iter().filter(|(k, _)| is_drawn(k)) {
+            kept.set(k.clone(), v.clone());
+        }
+        let mut own = r.clone();
+        own.set("XObject", kept);
+        out.push((id, own));
+    }
+    out
+}
+
+/// Each form with resources of its own (shared with no page) and the XObject names they hold
+/// that its content never draws.
+fn undrawn_in_forms(c: &Ctx) -> Vec<(ObjectId, Vec<Vec<u8>>)> {
+    let on_pages: HashSet<*const Dictionary> = c
+        .pages()
+        .filter_map(|(_, p)| page_resources(c, p))
+        .map(std::ptr::from_ref)
+        .collect();
+    let mut out = vec![];
+    for (&id, o) in &c.doc().objects {
+        let Object::Stream(s) = o else { continue };
+        let Some(r) = c.dict(&s.dict, b"Resources") else {
+            continue;
+        };
+        if subtype(&s.dict) != b"Form" || on_pages.contains(&std::ptr::from_ref(r)) {
+            continue;
+        }
+        let (Some(named), Ok(content)) = (
+            c.dict(r, b"XObject"),
+            s.decompressed_content_with_limit(STREAM_LIMIT),
+        ) else {
+            continue;
+        };
+        let drawn = drawn(c, &content, Some(r));
+        let names: Vec<_> = named
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !drawn.contains(&(std::ptr::from_ref(r), k.clone())))
+            .collect();
+        if !names.is_empty() {
+            out.push((id, names));
+        }
+    }
+    out
 }
 
 /// `page 3`, `pages 1 and 4`, `pages 1, 4 and 9`.
