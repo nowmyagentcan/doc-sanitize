@@ -9,6 +9,7 @@ pub mod common;
 pub mod drawing;
 pub mod excel;
 pub mod powerpoint;
+pub mod revisions;
 pub mod tree;
 pub mod word;
 pub mod xml;

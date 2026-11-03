@@ -506,3 +506,102 @@ fn macros_go_with_the_macro_type_unless_kept() {
         ]
     );
 }
+
+/// The text of each paragraph of a Word part, in order.
+fn paragraphs(xml: &[u8]) -> Vec<String> {
+    use quick_xml::events::Event;
+    let mut r = quick_xml::Reader::from_reader(xml);
+    let (mut out, mut text) = (vec![], false);
+    loop {
+        match r.read_event().unwrap() {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "w:p" => {
+                out.push(String::new())
+            }
+            Event::Start(e) if e.name().as_ref() == "w:t" => text = true,
+            Event::End(e) if e.name().as_ref() == "w:t" => text = false,
+            Event::Text(t) if text => *out.last_mut().unwrap() += &t.xml10_content(),
+            Event::Eof => return out,
+            _ => {}
+        }
+    }
+}
+
+/// A part of the copy at `path`.
+fn part_of(path: &std::path::Path, name: &str) -> Vec<u8> {
+    let entries = unzip(&fs::read(path).unwrap());
+    entries.into_iter().find(|e| e.0 == name).unwrap().1
+}
+
+#[test]
+fn tracked_changes_are_accepted_as_word_does() {
+    let dir = dir("clean-tracked");
+    put(&dir, &[("a.docx", &leaky_docx("docx"))]);
+    let keep =
+        "hidden-text,fake-redactions,embedded-files,external-links,image-metadata,cropped-images";
+    let out = run_in(&dir, &["clean", "a.docx", "--keep", keep]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("tracked-changes (7 changes)"),
+        "{}",
+        stdout(&out)
+    );
+    let copy = dir.join("a.clean.docx");
+    assert_eq!(
+        paragraphs(&part_of(&copy, "word/document.xml")),
+        [
+            "Agreement between the parties.",
+            "The fee is due monthly.",
+            "Payment termsSECRET-docx-ins-1MovedSECRET-docx-move-1",
+            "Visible SECRET-docx-vanish-1",
+            "SECRET-docx-vanish-2",
+            "SECRET-docx-white-1",
+            "SECRET-docx-black-1",
+            "Kept",
+            "Bound client",
+            "[picture]",
+            "",
+            "",
+        ]
+    );
+    let doc = String::from_utf8(part_of(&copy, "word/document.xml")).unwrap();
+    assert!(
+        doc.contains("<w:tcPr><w:gridSpan w:val=\"2\"/></w:tcPr>"),
+        "{doc}"
+    );
+    assert!(!doc.contains("SECRET-docx-del-1"));
+}
+
+#[test]
+fn shared_workbook_logs_are_deleted() {
+    let ss = "application/vnd.openxmlformats-officedocument.spreadsheetml";
+    let book = workbook(&[("Sheet1", "visible", &sheet_xml(""))])
+        .part("xl/workbook.xml", "rId8", "revisionHeaders", "xl/revisions/revisionHeaders.xml", &format!("{ss}.revisionHeaders+xml"), format!("<headers xmlns=\"{S}\" xmlns:r=\"{R}\" guid=\"{{1}}\"><header guid=\"{{2}}\" dateTime=\"2026-01-01T00:00:00\" userName=\"Sam Sample\" r:id=\"rId1\"/></headers>").as_bytes())
+        .part("xl/revisions/revisionHeaders.xml", "rId1", "revisionLog", "xl/revisions/revisionLog1.xml", &format!("{ss}.revisionLog+xml"), format!("<revisions xmlns=\"{S}\"><rcc rId=\"1\" sId=\"1\"><nc r=\"A1\" t=\"inlineStr\"><is><t>SECRET-log-1</t></is></nc></rcc></revisions>").as_bytes())
+        .part("xl/workbook.xml", "rId9", "usernames", "xl/revisions/userNames.xml", &format!("{ss}.userNames+xml"), format!("<users xmlns=\"{S}\" count=\"1\"><userInfo guid=\"{{3}}\" name=\"SECRET-log-2\" id=\"1\" dateTime=\"2026-01-01T00:00:00\"/></users>").as_bytes())
+        .zip();
+    let dir = dir("clean-shared");
+    put(&dir, &[("a.xlsx", &book)]);
+    let out = run_in(&dir, &["clean", "a.xlsx"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("removed  tracked-changes (3 parts)"));
+    assert!(copy_secrets(&dir.join("a.clean.xlsx")).is_empty());
+}
+
+#[test]
+fn a_change_that_cant_be_accepted_leaves_no_file() {
+    let body = format!(
+        "<w:p><w:ins w:id=\"1\" {BY_SAM}><w:r><w:t>new</w:t></w:r></w:ins><w:r><w:delText>stray</w:delText></w:r></w:p>"
+    );
+    let dir = dir("clean-stray");
+    put(
+        &dir,
+        &[("a.docx", &Pkg::new("docx").body(&doc_xml(&body)).zip())],
+    );
+    let out = run_in(&dir, &["clean", "a.docx"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "✗ Can't remove tracked-changes from a.docx: a kind of change this version can't accept (w:delText in word/document.xml).\n  Accept all changes in Word (Review › Accept › Accept All Changes), save, and run clean again, or use --keep tracked-changes.\n"
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+}

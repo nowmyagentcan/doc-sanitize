@@ -13,9 +13,9 @@ use super::common::rels_source;
 use super::tree::{Doc, El, Node};
 use super::{
     CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, excel, key, ns, part_name,
-    rels_name, resolve, word,
+    rels_name, resolve, revisions, word,
 };
-use crate::report::{Change, CheckId, Error, Finding, Format};
+use crate::report::{Change, CheckId, Error, Finding, Format, safe};
 
 const TYPES: &str = "[Content_Types].xml";
 
@@ -491,9 +491,10 @@ const NOT_YET: [(CheckId, &str); 2] = [
 ];
 
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 6] = [
+const CLEANABLE: [CheckId; 7] = [
     CheckId::Metadata,
     CheckId::Comments,
+    CheckId::TrackedChanges,
     CheckId::CustomData,
     CheckId::Macros,
     CheckId::LeftoverData,
@@ -540,6 +541,9 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     }
     if has(CheckId::Comments) {
         comments(&ctx, &mut d)?;
+    }
+    if has(CheckId::TrackedChanges) {
+        tracked_changes(&ctx, &mut d)?;
     }
     if has(CheckId::CustomData) {
         custom_data(&mut d)?;
@@ -666,6 +670,38 @@ fn comments(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                 })?;
                 d.edit(slide, |root| Ok(empty_extensions(root) > 0))?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// `tracked-changes`: every change in a Word file accepted; a workbook's shared-workbook logs
+/// deleted.
+fn tracked_changes(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    if d.format == Format::Xlsx {
+        d.delete_linked("revisionHeaders")?;
+        d.delete_linked("usernames")?;
+        return Ok(());
+    }
+    for short in ["styles", "numbering"] {
+        for l in d.linked(short)? {
+            let part = l.part.unwrap_or_default();
+            d.edit(&part, |root| Ok(revisions::accept_properties(root) > 0))?;
+        }
+    }
+    for part in word::stories(ctx) {
+        let mut left = None;
+        d.edit(part, |root| {
+            revisions::accept(root);
+            left = revisions::leftover(root);
+            Ok(true)
+        })?;
+        if let Some(name) = left {
+            return Err(Error::cannot_clean(&[(
+                CheckId::TrackedChanges,
+                format!("a kind of change this version can't accept ({name} in {})", safe(part)),
+                "Accept all changes in Word (Review › Accept › Accept All Changes), save, and run clean again, or use --keep tracked-changes.".into(),
+            )]));
         }
     }
     Ok(())
