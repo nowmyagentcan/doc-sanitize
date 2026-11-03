@@ -114,12 +114,25 @@ pub enum Format {
 pub enum Status {
     Found,
     NoneFound,
+    Incomplete,
     Error,
 }
 
 /// Where a finding is. Every field is a place in the file's structure, never a found value.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Where {
+    /// 1-based page number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<usize>,
+    /// `[x0, y0, x1, y1]` in points in the page's default user space, rounded to 0.1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[f64; 4]>,
+    /// A PDF object as `"12 0"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    /// 1-based PDF revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
     /// 1-based position in the workbook's sheet list.
@@ -139,6 +152,30 @@ pub struct Where {
 }
 
 impl Where {
+    /// On page `n`.
+    pub fn page(n: usize) -> Self {
+        Self {
+            page: Some(n),
+            ..Self::default()
+        }
+    }
+
+    /// At the PDF object `number generation`.
+    pub fn object((number, generation): (u32, u16)) -> Self {
+        Self {
+            object: Some(format!("{number} {generation}")),
+            ..Self::default()
+        }
+    }
+
+    /// Named by the property or key `name`.
+    pub fn field(name: &str) -> Self {
+        Self {
+            field: Some(safe(name)),
+            ..Self::default()
+        }
+    }
+
     /// In the part `name`.
     pub fn part(name: &str) -> Self {
         Self {
@@ -147,22 +184,23 @@ impl Where {
         }
     }
 
-    /// How people read the place: `slide 2`, `sheet Summary, F1:F40`, `sheet 3`, the field,
-    /// or the part when there is no slide or sheet.
+    /// How people read the place: `page 3`, `slide 2`, `sheet Summary, F1:F40`, `sheet 3`,
+    /// `revision 1`, `object 12 0`, the field, or the part when there is no page, slide or
+    /// sheet.
     pub fn shown(&self) -> String {
         let sheet = match (&self.sheet, self.sheet_index) {
             (Some(name), _) => Some(format!("sheet {name}")),
             (None, Some(i)) => Some(format!("sheet {i}")),
             _ => None,
         };
-        let part = self
-            .part
-            .clone()
-            .filter(|_| self.slide.is_none() && self.sheet_index.is_none());
+        let part = self.part.clone().filter(|_| position(self) == 0);
         [
+            self.page.map(|p| format!("page {p}")),
             self.slide.map(|s| format!("slide {s}")),
             sheet,
             self.cells.clone(),
+            self.revision.map(|r| format!("revision {r}")),
+            self.object.as_ref().map(|o| format!("object {o}")),
             self.field.clone(),
             part,
         ]
@@ -213,9 +251,9 @@ impl Finding {
     }
 }
 
-/// The order of a finding's place: slide or sheet first.
-fn position(f: &Finding) -> usize {
-    f.place.slide.or(f.place.sheet_index).unwrap_or(0)
+/// The page, slide or sheet a place is on; 0 for the file as a whole.
+fn position(w: &Where) -> usize {
+    w.page.or(w.slide).or(w.sheet_index).unwrap_or(0)
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +261,9 @@ pub struct CheckResult {
     pub id: CheckId,
     pub status: Status,
     pub count: usize,
+    /// Why the check couldn't look at everything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -443,25 +484,39 @@ impl FileResult {
         variant: &'static str,
         ran: &[CheckId],
         mut findings: Vec<Finding>,
+        incomplete: &[(CheckId, String)],
         warnings: Vec<Warning>,
     ) -> Self {
-        findings.sort_by_key(|f| (f.check, position(f)));
+        findings.sort_by_key(|f| (f.check, position(&f.place)));
         let checks: Vec<_> = ran
             .iter()
             .map(|&id| {
                 let count = findings.iter().filter(|f| f.check == id).count();
-                let status = if count > 0 {
-                    Status::Found
-                } else {
-                    Status::NoneFound
+                let notes: Vec<_> = incomplete
+                    .iter()
+                    .filter(|n| n.0 == id)
+                    .map(|n| n.1.as_str())
+                    .collect();
+                let note = (!notes.is_empty()).then(|| notes.join("; "));
+                let status = match (count, &note) {
+                    (1.., _) => Status::Found,
+                    (0, Some(_)) => Status::Incomplete,
+                    (0, None) => Status::NoneFound,
                 };
-                CheckResult { id, status, count }
+                CheckResult {
+                    id,
+                    status,
+                    count,
+                    note,
+                }
             })
             .collect();
-        let status = if findings.is_empty() {
-            Status::NoneFound
-        } else {
+        let status = if !findings.is_empty() {
             Status::Found
+        } else if checks.iter().any(|c| c.note.is_some()) {
+            Status::Incomplete
+        } else {
+            Status::NoneFound
         };
         Self {
             path,
@@ -526,8 +581,7 @@ impl<'a> Report<'a> {
             summary: Summary {
                 files: files.len(),
                 with_findings: count(Status::Found),
-                // No check can be incomplete yet: the rendered PDF checks bring the first.
-                incomplete: 0,
+                incomplete: count(Status::Incomplete),
                 failed: count(Status::Error),
             },
         }
@@ -624,6 +678,7 @@ mod tests {
             "docm",
             &[CheckId::LeftoverData],
             vec![finding(CheckId::LeftoverData, None, None)],
+            &[],
             vec![],
         );
         let files = [file];
@@ -661,9 +716,30 @@ mod tests {
             "pptx",
             &[CheckId::LeftoverData],
             vec![],
+            &[],
             vec![],
         );
         assert_eq!((none.status, none.exit_code()), (Status::NoneFound, 0));
+        let notes = [
+            (CheckId::HiddenText, "page 2: why".to_string()),
+            (CheckId::HiddenText, "page 5: why not".to_string()),
+        ];
+        let ran = [CheckId::Metadata, CheckId::HiddenText];
+        let part = FileResult::checked(
+            "a.pdf".into(),
+            Format::Pdf,
+            "pdf",
+            &ran,
+            vec![],
+            &notes,
+            vec![],
+        );
+        assert_eq!((part.status, part.exit_code()), (Status::Incomplete, 1));
+        assert_eq!(
+            serde_json::to_string(&part.checks).unwrap(),
+            r#"[{"id":"metadata","status":"none_found","count":0},{"id":"hidden-text","status":"incomplete","count":0,"note":"page 2: why; page 5: why not"}]"#
+        );
+        assert_eq!(Report::check(&[part]).summary.incomplete, 1);
         let f = finding(CheckId::LeftoverData, Some("ppt/x.bin"), Some("v"));
         assert_eq!(
             serde_json::to_string(&f).unwrap(),
@@ -724,6 +800,18 @@ mod tests {
             ..Where::part("ppt/slides/slide2.xml")
         };
         assert_eq!(at(slide), "slide 2");
+        let page = Where {
+            bbox: Some([72.0, 640.2, 210.5, 652.0]),
+            part: Some("ignored".into()),
+            ..Where::page(3)
+        };
+        assert_eq!(at(page), "page 3");
+        let revision = Where {
+            revision: Some(1),
+            ..Where::object((12, 0))
+        };
+        assert_eq!(at(revision), "revision 1, object 12 0");
+        assert_eq!(at(Where::field("/Info")), "/Info");
         assert_eq!(at(Where::default()), "");
     }
 

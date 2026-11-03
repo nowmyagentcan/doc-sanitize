@@ -38,24 +38,23 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
     let result = on_worker(|| {
         let bytes = input::load(path)?;
         let mut warnings = vec![];
-        let (format, variant, ran, findings): (_, _, Vec<CheckId>, _) = match input::sniff(&bytes)?
-        {
+        let (format, variant, ran, found): (_, _, &[CheckId], _) = match input::sniff(&bytes)? {
             Kind::Pdf => {
                 let pdf = pdf::open(&bytes, options.password.as_deref())?;
                 if pdf.repaired {
                     warnings.push(Warning::repaired());
                 }
-                (Format::Pdf, "pdf", vec![], vec![])
+                let found = pdf::check(&pdf, options.show_values);
+                (Format::Pdf, "pdf", &pdf::CHECKS, found)
             }
             Kind::Zip => {
                 let pkg = Package::open(&bytes)?;
-                let found = office::check(&pkg, options.show_values)?;
-                (
-                    pkg.format,
-                    pkg.variant,
-                    office::checks(pkg.format).to_vec(),
-                    found,
-                )
+                let findings = office::check(&pkg, options.show_values)?;
+                let found = pdf::Found {
+                    findings,
+                    incomplete: vec![],
+                };
+                (pkg.format, pkg.variant, office::checks(pkg.format), found)
             }
         };
         if let Some(w) = mismatch(&name, path, variant) {
@@ -65,8 +64,9 @@ pub fn check(path: &Path, options: &Options) -> (FileResult, Option<String>) {
             name.clone(),
             format,
             variant,
-            &ran,
-            findings,
+            ran,
+            found.findings,
+            &found.incomplete,
             warnings,
         ))
     });

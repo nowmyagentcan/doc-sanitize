@@ -205,3 +205,141 @@ pub fn write_objects(out: &mut Vec<u8>, objects: &[(u32, Vec<u8>)]) -> Vec<usize
         })
         .collect()
 }
+
+/// A PDF whose structure leaks: properties, XMP, comments, attachments, scripts, actions,
+/// links to local files, signatures, form data and a JPEG with EXIF and GPS. Every planted
+/// value starts with `SECRET-pdf-`.
+pub fn leaky_structure() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let xmp = b.stream(
+        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:CreatorTool=\"SECRET-pdf-tool-1\"><dc:creator><rdf:Seq><rdf:li>SECRET-pdf-xmp-1</rdf:li></rdf:Seq></dc:creator></rdf:Description></rdf:RDF></x:xmpmeta>",
+    );
+    let jpeg = super::jpeg(&[0x010F, 0x8825], b"");
+    let image = b.stream(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+            "Metadata" => xmp,
+        },
+        &jpeg,
+    );
+    let file = b.stream(
+        dictionary! { "Type" => "EmbeddedFile" },
+        b"SECRET-pdf-file-1",
+    );
+    let spec = |b: &mut PdfBuilder, name: &str| {
+        b.add(dictionary! {
+            "Type" => "Filespec", "F" => Object::string_literal(name),
+            "EF" => dictionary! { "F" => file },
+        })
+    };
+    let attached = spec(&mut b, "SECRET-pdf-attached-1.txt");
+    let on_note = spec(&mut b, "SECRET-pdf-note-file-1.txt");
+    let script = b.add(dictionary! {
+        "S" => "JavaScript", "JS" => Object::string_literal("app.alert('SECRET-pdf-js-1')"),
+    });
+    let launch = b.add(dictionary! {
+        "S" => "Launch", "F" => Object::string_literal("SECRET-pdf-launch-1.exe"),
+    });
+    let widget = b.add(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "F" => 2, "FT" => "Tx", "T" => Object::string_literal("Notes"),
+        "V" => Object::string_literal("SECRET-pdf-field-1"),
+    });
+    let sig = b.add(dictionary! {
+        "FT" => "Sig", "T" => Object::string_literal("Signature1"),
+        "V" => dictionary! { "Type" => "Sig", "Contents" => Object::string_literal("0") },
+    });
+    let link = |uri: &str| -> Object {
+        dictionary! {
+            "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal(uri) },
+        }
+        .into()
+    };
+    let annots: Vec<Object> = vec![
+        dictionary! {
+            "Type" => "Annot", "Subtype" => "Text", "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "T" => Object::string_literal("Sam Sample"), "Contents" => Object::string_literal("SECRET-pdf-comment-1"),
+        }
+        .into(),
+        dictionary! {
+            "Type" => "Annot", "Subtype" => "FileAttachment", "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "FS" => on_note,
+        }
+        .into(),
+        dictionary! {
+            "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "A" => dictionary! { "S" => "GoToR", "F" => Object::string_literal(r"D:\Projects\avery\SECRET-pdf-goto-1.pdf"), "D" => vec![0.into()] },
+        }
+        .into(),
+        link("file:///home/avery/SECRET-pdf-uri-1.txt"),
+        link("https://example.com/visible"),
+        widget.into(),
+    ];
+    b.page_with(
+        &text_at(72, 720, "Visible text"),
+        dictionary! {
+            "Annots" => annots, "PieceInfo" => dictionary! { "App" => dictionary! { "Private" => Object::string_literal("SECRET-pdf-piece-1") } },
+            "Thumb" => image,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image } },
+        },
+    );
+    let info = b.add(dictionary! {
+        "Author" => Object::string_literal("Avery Example"),
+        "Title" => Object::string_literal("SECRET-pdf-title-1"),
+    });
+    b.catalog = dictionary! {
+        "Metadata" => xmp,
+        "OpenAction" => launch,
+        "Names" => dictionary! {
+            "EmbeddedFiles" => dictionary! { "Names" => vec![Object::string_literal("a.txt"), attached.into()] },
+            "JavaScript" => dictionary! { "Names" => vec![Object::string_literal("init"), script.into()] },
+        },
+        "AcroForm" => dictionary! {
+            "Fields" => vec![widget.into(), sig.into()],
+            "XFA" => vec![Object::string_literal("template"), Object::string_literal("<template/>")],
+        },
+        "Perms" => dictionary! { "UR3" => dictionary! { "Type" => "Sig" } },
+        "AF" => vec![attached.into()],
+        "Collection" => dictionary! { "Type" => "Collection" },
+    };
+    let mut doc = b.finish();
+    doc.trailer.set("Info", info);
+    save(&mut doc)
+}
+
+/// The no-leak twin of [`leaky_structure`]: visible text, a web link, a visible field value
+/// and a JPEG without metadata.
+pub fn plain_structure() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    let image = b.stream(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+        },
+        &super::jpeg(&[], b""),
+    );
+    let widget = b.add(dictionary! {
+        "Type" => "Annot", "Subtype" => "Widget", "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        "FT" => "Tx", "T" => Object::string_literal("Name"), "V" => Object::string_literal("Shown on the page"),
+    });
+    let link: Object = dictionary! {
+        "Type" => "Annot", "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+        "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal("https://example.com/") },
+    }
+    .into();
+    b.page_with(
+        &format!(
+            "{}q 10 0 0 10 72 600 cm /Im1 Do Q\n",
+            text_at(72, 720, "Visible text")
+        ),
+        dictionary! {
+            "Annots" => vec![link, widget.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => image } },
+        },
+    );
+    b.catalog = dictionary! { "AcroForm" => dictionary! { "Fields" => vec![widget.into()] } };
+    b.bytes()
+}

@@ -233,3 +233,161 @@ fn a_wrong_stream_length_is_read_and_may_be_repaired() {
         }
     }
 }
+
+/// Each finding of `check` as (kind, where, count, detail).
+fn pdf_kinds(f: &serde_json::Value, check: &str) -> Vec<(String, String, u64, String)> {
+    findings_of(f, check)
+        .into_iter()
+        .map(|x| {
+            (
+                x["kind"].as_str().unwrap().into(),
+                x["where"].to_string(),
+                x["count"].as_u64().unwrap(),
+                x["detail"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+fn k(kind: &str, place: &str, count: u64, detail: &str) -> (String, String, u64, String) {
+    (kind.into(), place.into(), count, detail.into())
+}
+
+#[test]
+fn structure_leaks_are_found_and_their_values_stay_out() {
+    let dir = dir("pdf-structure");
+    put(
+        &dir,
+        &[
+            ("leaky.pdf", &leaky_structure()),
+            ("plain.pdf", &plain_structure()),
+        ],
+    );
+    let out = run_in(&dir, &["leaky.pdf", "--json"]);
+    assert!(!stdout(&out).contains("SECRET-") && !stderr(&out).contains("SECRET-"));
+    let f = &json(&out)["files"][0];
+    let xmp = f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["kind"] == "xmp")
+        .unwrap()["where"]
+        .to_string();
+    assert_eq!(
+        pdf_kinds(f, "metadata"),
+        [
+            k(
+                "info_dict",
+                r#"{"field":"/Info"}"#,
+                2,
+                "2 document properties, including the author"
+            ),
+            k("xmp", &xmp, 1, "1 XMP metadata packet"),
+            k("object_xmp", "{}", 1, "1 object with its own XMP metadata"),
+            k(
+                "app_data",
+                "{}",
+                1,
+                "1 object with private application data"
+            ),
+            k("thumbnail", "{}", 1, "1 page thumbnail"),
+        ]
+    );
+    assert_eq!(
+        pdf_kinds(f, "comments"),
+        [k(
+            "annotation",
+            r#"{"page":1}"#,
+            1,
+            "1 annotation by 1 author"
+        )]
+    );
+    assert_eq!(
+        pdf_kinds(f, "embedded-files"),
+        [
+            k("attachment", "{}", 1, "1 attached file"),
+            k("associated_file", "{}", 1, "1 associated file"),
+            k(
+                "portfolio",
+                "{}",
+                1,
+                "the file is a portfolio that shows its attachments as its content"
+            ),
+            k(
+                "file_annotation",
+                r#"{"page":1}"#,
+                1,
+                "1 file attached to an annotation"
+            ),
+        ]
+    );
+    assert_eq!(
+        pdf_kinds(f, "macros"),
+        [
+            k(
+                "javascript",
+                "{}",
+                1,
+                "1 script that runs when the file is opened or used"
+            ),
+            k(
+                "action",
+                "{}",
+                1,
+                "1 action that opens a file, imports data or sends form data"
+            ),
+        ]
+    );
+    assert_eq!(
+        pdf_kinds(f, "external-links"),
+        [
+            k("remote_go_to", "{}", 1, "1 link to another file"),
+            k("file_uri", "{}", 1, "1 link to a local file"),
+        ]
+    );
+    let image = pdf_kinds(f, "image-metadata");
+    assert_eq!(
+        (image.len(), image[0].3.as_str()),
+        (1, "1 picture with EXIF and GPS")
+    );
+    assert_eq!(
+        pdf_kinds(f, "signatures"),
+        [k(
+            "pdf_signature",
+            "{}",
+            2,
+            "2 digital signatures, including usage rights"
+        )]
+    );
+    assert_eq!(
+        pdf_kinds(f, "form-data"),
+        [
+            k("xfa", "{}", 1, "an XFA form in 1 part"),
+            k(
+                "hidden_field_value",
+                "{}",
+                1,
+                "1 form field with a value no page shows"
+            ),
+        ]
+    );
+
+    let shown = stdout(&run_in(&dir, &["leaky.pdf", "--show-values"]));
+    for secret in [
+        "/Title=SECRET-pdf-title-1",
+        "xmp:CreatorTool=SECRET-pdf-tool-1; dc:creator=SECRET-pdf-xmp-1",
+        "page 1: SECRET-pdf-comment-1",
+        "SECRET-pdf-attached-1.txt",
+        "page 1: SECRET-pdf-note-file-1.txt",
+        "app.alert('SECRET-pdf-js-1')",
+        "SECRET-pdf-launch-1.exe",
+        r"D:\Projects\avery\SECRET-pdf-goto-1.pdf",
+        "file:///home/avery/SECRET-pdf-uri-1.txt",
+        "SECRET-pdf-field-1",
+    ] {
+        assert!(shown.contains(secret), "{secret} in {shown}");
+    }
+
+    let f = &json(&run_in(&dir, &["plain.pdf", "--json"]))["files"][0];
+    assert_eq!(f["status"], "none_found", "{f}");
+}

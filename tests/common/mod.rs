@@ -476,3 +476,15 @@ pub fn kinds(f: &serde_json::Value, check: &str) -> Vec<(String, String, u64, St
 pub fn found(kind: &str, part: &str, count: u64, detail: &str) -> (String, String, u64, String) {
     (kind.into(), part.into(), count, detail.into())
 }
+
+/// The checks a PDF lists, in order.
+pub const PDF_CHECKS: [&str; 8] = [
+    "metadata",
+    "comments",
+    "embedded-files",
+    "macros",
+    "external-links",
+    "image-metadata",
+    "signatures",
+    "form-data",
+];

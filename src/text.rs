@@ -136,18 +136,21 @@ pub fn file(
         out.line("")?;
     }
     let look = out.look;
-    let found: Vec<_> = f
-        .checks
+    let with = |s| f.checks.iter().filter(move |c| c.status == s);
+    let found: Vec<_> = with(Status::Found).collect();
+    let incomplete: Vec<_> = with(Status::Incomplete).collect();
+    let none: Vec<_> = with(Status::NoneFound).collect();
+    let width = found
         .iter()
-        .filter(|c| c.status == Status::Found)
-        .collect();
-    let none: Vec<_> = f
-        .checks
-        .iter()
-        .filter(|c| c.status == Status::NoneFound)
-        .collect();
-    let width = found.iter().map(|c| c.id.id().len()).max().unwrap_or(0) + 2;
+        .chain(&incomplete)
+        .map(|c| c.id.id().len())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let status = match found.len() {
+        0 if !incomplete.is_empty() => {
+            format!("{} checks, {} incomplete", f.checks.len(), incomplete.len())
+        }
         0 => format!(
             "nothing found by {}",
             plural(f.checks.len() as u64, "check")
@@ -174,6 +177,11 @@ pub fn file(
                 out.line(&format!("    {:width$}{}{v}", "", shown(x)))?;
             }
         }
+    }
+    for c in &incomplete {
+        let mark = look.paint(YELLOW, "!");
+        let note = c.note.as_deref().unwrap_or_default();
+        out.line(&format!("  {mark} {:width$}{note}", c.id.id()))?;
     }
     if !none.is_empty() {
         let ids: Vec<_> = none.iter().map(|c| c.id.id()).collect();
@@ -313,6 +321,7 @@ mod tests {
                     finding(Some("word/x.bin"), "1 ZIP entry with no content type", None),
                     finding(None, "1 ZIP comment of 4 bytes", Some("note")),
                 ],
+                &[],
                 vec![Warning {
                     code: "extension_mismatch",
                     message: "Q3 report.docx is a .docm file with a .docx name.".into(),
@@ -320,11 +329,24 @@ mod tests {
             ),
             FileResult::failed("gone.pdf".into(), Error::not_found()),
             FileResult::checked(
+                "scan.pdf".into(),
+                Format::Pdf,
+                "pdf",
+                &[CheckId::Metadata, CheckId::HiddenText],
+                vec![],
+                &[(
+                    CheckId::HiddenText,
+                    "page 4: a font couldn't be read".into(),
+                )],
+                vec![],
+            ),
+            FileResult::checked(
                 "deck.pptx".into(),
                 Format::Pptx,
                 "pptx",
                 &[CheckId::LeftoverData],
                 vec![],
+                &[],
                 vec![],
             ),
         ]
@@ -352,10 +374,14 @@ mod tests {
              \x20 ! Q3 report.docx is a .docm file with a .docx name.\n\
              \x20 Remove it: doc-sanitize clean \"Q3 report.docx\"\n\
              \n\
+             scan.pdf  2 checks, 1 incomplete\n\
+             \x20 ! hidden-text  page 4: a font couldn't be read\n\
+             \x20 ✓ 1 check found nothing: metadata\n\
+             \n\
              deck.pptx  nothing found by 1 check\n\
              \x20 ✓ 1 check found nothing: leftover-data\n\
              \n\
-             1 of 3 files have hidden data · 1 failed\n"
+             1 of 4 files have hidden data · 1 failed\n"
         );
         assert_eq!(err, "\n✗ Can't find gone.pdf.\n  Check the path.\n");
     }
@@ -382,7 +408,7 @@ mod tests {
         let (out, err) = printed(ASCII);
         assert!(out.contains("  x leftover-data  word/x.bin"));
         assert!(out.contains("  ok 1 check found nothing"));
-        assert!(out.ends_with("1 of 3 files have hidden data - 1 failed\n"));
+        assert!(out.ends_with("1 of 4 files have hidden data - 1 failed\n"));
         assert!(err.starts_with("\nx Can't find"));
         assert!(!out.contains('\x1b'));
     }

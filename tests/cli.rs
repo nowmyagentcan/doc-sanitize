@@ -104,6 +104,14 @@ fn json_has_the_report_envelope() {
     put(&dir, &[("fake.docx", PDF)]);
     let out = run_in(&dir, &["fake.docx", "--json"]);
     assert_eq!(out.status.code(), Some(0));
+    let checks: Vec<_> = PDF_CHECKS
+        .iter()
+        .map(|id| {
+            format!(
+                "        {{\n          \"id\": \"{id}\",\n          \"status\": \"none_found\",\n          \"count\": 0\n        }}"
+            )
+        })
+        .collect();
     assert_eq!(
         stdout(&out),
         r#"{
@@ -115,7 +123,9 @@ fn json_has_the_report_envelope() {
       "format": "pdf",
       "variant": "pdf",
       "status": "none_found",
-      "checks": [],
+      "checks": [
+{checks}
+      ],
       "findings": [],
       "warnings": [
         {
@@ -134,6 +144,7 @@ fn json_has_the_report_envelope() {
   }
 }
 "#
+        .replace("{checks}", &checks.join(",\n"))
     );
 }
 
@@ -263,9 +274,18 @@ fn text_output_has_a_line_per_file_and_a_summary() {
     put(&dir, &[("a.pdf", PDF), ("Q3 filing.pdf", PDF)]);
     let out = run_in(&dir, &["a.pdf", "gone.pdf", "Q3 filing.pdf"]);
     assert_eq!(out.status.code(), Some(1));
+    let blank = |name: &str| {
+        let n = PDF_CHECKS.len();
+        let ids = PDF_CHECKS.join(", ");
+        format!("{name}  nothing found by {n} checks\n  ✓ {n} checks found nothing: {ids}\n")
+    };
     assert_eq!(
         stdout(&out),
-        "a.pdf  nothing found by 0 checks\n\nQ3 filing.pdf  nothing found by 0 checks\n\n0 of 3 files have hidden data · 1 failed\n"
+        format!(
+            "{}\n{}\n0 of 3 files have hidden data · 1 failed\n",
+            blank("a.pdf"),
+            blank("Q3 filing.pdf")
+        )
     );
     assert_eq!(
         stderr(&out),
@@ -278,7 +298,7 @@ fn text_output_has_a_line_per_file_and_a_summary() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
-    assert_eq!(stdout(&plain), "a.pdf  nothing found by 0 checks\n");
+    assert_eq!(stdout(&plain), blank("a.pdf"));
     assert!(!stdout(&out).contains('\x1b'));
 }
 
