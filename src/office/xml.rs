@@ -56,12 +56,17 @@ pub struct Reader<'a> {
     part: &'a str,
     depth: usize,
     root: bool,
-    /// The elements around the current event, outermost first, as (namespace, local name).
-    stack: Vec<(String, String)>,
-    /// The element the last `Start` opened; it joins `stack` on the next event.
-    opened: Option<(String, String)>,
-    /// The element the last `End` closed.
-    closed: Option<(String, String)>,
+    /// The namespace URIs met so far, which `stack` refers to by index.
+    uris: Vec<String>,
+    /// The open elements, outermost first: namespace index and the span of the local name
+    /// in `names`. During a `Start` the last one is that element itself.
+    stack: Vec<(usize, usize, usize)>,
+    names: String,
+    /// Whether the last event was a `Start`, so the top of `stack` isn't around it.
+    opened: bool,
+    /// The namespace index and local name of the element the last `End` closed.
+    closed: Option<usize>,
+    closed_name: String,
 }
 
 impl<'a> Reader<'a> {
@@ -75,9 +80,12 @@ impl<'a> Reader<'a> {
             part,
             depth: 0,
             root: false,
+            uris: vec![],
             stack: vec![],
-            opened: None,
+            names: String::new(),
+            opened: false,
             closed: None,
+            closed_name: String::new(),
         }
     }
 
@@ -91,9 +99,7 @@ impl<'a> Reader<'a> {
 
     /// The next event; `Eof` once the root element has closed.
     pub fn event(&mut self) -> Result<Event<'a>, Error> {
-        if let Some(open) = self.opened.take() {
-            self.stack.push(open);
-        }
+        self.opened = false;
         self.closed = None;
         let event = match self.inner.read_event() {
             Ok(e) => e,
@@ -119,12 +125,28 @@ impl<'a> Reader<'a> {
                 self.attributes(e)?;
                 if matches!(event, Event::Start(_)) {
                     self.depth += 1;
-                    self.opened = Some((self.ns(e).into(), local(e)));
+                    let uri = self.ns(e);
+                    let ns = match self.uris.iter().position(|u| u == uri) {
+                        Some(i) => i,
+                        None => {
+                            self.uris.push(uri.into());
+                            self.uris.len() - 1
+                        }
+                    };
+                    let start = self.names.len();
+                    self.names.push_str(e.local_name().as_ref());
+                    self.stack.push((ns, start, self.names.len()));
+                    self.opened = true;
                 }
             }
             Event::End(_) => {
                 self.depth -= 1;
-                self.closed = self.stack.pop();
+                if let Some((ns, start, _)) = self.stack.pop() {
+                    self.closed_name.clear();
+                    self.closed_name.push_str(&self.names[start..]);
+                    self.names.truncate(start);
+                    self.closed = Some(ns);
+                }
             }
             Event::Text(t) if t.len() > MAX_VALUE => {
                 return Err(self.too_large("a text value", "32 MiB"));
@@ -200,26 +222,37 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// The elements around the current event, as (namespace, local name), outermost first.
+    fn around(&self) -> impl DoubleEndedIterator<Item = (&str, &str)> {
+        let n = self.stack.len() - usize::from(self.opened);
+        self.stack[..n]
+            .iter()
+            .map(|&(ns, start, end)| (self.uri(ns), &self.names[start..end]))
+    }
+
+    fn uri(&self, i: usize) -> &str {
+        &self.uris[i]
+    }
+
     /// How many elements are around the current event: 0 for the root.
     pub fn level(&self) -> usize {
-        self.stack.len()
+        self.stack.len() - usize::from(self.opened)
     }
 
     /// Whether an element around the current event is `local` in namespace `ns`.
     pub fn within(&self, ns: &str, local: &str) -> bool {
-        self.stack.iter().any(|(n, l)| n == ns && l == local)
+        self.around().any(|e| e == (ns, local))
     }
 
     /// The element around the current event, as (namespace, local name).
     pub fn parent(&self) -> Option<(&str, &str)> {
-        self.stack.last().map(|(n, l)| (n.as_str(), l.as_str()))
+        self.around().next_back()
     }
 
     /// Whether the current `End` closes `local` in namespace `ns`.
     pub fn closes(&self, ns: &str, local: &str) -> bool {
         self.closed
-            .as_ref()
-            .is_some_and(|(n, l)| n == ns && l == local)
+            .is_some_and(|i| self.uri(i) == ns && self.closed_name == local)
     }
 
     /// Whether `e` is the element `local` in namespace `ns`.
