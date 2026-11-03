@@ -1329,6 +1329,10 @@ fn cropped_pictures_keep_only_what_shows() {
         size(&part_of(&copy, "word/media/image2-crop1.png")),
         (10, 5)
     );
+    // The gradient's red starts a quarter of the way in, where the crop now starts.
+    let shown = image::load_from_memory(&part_of(&copy, "word/media/image1-crop1.jpeg")).unwrap();
+    let red = shown.to_rgb8().get_pixel(0, 9).0[0];
+    assert!((55..=75).contains(&red), "{red}");
     let xml = String::from_utf8(part_of(&copy, "word/document.xml")).unwrap();
     assert_eq!(xml.matches("<a:srcRect/>").count(), 3, "{xml}");
 }

@@ -1445,6 +1445,7 @@ fn readable_pdfs() -> Vec<(&'static str, Vec<u8>)> {
         ("unknown_filter.pdf", unknown_filter()),
         ("prev_loop.pdf", prev_loop()),
         ("hybrid_xref.pdf", hybrid_xref()),
+        ("objstm_self.pdf", objstm_self()),
         ("short_length.pdf", bad_length(-100)),
         ("long_length.pdf", bad_length(100)),
         ("owner_only.pdf", aes256("owner-secret", "")),
