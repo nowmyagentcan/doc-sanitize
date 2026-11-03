@@ -373,10 +373,8 @@ fn copy_secrets(path: &std::path::Path) -> std::collections::BTreeSet<String> {
 
 #[test]
 fn properties_comments_custom_data_and_macros_are_removed() {
-    let docx_keep =
-        "tracked-changes,hidden-text,fake-redactions,embedded-files,external-links,cropped-images";
-    let pptx_keep =
-        "hidden-slides,speaker-notes,hidden-objects,embedded-files,external-links,cropped-images";
+    let docx_keep = "tracked-changes,hidden-text,fake-redactions,embedded-files,external-links";
+    let pptx_keep = "hidden-slides,speaker-notes,hidden-objects,embedded-files,external-links";
     let cases = [
         (
             "leaky.docm",
@@ -543,7 +541,7 @@ fn part_of(path: &std::path::Path, name: &str) -> Vec<u8> {
 fn tracked_changes_are_accepted_as_word_does() {
     let dir = dir("clean-tracked");
     put(&dir, &[("a.docx", &leaky_docx("docx"))]);
-    let keep = "hidden-text,fake-redactions,embedded-files,external-links,cropped-images";
+    let keep = "hidden-text,fake-redactions,embedded-files,external-links";
     let out = run_in(&dir, &["clean", "a.docx", "--keep", keep]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
@@ -616,7 +614,7 @@ fn a_change_that_cant_be_accepted_leaves_no_file() {
 fn hidden_text_goes_and_dark_text_becomes_bars() {
     let dir = dir("clean-hidden");
     put(&dir, &[("a.docx", &leaky_docx("docx"))]);
-    let out = run_in(&dir, &["clean", "a.docx", "--keep", "cropped-images"]);
+    let out = run_in(&dir, &["clean", "a.docx"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let copy = dir.join("a.clean.docx");
     assert_eq!(
@@ -753,7 +751,7 @@ fn an_imported_document_leaves_no_file() {
 fn slide_objects_become_their_pictures_and_charts_lose_workbooks() {
     let dir = dir("clean-ole");
     put(&dir, &[("a.pptx", &leaky_pptx("pptx"))]);
-    let keep = "hidden-slides,speaker-notes,hidden-objects,cropped-images";
+    let keep = "hidden-slides,speaker-notes,hidden-objects";
     let out = run_in(&dir, &["clean", "a.pptx", "--keep", keep]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stdout(&out).contains("  changed  1 embedded object is now a picture.\n"));
@@ -779,7 +777,7 @@ fn hidden_sheets_and_cells_go_and_the_workbook_keeps_its_values() {
     for (name, ext) in [("a.xlsx", "xlsx"), ("a.xlsm", "xlsx")] {
         let dir = dir("clean-book");
         put(&dir, &[(name, &leaky_xlsx(&name[2..]))]);
-        let out = run_in(&dir, &["clean", name, "--keep", "cropped-images", "--json"]);
+        let out = run_in(&dir, &["clean", name, "--json"]);
         assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
         let f = &json(&out)["files"][0];
         let codes: Vec<_> = f["changes"]
@@ -963,7 +961,7 @@ fn slicers_stop_the_pivot_cache_clean() {
 fn kept_comments_on_cleared_cells_go_with_them() {
     let dir = dir("clean-kept-notes");
     put(&dir, &[("a.xlsx", &leaky_xlsx("xlsx"))]);
-    let keep = "comments,cropped-images";
+    let keep = "comments";
     let out = run_in(&dir, &["clean", "a.xlsx", "--keep", keep]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     // The note on A1 stays: A1 keeps its value.
@@ -977,7 +975,7 @@ fn kept_comments_on_cleared_cells_go_with_them() {
 fn hidden_slides_notes_and_shapes_are_deleted() {
     let dir = dir("clean-deck");
     put(&dir, &[("a.pptx", &leaky_pptx("pptx"))]);
-    let out = run_in(&dir, &["clean", "a.pptx", "--keep", "cropped-images"]);
+    let out = run_in(&dir, &["clean", "a.pptx"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(
@@ -1069,7 +1067,6 @@ fn found_checks(f: &serde_json::Value) -> Vec<String> {
 
 #[test]
 fn every_kept_check_survives_and_shows_as_kept() {
-    let pictures = ["cropped-images"];
     for (name, bytes) in [
         ("a.docx", leaky_docx("docx")),
         ("a.xlsx", leaky_xlsx("xlsx")),
@@ -1079,7 +1076,7 @@ fn every_kept_check_survives_and_shows_as_kept() {
         put(&dir, &[(name, &bytes)]);
         let checked = json(&run_in(&dir, &[name, "--json"]));
         for id in found_checks(&checked["files"][0]) {
-            if pictures.contains(&id.as_str()) || id == "signatures" {
+            if id == "signatures" {
                 continue;
             }
             // A hidden macro sheet is a hidden sheet too: removing hidden sheets removes it.
@@ -1088,7 +1085,7 @@ fn every_kept_check_survives_and_shows_as_kept() {
             } else {
                 ""
             };
-            let keep = format!("{id}{also},{}", pictures.join(","));
+            let keep = format!("{id}{also}");
             let out = run_in(
                 &dir,
                 &[
@@ -1134,7 +1131,7 @@ fn every_kept_check_survives_and_shows_as_kept() {
 }
 
 #[test]
-fn the_leak_fixtures_clean_to_nothing_but_their_pictures() {
+fn the_leak_fixtures_clean_to_nothing() {
     for (name, bytes) in [
         ("a.docx", leaky_docx("docx")),
         ("a.xlsx", leaky_xlsx("xlsx")),
@@ -1145,18 +1142,14 @@ fn the_leak_fixtures_clean_to_nothing_but_their_pictures() {
     ] {
         let dir = dir("clean-leaks");
         put(&dir, &[(name, &bytes)]);
-        let out = run_in(&dir, &["clean", name, "--keep", "cropped-images", "--json"]);
+        let out = run_in(&dir, &["clean", name, "--json"]);
         let f = &json(&out)["files"][0];
         assert_eq!(f["status"], "cleaned", "{name}: {f}");
         let output = f["output"].as_str().unwrap();
         assert!(!output.ends_with('m'), "{name} -> {output}");
         let copy = json(&run_in(&dir, &[output, "--json"]));
-        let left: Vec<_> = found_checks(&copy["files"][0]);
-        let pictures: Vec<_> = left
-            .iter()
-            .filter(|c| !["cropped-images"].contains(&c.as_str()))
-            .collect();
-        assert!(pictures.is_empty(), "{name}: {left:?}");
+        let left = found_checks(&copy["files"][0]);
+        assert!(left.is_empty(), "{name}: {left:?}");
         let secrets = copy_secrets(&dir.join(output));
         let accepted = ["ins", "move"].map(|k| format!("SECRET-docx-{k}-1"));
         assert!(
@@ -1189,15 +1182,7 @@ fn write_cleaned_fixtures() {
         fs::write(out.join(name), bytes).unwrap();
         let o = run_in(
             &out,
-            &[
-                "clean",
-                name,
-                "--keep",
-                "cropped-images",
-                "--overwrite",
-                "-o",
-                &format!("clean-{name}"),
-            ],
+            &["clean", name, "--overwrite", "-o", &format!("clean-{name}")],
         );
         assert_eq!(o.status.code(), Some(0), "{name}: {}", stderr(&o));
     }
@@ -1296,4 +1281,81 @@ fn a_tiff_with_metadata_leaves_no_file() {
         &["clean", "tiff_exif.docx", "--keep", "image-metadata"],
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn cropped_pictures_keep_only_what_shows() {
+    let size = |b: &[u8]| {
+        let image = image::load_from_memory(b).unwrap();
+        (image.width(), image.height())
+    };
+    let body = blip("rId1", "<a:srcRect l=\"25000\" r=\"25000\" t=\"10000\"/>")
+        + &blip("rId1", "")
+        + &blip("rId2", "<a:srcRect b=\"50000\"/>")
+        + &blip("rId2", "<a:srcRect b=\"50000\"/>");
+    let doc = picture_doc(
+        &[
+            ("word/media/image1.jpeg", &photo(40, 20)),
+            ("word/media/image2.png", &png(10, 10)),
+        ],
+        &body,
+    );
+    let dir = dir("clean-crops");
+    put(&dir, &[("a.docx", &doc)]);
+    let out = run_in(&dir, &["clean", "a.docx", "--json"]);
+    let f = &json(&out)["files"][0];
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let copy = dir.join("a.clean.docx");
+    let names: Vec<String> = unzip(&fs::read(&copy).unwrap())
+        .into_iter()
+        .map(|e| e.0)
+        .filter(|n| n.contains("media"))
+        .collect();
+    // image1 still shows whole elsewhere; image2 showed only cropped, so it goes.
+    assert_eq!(
+        names,
+        [
+            "word/media/image1.jpeg",
+            "word/media/image1-crop1.jpeg",
+            "word/media/image2-crop1.png"
+        ]
+    );
+    assert_eq!(size(&part_of(&copy, "word/media/image1.jpeg")), (40, 20));
+    assert_eq!(
+        size(&part_of(&copy, "word/media/image1-crop1.jpeg")),
+        (20, 18)
+    );
+    assert_eq!(
+        size(&part_of(&copy, "word/media/image2-crop1.png")),
+        (10, 5)
+    );
+    let xml = String::from_utf8(part_of(&copy, "word/document.xml")).unwrap();
+    assert_eq!(xml.matches("<a:srcRect/>").count(), 3, "{xml}");
+}
+
+#[test]
+fn pictures_that_cant_be_cropped_leave_no_file() {
+    let mut cmyk = photo(8, 8);
+    let sof = cmyk.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    cmyk[sof + 9] = 4;
+    for (picture, why) in [
+        (cmyk, "is a CMYK JPEG"),
+        (jpeg(&[0x0112], b""), "is turned by its EXIF orientation"),
+    ] {
+        let doc = picture_doc(
+            &[("word/media/image1.jpeg", &picture)],
+            &blip("rId1", "<a:srcRect l=\"20000\"/>"),
+        );
+        let dir = dir("clean-uncroppable");
+        put(&dir, &[("a.docx", &doc)]);
+        let out = run_in(&dir, &["clean", "a.docx"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            stderr(&out),
+            format!(
+                "✗ Can't remove cropped-images from a.docx: picture word/media/image1.jpeg {why}.\n  Run clean again with --keep cropped-images.\n"
+            )
+        );
+        assert!(!dir.join("a.clean.docx").exists());
+    }
 }

@@ -297,6 +297,77 @@ pub fn orientation(b: &[u8]) -> Option<u16> {
     Some(1)
 }
 
+/// Why a cropped picture can't be cropped by [`crop`]: only PNG and JPEG are, and not a
+/// CMYK JPEG or one an EXIF orientation turns.
+pub fn cant_crop(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(PNG) {
+        return None;
+    }
+    if !b.starts_with(&[0xFF, 0xD8]) {
+        return Some("isn't a JPEG or PNG picture");
+    }
+    match orientation(b) {
+        None => Some("can't be read"),
+        Some(1) if jpeg_components(b) == Some(4) => Some("is a CMYK JPEG"),
+        Some(1) => None,
+        Some(_) => Some("is turned by its EXIF orientation"),
+    }
+}
+
+/// The component count of a JPEG's frame.
+fn jpeg_components(b: &[u8]) -> Option<u8> {
+    let mut i = 2;
+    while b.get(i) == Some(&0xFF) {
+        let marker = *b.get(i + 1)?;
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            return b.get(i + 9).copied();
+        }
+        i += 2 + be16(b, i + 2).ok()?;
+    }
+    None
+}
+
+/// The PNG or JPEG picture cut to what shows once `cut` (the share cut from the left, top,
+/// right and bottom) is taken off, rounding outwards to whole pixels. It is encoded again in
+/// its own format with its ICC profile, a JPEG at quality 92; no other metadata is kept.
+pub fn crop(b: &[u8], cut: [f64; 4]) -> Result<Vec<u8>, &'static str> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::codecs::png::PngEncoder;
+    use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageReader, Limits};
+    const BROKEN: &str = "can't be decoded";
+    let mut reader = ImageReader::new(std::io::Cursor::new(b))
+        .with_guessed_format()
+        .map_err(|_| BROKEN)?;
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(512 << 20);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|_| BROKEN)?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let image = DynamicImage::from_decoder(decoder).map_err(|_| BROKEN)?;
+    let (w, h) = (f64::from(image.width()), f64::from(image.height()));
+    let x0 = (cut[0] * w).floor().clamp(0.0, w - 1.0);
+    let y0 = (cut[1] * h).floor().clamp(0.0, h - 1.0);
+    let x1 = (w - cut[2] * w).ceil().clamp(x0 + 1.0, w);
+    let y1 = (h - cut[3] * h).ceil().clamp(y0 + 1.0, h);
+    let shown = image.crop_imm(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+    let mut out = vec![];
+    let encoded = if b.starts_with(PNG) {
+        let mut e = PngEncoder::new(&mut out);
+        if let Some(icc) = icc {
+            let _ = e.set_icc_profile(icc);
+        }
+        shown.write_with_encoder(e)
+    } else {
+        let mut e = JpegEncoder::new_with_quality(&mut out, 92);
+        if let Some(icc) = icc {
+            let _ = e.set_icc_profile(icc);
+        }
+        shown.write_with_encoder(e)
+    };
+    encoded.map_err(|_| "can't be encoded again")?;
+    Ok(out)
+}
+
 /// TIFF tags that describe the picture's origin rather than its pixels.
 fn tiff(b: &[u8]) -> Result<Labels, ()> {
     let mut labels = vec![];
@@ -826,5 +897,25 @@ mod tests {
             )
         );
         assert_eq!(svg(&out, "a.svg").unwrap(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn crops_keep_the_colour_profile() {
+        use image::ImageEncoder;
+        let mut png = vec![];
+        let mut e = image::codecs::png::PngEncoder::new(&mut png);
+        e.set_icc_profile(b"profile".to_vec()).unwrap();
+        e.write_image(&[9; 4 * 4 * 3], 4, 4, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let out = crop(&png, [0.5, 0.0, 0.0, 0.25]).unwrap();
+        let image = image::load_from_memory(&out).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 3));
+        assert!(out.windows(4).any(|w| w == b"iCCP"));
+        assert_eq!(cant_crop(&png), None);
+        assert_eq!(cant_crop(b"GIF89a"), Some("isn't a JPEG or PNG picture"));
+        assert_eq!(
+            crop(b"\x89PNG\r\n\x1a\nbroken", [0.1; 4]),
+            Err("can't be decoded")
+        );
     }
 }

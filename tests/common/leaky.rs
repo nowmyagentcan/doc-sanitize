@@ -797,7 +797,7 @@ pub fn leaky_pptx(variant: &str) -> Vec<u8> {
         .part(pr, "rId12", &format!("{MS}/2011/relationships/webextension"), "ppt/webextensions/webextension1.xml", "application/vnd.ms-office.webextension+xml", b"<we:webextension xmlns:we=\"http://schemas.microsoft.com/office/webextensions/webextension/2010/11\" id=\"{66666666-6666-6666-6666-666666666666}\"><we:reference id=\"wa1\" version=\"1.0\" store=\"en-US\" storeType=\"OMEX\"/><we:properties><we:property name=\"matter\" value=\"&quot;SECRET-pptx-addin-1&quot;\"/></we:properties></we:webextension>")
         .part(s1, "rId2", "notesSlide", "ppt/notesSlides/notesSlide1.xml", &pml("notesSlide"), notes.as_bytes())
         .part(s1, "rId3", "comments", "ppt/comments/comment1.xml", &pml("comments"), legacy.as_bytes())
-        .part(s1, "rId4", "image", "ppt/media/image1.jpeg", "", &jpeg(&[], b""))
+        .part(s1, "rId4", "image", "ppt/media/image1.jpeg", "", &photo(40, 20))
         .part(s1, "rId5", "package", "ppt/embeddings/Microsoft_Excel_Worksheet.xlsx", &format!("{SML}.sheet"), b"PK\x03\x04SECRET-pptx-ole-1")
         .part(s1, "rId6", "image", "ppt/media/image2.png", "", &png(4, 4))
         .link(s1, rel("rId7", "slide", "slide2.xml"))

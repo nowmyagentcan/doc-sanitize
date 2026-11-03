@@ -199,12 +199,8 @@ pub fn crops_and_alt_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 return Ok(());
             };
             if r.is(e, ns::A, "srcRect") {
-                let side = |a| -> Result<f64, Error> {
-                    let v: f64 = r.attr(e, a)?.and_then(|v| v.parse().ok()).unwrap_or(0.0);
-                    Ok((v.max(0.0) / 100_000.0).min(1.0))
-                };
-                let (w, h) = (1.0 - side("l")? - side("r")?, 1.0 - side("t")? - side("b")?);
-                let hidden = 1.0 - w.max(0.0) * h.max(0.0);
+                let side = |a| -> Result<f64, Error> { Ok(share(r.attr(e, a)?.as_deref())) };
+                let hidden = hidden([side("l")?, side("t")?, side("r")?, side("b")?]);
                 if hidden >= 0.01 {
                     crops += 1;
                     most = most.max(hidden);
@@ -253,6 +249,36 @@ pub fn crops_and_alt_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         }
     }
     Ok(found)
+}
+
+/// One side of an `a:srcRect` (1/1000 of a percent) as a share of the picture; a negative
+/// value cuts nothing.
+fn share(v: Option<&str>) -> f64 {
+    let v: f64 = v.and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    (v.max(0.0) / 100_000.0).min(1.0)
+}
+
+/// The share of a picture hidden by cutting `[l, t, r, b]` from its sides.
+fn hidden([l, t, r, b]: [f64; 4]) -> f64 {
+    1.0 - (1.0 - l - r).max(0.0) * (1.0 - t - b).max(0.0)
+}
+
+/// The pictures in a part whose `a:srcRect` hides at least 1% of them: the relationship id of
+/// the stored picture ("" when none is stored) and the shares cut from the left, top, right
+/// and bottom.
+pub fn crops(root: &El) -> Vec<(String, [f64; 4])> {
+    let mut out = vec![];
+    root.each(&mut |e| out.extend(crop_of(e)));
+    out
+}
+
+/// The crop of a picture fill (an element holding `a:blip` and `a:srcRect`), as [`crops`]
+/// gives it.
+pub fn crop_of(e: &El) -> Option<(String, [f64; 4])> {
+    let rect = e.child(ns::A, "srcRect")?;
+    let cut = ["l", "t", "r", "b"].map(|a| share(rect.attr("", a)));
+    let blip = e.child(ns::A, "blip").and_then(|b| b.attr(ns::R, "embed"));
+    (hidden(cut) >= 0.01).then(|| (blip.unwrap_or_default().to_string(), cut))
 }
 
 /// An object element and what makes it hidden: its own `cNvPr`/`docPr` and its box (both

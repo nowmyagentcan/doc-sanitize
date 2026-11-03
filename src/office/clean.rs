@@ -10,7 +10,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use super::common::rels_source;
-use super::tree::{Doc, El, Node};
+use super::tree::{Attr, Doc, El, Node};
 use super::xml;
 use super::{
     CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, drawing, excel, key, ns,
@@ -170,6 +170,54 @@ impl Draft {
                 t.set("", "ContentType", ct);
             }
         }
+    }
+
+    /// Gives the new part `name` the content type `ct`, with an Override unless its
+    /// extension's Default already does.
+    pub fn add_type(&mut self, name: &str, ct: &str) {
+        if self.content_type(name).as_deref() == Some(ct) {
+            return;
+        }
+        let mut o = El::like(&self.types.root, "Override");
+        o.attrs = [("PartName", format!("/{name}")), ("ContentType", ct.into())]
+            .map(|(name, value)| Attr {
+                name: name.into(),
+                ns: "".into(),
+                value,
+            })
+            .into();
+        self.types.root.kids.push(Node::El(o));
+    }
+
+    /// A relationship from `source` like its relationship `like`, to `part` in the same
+    /// folder as `like`'s target; gives its id.
+    pub fn relate(&mut self, source: &str, like: &str, part: &str) -> Result<String, Error> {
+        let rels = self.rels(source)?;
+        let mut n = rels.len();
+        let id = loop {
+            n += 1;
+            let id = format!("rId{n}");
+            if rels.iter().all(|r| r.id != id) {
+                break id;
+            }
+        };
+        let file = part.rsplit('/').next().unwrap_or(part);
+        self.edit(&rels_name(source), |root| {
+            let Some(old) = root
+                .els()
+                .find(|e| e.is(RELATIONSHIPS, "Relationship") && e.attr("", "Id") == Some(like))
+            else {
+                return Ok(false);
+            };
+            let mut rel = old.clone();
+            let target = old.attr("", "Target").unwrap_or_default();
+            let folder = &target[..target.rfind('/').map_or(0, |i| i + 1)];
+            rel.set("", "Id", &id);
+            rel.set("", "Target", &format!("{folder}{file}"));
+            root.kids.push(Node::El(rel));
+            Ok(true)
+        })?;
+        Ok(id)
     }
 
     fn drop_override(&mut self, keep: impl Fn(&str) -> bool) {
@@ -506,7 +554,7 @@ fn ids(root: &El) -> HashSet<String> {
 }
 
 /// The checks whose findings clean can remove from Office files.
-const CLEANABLE: [CheckId; 18] = [
+const CLEANABLE: [CheckId; 19] = [
     CheckId::Metadata,
     CheckId::Comments,
     CheckId::TrackedChanges,
@@ -522,6 +570,7 @@ const CLEANABLE: [CheckId; 18] = [
     CheckId::Macros,
     CheckId::ExternalLinks,
     CheckId::ImageMetadata,
+    CheckId::CroppedImages,
     CheckId::PivotCaches,
     CheckId::LeftoverData,
     CheckId::Signatures,
@@ -560,6 +609,12 @@ fn blocking(
                 out.push((c, format!("picture {} is a TIFF", safe(p)), hint.into()));
                 continue;
             }
+        }
+        if c == CheckId::CroppedImages
+            && let Some(why) = uncroppable(ctx)?
+        {
+            out.push((c, why, format!("Run clean again with --keep {}.", c.id())));
+            continue;
         }
         let why = match c {
             CheckId::EmbeddedFiles if kinds.contains(&"imported_chunk") => Some((
@@ -677,6 +732,9 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     }
     if has(CheckId::ImageMetadata) {
         image_metadata(&mut d, found)?;
+    }
+    if has(CheckId::CroppedImages) {
+        cropped_images(&ctx, &mut d)?;
     }
     let leftovers = remove.contains(&CheckId::LeftoverData);
     if leftovers && has(CheckId::LeftoverData) {
@@ -1388,6 +1446,88 @@ fn leftover_data(ctx: &Ctx, d: &mut Draft, found: &[Finding]) -> Result<(), Erro
         for g in word::glossaries(ctx) {
             d.delete(g)?;
         }
+    }
+    Ok(())
+}
+
+/// Why the cropped pictures of `ctx` can't be cropped, for the first one that can't.
+fn uncroppable(ctx: &Ctx) -> Result<Option<String>, Error> {
+    let pkg = ctx.pkg;
+    for part in drawing::drawing_parts(ctx) {
+        let doc = Doc::parse(&pkg.read(part)?, part)?;
+        for (id, _) in drawing::crops(&doc.root) {
+            let rel = pkg
+                .rels(part)?
+                .into_iter()
+                .find(|r| r.id == id && !r.external);
+            let Some(media) = rel.and_then(|r| resolve(part, &r.target)) else {
+                continue;
+            };
+            if let Some(why) = pkg.read(&media).ok().and_then(|b| pictures::cant_crop(&b)) {
+                return Ok(Some(format!("picture {} {why}", safe(&media))));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `cropped-images`: each cropped picture shows a new copy of its media holding only what
+/// shows (one copy per distinct crop of a media part) and its `a:srcRect` is emptied. The
+/// sweep then takes the old media when nothing else shows it.
+fn cropped_images(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
+    let key = |media: &str, cut: [f64; 4]| (media.to_string(), cut.map(f64::to_bits));
+    let mut made: HashMap<(String, [u64; 4]), String> = HashMap::new();
+    for part in drawing::drawing_parts(ctx) {
+        let Some(doc) = d.doc(part)? else {
+            continue;
+        };
+        let mut ids = HashMap::new();
+        for (id, cut) in drawing::crops(&doc.root) {
+            let Some(media) = d.target(part, &id)? else {
+                continue;
+            };
+            let k = key(&media, cut);
+            if !made.contains_key(&k) {
+                let input = d.bytes(&media).unwrap_or_default();
+                let copy = pictures::crop(input, cut).map_err(|why| {
+                    Error::cannot_clean(&[(
+                        CheckId::CroppedImages,
+                        format!("picture {} {why}", safe(&media)),
+                        "Run clean again with --keep cropped-images.".into(),
+                    )])
+                })?;
+                let (stem, ext) = media.rsplit_once('.').unwrap_or((&media, ""));
+                let name = (1..)
+                    .map(|n| format!("{stem}-crop{n}.{ext}"))
+                    .find(|n| !d.has(n))
+                    .expect("a free name");
+                let ct = d.content_type(&media).unwrap_or_default();
+                d.set(&name, copy);
+                d.add_type(&name, &ct);
+                made.insert(k.clone(), name);
+            }
+            if !ids.contains_key(&(id.clone(), k.1)) {
+                let new = d.relate(part, &id, &made[&k])?;
+                ids.insert((id, k.1), new);
+            }
+        }
+        d.change(part, |root| {
+            let mut n = 0;
+            root.each_mut(&mut |e| {
+                let Some((id, cut)) = drawing::crop_of(e) else {
+                    return;
+                };
+                let new = ids.get(&(id, cut.map(f64::to_bits)));
+                if let (Some(new), Some(blip)) = (new, e.child_mut(ns::A, "blip")) {
+                    blip.set(ns::R, "embed", new);
+                }
+                if let Some(rect) = e.child_mut(ns::A, "srcRect") {
+                    rect.attrs.clear();
+                }
+                n += 1;
+            });
+            n
+        })?;
     }
     Ok(())
 }

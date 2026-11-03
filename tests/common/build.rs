@@ -143,6 +143,17 @@ pub fn jpeg(tags: &[u16], after: &[u8]) -> Vec<u8> {
     b
 }
 
+/// A real `w × h` JPEG (a colour gradient) that decoders read.
+pub fn photo(w: u32, h: u32) -> Vec<u8> {
+    let rgb = |x: u32, y: u32| image::Rgb([(x * 255 / w) as u8, (y * 255 / h) as u8, 128]);
+    let image = image::RgbImage::from_fn(w, h, rgb);
+    let mut out = vec![];
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode_image(&image)
+        .unwrap();
+    out
+}
+
 pub fn picture_doc(media: &[(&str, &[u8])], body: &str) -> Vec<u8> {
     let mut p = Pkg::new("docx").body(&doc_xml(body));
     for (i, (name, bytes)) in media.iter().enumerate() {
