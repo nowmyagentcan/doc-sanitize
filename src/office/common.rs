@@ -193,15 +193,10 @@ fn unused_strings<'n>(
             Event::Start(e) if depth == 1 && r.is(e, SPREADSHEET, "si") => {
                 current.clear();
             }
-            Event::Empty(e) if depth == 1 && r.is(e, SPREADSHEET, "si") => {
-                if !used.contains(&count) {
-                    unused += 1;
-                    first.get_or_insert_default();
-                }
-                count += 1;
-            }
+            Event::Empty(e) if depth == 1 && r.is(e, SPREADSHEET, "si") => count += 1,
+            // An empty string holds nothing, so it isn't leftover data.
             Event::End(e) if depth == 2 && e.local_name().as_ref() == "si" => {
-                if !used.contains(&count) {
+                if !used.contains(&count) && !current.is_empty() {
                     unused += 1;
                     if values && first.is_none() {
                         first = Some(current.clone());
@@ -210,7 +205,7 @@ fn unused_strings<'n>(
                 count += 1;
             }
             Event::Eof => break,
-            _ if values && depth >= 2 => current += &xml::text(&ev).unwrap_or_default(),
+            _ if depth >= 2 => current += &xml::text(&ev).unwrap_or_default(),
             _ => {}
         }
         match ev {

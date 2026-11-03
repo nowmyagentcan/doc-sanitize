@@ -479,13 +479,14 @@ fn shared_strings_no_cell_uses_are_found() {
         ],
     );
     let book = zip(&book);
+    // The empty fourth string holds nothing, so it isn't counted.
     assert_eq!(
         leftovers("strings.xlsx", &book),
         [found(
             "unused_strings",
             "xl/sharedStrings.xml",
-            3,
-            "3 shared strings that no cell uses"
+            2,
+            "2 shared strings that no cell uses"
         )]
     );
     let dir = dir("strings");

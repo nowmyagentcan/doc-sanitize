@@ -204,9 +204,14 @@ fn conclude(
     };
     let error = match recheck.findings.first() {
         Some(f) => Some(Error::recheck_failed(f.check)),
-        None => save(path, &cleaned.bytes, cleaned.variant, options)
-            .map(|out| result.output = Some(out))
-            .err(),
+        None => save(
+            path,
+            &cleaned.bytes,
+            (checked.variant, cleaned.variant),
+            options,
+        )
+        .map(|out| result.output = Some(out))
+        .err(),
     };
     result.recheck = Some(recheck);
     if let Some(e) = error {
@@ -217,14 +222,15 @@ fn conclude(
     result
 }
 
-/// Writes the copy of `input` where `options` say and gives the path written, as shown.
+/// Writes the copy of `input` (its variant and the copy's) where `options` say and gives the
+/// path written, as shown.
 fn save(
     input: &Path,
     bytes: &[u8],
-    variant: &str,
+    variants: (Option<&str>, &str),
     options: &CleanOptions,
 ) -> Result<String, Error> {
-    let out = output(input, variant, &options.target);
+    let out = output(input, variants, &options.target);
     let shown = safe(&out.to_string_lossy());
     let replace = options.overwrite && matches!(options.target, Target::File(_));
     if fs::symlink_metadata(&out).is_ok() && !replace {
@@ -237,11 +243,17 @@ fn save(
     Ok(shown)
 }
 
-/// Where the copy of `input` goes: the `-o` file, or `<stem>.clean.<ext>` (the variant's
-/// extension) beside the input or in `--out-dir`, with `-2` … `-999` while the name is taken.
-fn output(input: &Path, variant: &str, target: &Target) -> PathBuf {
+/// Where the copy of `input` goes: the `-o` file, or `<stem>.clean.<ext>` (the copy's
+/// variant) beside the input or in `--out-dir`, with `-2` … `-999` while the name is taken.
+fn output(input: &Path, (was, variant): (Option<&str>, &str), target: &Target) -> PathBuf {
     let dir = match target {
-        Target::File(f) => return f.clone(),
+        // An -o name with the macro extension the copy no longer has takes the new one.
+        Target::File(f) => match f.extension() {
+            Some(e) if was.is_some_and(|w| w != variant && e.eq_ignore_ascii_case(w)) => {
+                return f.with_extension(variant);
+            }
+            _ => return f.clone(),
+        },
         Target::Dir(d) => d.clone(),
         Target::Beside => input.parent().map(Path::to_path_buf).unwrap_or_default(),
     };

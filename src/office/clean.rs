@@ -3,7 +3,7 @@
 //! the consistency check proves every reference still resolves, and the parts are written as a
 //! new ZIP with fixed times.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Write};
 
 use zip::write::SimpleFileOptions;
@@ -11,11 +11,13 @@ use zip::{CompressionMethod, DateTime, ZipWriter};
 
 use super::common::rels_source;
 use super::tree::{Doc, El, Node};
+use super::xml;
 use super::{
     CONTENT_TYPES, Ctx, MAIN_TYPES, Package, RELATIONSHIPS, Rel, common, drawing, excel, key, ns,
     part_name, powerpoint, rels_name, resolve, revisions, word,
 };
-use crate::report::{Change, CheckId, Error, Finding, Format, safe};
+use crate::report::{Change, CheckId, Error, Finding, Format, counted, safe};
+use quick_xml::events::Event;
 
 const TYPES: &str = "[Content_Types].xml";
 
@@ -26,6 +28,8 @@ pub struct Draft {
     pub main: String,
     entries: Vec<Option<(String, Vec<u8>)>>,
     index: HashMap<String, usize>,
+    /// The parts (by key) written since the input was read.
+    edited: HashSet<String>,
     types: Doc,
     /// What a reader of the copy will see differently.
     pub changes: Vec<Change>,
@@ -48,6 +52,7 @@ impl Draft {
             main: pkg.main.clone(),
             entries: vec![],
             index: HashMap::new(),
+            edited: HashSet::new(),
             types: Doc::parse(&pkg.read(TYPES)?, TYPES)?,
             changes: vec![],
         };
@@ -57,6 +62,7 @@ impl Draft {
                 d.set(&e.name, pkg.read(&e.name)?);
             }
         }
+        d.edited.clear();
         Ok(d)
     }
 
@@ -76,6 +82,7 @@ impl Draft {
 
     /// Replaces a part's bytes, or adds the part at the end.
     pub fn set(&mut self, name: &str, bytes: Vec<u8>) {
+        self.edited.insert(key(name));
         match self.index.get(&key(name)) {
             Some(&i) => {
                 if let Some(e) = &mut self.entries[i] {
@@ -399,23 +406,11 @@ impl Draft {
                     return Err(format!("{name} links to missing {}", l.target));
                 }
             }
-            if self.is_xml(&name)
-                && let Ok(Some(doc)) = self.doc(&name)
-            {
-                let mut missing = None;
-                doc.root.each(&mut |e| {
-                    for a in &e.attrs {
-                        if &*a.ns == ns::R && !a.declares() && !ids.contains(&a.value) {
-                            missing.get_or_insert(format!(
-                                "{name} names missing relationship {}",
-                                a.value
-                            ));
-                        }
-                    }
-                });
-                if let Some(m) = missing {
-                    return Err(m);
-                }
+            // Parts copied as they were, with the relationships they had, can't name a missing
+            // one because of us.
+            let touched = |n: &str| self.edited.contains(&key(n));
+            if self.is_xml(&name) && (touched(&name) || touched(&rels_name(&name))) {
+                self.names_known(&name, &ids)?;
             }
         }
         for l in self.rels("").map_err(fail)? {
@@ -444,6 +439,26 @@ impl Draft {
                 "the main part's type {main} isn't a {}",
                 self.variant
             )),
+        }
+    }
+
+    /// Checks that every relationship-id attribute of `part` is one of `ids`.
+    fn names_known(&self, part: &str, ids: &HashSet<String>) -> Result<(), String> {
+        let bytes = self.bytes(part).unwrap_or_default();
+        let text = xml::decode(bytes, part).map_err(|e| e.message)?;
+        let mut r = xml::Reader::new(&text, part);
+        loop {
+            match r.event().map_err(|e| e.message)? {
+                Event::Start(e) | Event::Empty(e) if e.attributes_raw().contains(':') => {
+                    for (ns, _, v) in r.attrs(&e).map_err(|e| e.message)? {
+                        if ns == ns::R && !ids.contains(v.as_ref()) {
+                            return Err(format!("{part} names missing relationship {v}"));
+                        }
+                    }
+                }
+                Event::Eof => return Ok(()),
+                _ => {}
+            }
         }
     }
 
@@ -585,7 +600,12 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     let mut d = Draft::new(pkg)?;
     let has = |c: CheckId| remove.contains(&c) && found.iter().any(|f| f.check == c);
     if remove.contains(&CheckId::Macros) {
-        macros(&mut d)?;
+        let kinds: Vec<&str> = found
+            .iter()
+            .filter(|f| f.check == CheckId::Macros)
+            .map(|f| f.kind)
+            .collect();
+        macros(&mut d, &kinds)?;
     }
     if has(CheckId::Signatures) {
         d.delete_linked("origin")?;
@@ -634,7 +654,9 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
         external_links(&ctx, &mut d)?;
     }
     if d.format == Format::Xlsx {
-        workbook(&ctx, &mut d, &has, remove.contains(&CheckId::Comments))?;
+        let leftovers_kept = !remove.contains(&CheckId::LeftoverData);
+        let comments_gone = remove.contains(&CheckId::Comments);
+        workbook(&ctx, &mut d, &has, comments_gone, leftovers_kept)?;
     }
     if has(CheckId::Metadata) {
         metadata(&mut d)?;
@@ -672,16 +694,18 @@ const P188: &str = "http://schemas.microsoft.com/office/powerpoint/2018/8/main";
 
 /// `macros`: VBA projects, custom ribbons and ActiveX controls; a macro-enabled main part
 /// becomes the plain type of its kind, and the copy takes that extension.
-fn macros(d: &mut Draft) -> Result<(), Error> {
+fn macros(d: &mut Draft, kinds: &[&str]) -> Result<(), Error> {
     d.delete_linked("vbaProject")?;
     d.delete_linked("extensibility")?;
-    let controls =
-        |e: &El| e.is(ns::W, "control") || e.is(ns::S, "controls") || e.is(ns::P, "controls");
-    for part in d.xml_parts() {
-        d.prune_linked(&part, controls)?;
+    if kinds.contains(&"activex") {
+        let controls =
+            |e: &El| e.is(ns::W, "control") || e.is(ns::S, "controls") || e.is(ns::P, "controls");
+        for part in d.xml_parts() {
+            d.prune_linked(&part, controls)?;
+        }
+        d.delete_linked("control")?;
     }
-    d.delete_linked("control")?;
-    if d.format == Format::Docx {
+    if kinds.contains(&"dde_field") {
         for part in d.xml_parts() {
             d.edit(&part, |root| Ok(word::unlink_fields(root, false, true) > 0))?;
         }
@@ -883,7 +907,23 @@ fn workbook(
     d: &mut Draft,
     has: &dyn Fn(CheckId) -> bool,
     comments_gone: bool,
+    leftovers_kept: bool,
 ) -> Result<(), Error> {
+    let leftovers = has(CheckId::LeftoverData);
+    // Strings no cell used in the input are leftover data: they stay when it is kept (and
+    // only sheet edits could leave others unused).
+    let edits = [
+        CheckId::HiddenText,
+        CheckId::FakeRedactions,
+        CheckId::HiddenSheets,
+        CheckId::HiddenRowsColumns,
+        CheckId::Macros,
+        CheckId::ExternalLinks,
+    ];
+    let unused = match leftovers_kept && edits.into_iter().any(has) {
+        true => excel::unused_strings(d)?,
+        false => Default::default(),
+    };
     let mut deleted: Vec<String> = vec![];
     for s in &ctx.sheets {
         let macro_sheet = s.part.as_deref().is_some_and(|p| {
@@ -900,26 +940,6 @@ fn workbook(
     if !deleted.is_empty() {
         excel::delete_sheets(d, &deleted)?;
     }
-    let (hidden, dark, lines) = (
-        has(CheckId::HiddenText),
-        has(CheckId::FakeRedactions),
-        has(CheckId::HiddenRowsColumns),
-    );
-    let mut cleared = 0;
-    if hidden || dark || lines {
-        let clear = excel::Clear::new(ctx, lines, hidden, dark)?;
-        for sheet in excel::cell_sheets(d)? {
-            let mut refs = vec![];
-            d.edit(&sheet, |root| {
-                refs = excel::clear_cells(root, &clear);
-                Ok(!refs.is_empty())
-            })?;
-            cleared += refs.len();
-            if !comments_gone && !refs.is_empty() {
-                drop_cell_comments(d, &sheet, &refs)?;
-            }
-        }
-    }
     if has(CheckId::PivotCaches) {
         d.delete_linked("pivotTable")?;
         let book = d.main.clone();
@@ -927,53 +947,90 @@ fn workbook(
     }
     let mut external = false;
     if has(CheckId::ExternalLinks) {
-        let book = d.main.clone();
-        external = d.prune_linked(&book, |e| e.is(ns::S, "externalReferences"))? > 0;
-        let ac = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac";
-        d.prune_linked(&book, |e| e.is(ac, "absPath"))?;
-        if external {
-            d.edit(&book, |root| {
-                let linked = |e: &El| {
-                    e.is(ns::S, "definedName") && e.text().contains('[') && e.text().contains(']')
-                };
-                Ok(root.prune(&linked) > 0)
-            })?;
-        }
-        d.delete_linked("connections")?;
-        d.delete_linked("queryTable")?;
-        for part in d.xml_parts() {
-            if d.content_type(&part)
-                .is_some_and(|t| t.ends_with(".table+xml"))
-            {
-                d.edit(&part, |root| {
-                    let mut n = 0;
-                    root.each_mut(&mut |e| {
-                        n += e.drop_attrs(|a| {
-                            a.name == "queryTableFieldId"
-                                || (a.name == "tableType" && a.value == "queryTable")
-                        });
-                    });
-                    Ok(n > 0)
-                })?;
+        external = workbook_links(d)?;
+    }
+    let (hidden, dark, lines) = (
+        has(CheckId::HiddenText),
+        has(CheckId::FakeRedactions),
+        has(CheckId::HiddenRowsColumns),
+    );
+    // Found cells are cleared, so the values rule applies whenever there are any.
+    let values = !deleted.is_empty() || external || hidden || dark || lines;
+    let clear = (hidden || dark || lines)
+        .then(|| excel::Clear::new(ctx, lines, hidden, dark))
+        .transpose()?;
+    // One pass over each sheet: clear, keep values, note the shared strings left in use. With
+    // none of that and no unused strings to blank, the sheets stay as they are.
+    if !values && !leftovers {
+        return Ok(());
+    }
+    let (mut replaced, mut empty) = (0, 0);
+    let mut used = BTreeSet::new();
+    for sheet in excel::cell_sheets(d)? {
+        let mut refs = vec![];
+        d.edit(&sheet, |root| {
+            if let Some(c) = &clear {
+                refs = excel::clear_cells(root, c);
             }
+            let (r, e) = if values {
+                excel::to_values(root)
+            } else {
+                (0, 0)
+            };
+            (replaced, empty) = (replaced + r, empty + e);
+            excel::used_in(root, &mut used);
+            Ok(!refs.is_empty() || r + e > 0)
+        })?;
+        if !comments_gone && !refs.is_empty() {
+            drop_cell_comments(d, &sheet, &refs)?;
         }
     }
-    if !deleted.is_empty() || cleared > 0 || external {
-        values_rule(d, &deleted)?;
+    if values {
+        values_rule(d, &deleted, replaced, empty)?;
     }
-    excel::rebuild_strings(d)
+    excel::blank_strings(d, &used, &unused)
 }
 
-/// The values rule: every formula becomes its saved result and every chart literal.
-fn values_rule(d: &mut Draft, deleted: &[String]) -> Result<(), Error> {
-    let (mut replaced, mut empty, mut charts) = (0, 0, 0);
-    for sheet in excel::cell_sheets(d)? {
-        d.edit(&sheet, |root| {
-            let (r, e) = excel::to_values(root);
-            (replaced, empty) = (replaced + r, empty + e);
-            Ok(r + e > 0)
+/// Linked workbooks with the names that use them, the saved folder path, connections and
+/// query tables; gives whether a linked workbook went (which brings the values rule).
+fn workbook_links(d: &mut Draft) -> Result<bool, Error> {
+    let book = d.main.clone();
+    let external = d.prune_linked(&book, |e| e.is(ns::S, "externalReferences"))? > 0;
+    let ac = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac";
+    d.prune_linked(&book, |e| e.is(ac, "absPath"))?;
+    if external {
+        d.edit(&book, |root| {
+            let linked = |e: &El| {
+                e.is(ns::S, "definedName") && e.text().contains('[') && e.text().contains(']')
+            };
+            Ok(root.prune(&linked) > 0)
         })?;
     }
+    d.delete_linked("connections")?;
+    d.delete_linked("queryTable")?;
+    for part in d.xml_parts() {
+        if d.content_type(&part)
+            .is_some_and(|t| t.ends_with(".table+xml"))
+        {
+            d.edit(&part, |root| {
+                let mut n = 0;
+                root.each_mut(&mut |e| {
+                    n += e.drop_attrs(|a| {
+                        a.name == "queryTableFieldId"
+                            || (a.name == "tableType" && a.value == "queryTable")
+                    });
+                });
+                Ok(n > 0)
+            })?;
+        }
+    }
+    Ok(external)
+}
+
+/// The rest of the values rule once the sheets have their values: charts become literal,
+/// the calculation chain goes, and the changes are told.
+fn values_rule(d: &mut Draft, deleted: &[String], replaced: u64, empty: u64) -> Result<(), Error> {
+    let mut charts = 0;
     for part in d.names() {
         if d.content_type(&part).as_deref() != Some(CHART_TYPE) {
             continue;
@@ -996,29 +1053,33 @@ fn values_rule(d: &mut Draft, deleted: &[String]) -> Result<(), Error> {
         charts += u64::from(changed);
     }
     d.delete_linked("calcChain")?;
-    if replaced > 0 {
-        let what = match replaced {
-            1 => "1 formula was replaced by its saved result.".to_string(),
-            n => format!("{n} formulas were replaced by their saved results."),
-        };
-        d.changes
-            .push(Change::counted("formulas_to_values", replaced, what));
-    }
-    if empty > 0 {
-        let what = match empty {
-            1 => "1 formula had no saved result and is now empty.".to_string(),
-            n => format!("{n} formulas had no saved result and are now empty."),
-        };
-        d.changes
-            .push(Change::counted("formulas_without_value", empty, what));
-    }
-    if charts > 0 {
-        let what = match charts {
-            1 => "1 chart now shows its saved values instead of linked cells.".to_string(),
-            n => format!("{n} charts now show their saved values instead of linked cells."),
-        };
-        d.changes
-            .push(Change::counted("charts_to_values", charts, what));
+    for (code, n, one, many) in [
+        (
+            "formulas_to_values",
+            replaced,
+            "formula was replaced by its saved result",
+            "formulas were replaced by their saved results",
+        ),
+        (
+            "formulas_without_value",
+            empty,
+            "formula had no saved result and is now empty",
+            "formulas had no saved result and are now empty",
+        ),
+        (
+            "charts_to_values",
+            charts,
+            "chart now shows its saved values instead of linked cells",
+            "charts now show their saved values instead of linked cells",
+        ),
+    ] {
+        if n > 0 {
+            d.changes.push(Change::counted(
+                code,
+                n,
+                format!("{}.", counted(n, one, many)),
+            ));
+        }
     }
     Ok(())
 }
@@ -1112,8 +1173,8 @@ fn external_links(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             d.unlink(&source, id)?;
         }
     }
-    for part in d.xml_parts() {
-        d.edit(&part, |root| {
+    for part in drawing::drawing_parts(ctx) {
+        d.edit(part, |root| {
             let mut n = 0;
             root.each_mut(&mut |e| {
                 for a in &mut e.attrs {
@@ -1238,12 +1299,9 @@ fn custom_data(d: &mut Draft) -> Result<(), Error> {
             || e.is(ns::S, "scenarios")
             || e.is(ns::S, "customProperties")
     };
-    for part in d.xml_parts() {
-        d.prune_linked(&part, pick)?;
-    }
     let empty_tags = |e: &El| e.is(ns::P, "custDataLst") && e.els().next().is_none();
     for part in d.xml_parts() {
-        d.prune_linked(&part, empty_tags)?;
+        d.change(&part, |root| root.prune(&pick) + root.prune(&empty_tags))?;
     }
     d.delete_linked("tags")?;
     Ok(())
@@ -1302,7 +1360,8 @@ fn metadata(d: &mut Draft) -> Result<(), Error> {
     Ok(())
 }
 
-/// `leftover-data`: the glossary and unused shared strings; the sweep takes the rest.
+/// `leftover-data`: the glossary; the workbook step blanks unused shared strings and the
+/// sweep takes the rest.
 fn leftover_data(ctx: &Ctx, d: &mut Draft, found: &[Finding]) -> Result<(), Error> {
     let kinds = |k: &str| {
         found
@@ -1313,9 +1372,6 @@ fn leftover_data(ctx: &Ctx, d: &mut Draft, found: &[Finding]) -> Result<(), Erro
         for g in word::glossaries(ctx) {
             d.delete(g)?;
         }
-    }
-    if kinds("unused_strings") {
-        excel::rebuild_strings(d)?;
     }
     Ok(())
 }
@@ -1337,6 +1393,7 @@ mod tests {
             main: "word/document.xml".into(),
             entries: vec![],
             index: HashMap::new(),
+            edited: HashSet::new(),
             types: Doc::parse(types.as_bytes(), TYPES).unwrap(),
             changes: vec![],
         };

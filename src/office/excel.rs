@@ -1,7 +1,7 @@
 //! Checks that only Excel workbooks have.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use quick_xml::events::{BytesStart, Event};
 
@@ -587,64 +587,60 @@ fn shared_index(c: &El) -> Option<usize> {
         .and_then(|v| v.text().trim().parse().ok())
 }
 
-/// Rebuilds the shared strings of the copy with only the strings some cell uses, renumbering
-/// the cells that use them.
-pub fn rebuild_strings(d: &mut Draft) -> Result<(), Error> {
-    let sheets = cell_sheets(d)?;
+/// Adds the shared strings a sheet's cells use to `used`.
+pub fn used_in(sheet: &El, used: &mut BTreeSet<usize>) {
+    sheet.each(&mut |e| {
+        if e.is(ns::S, "c")
+            && let Some(i) = shared_index(e)
+        {
+            used.insert(i);
+        }
+    });
+}
+
+/// The shared strings no cell of the copy uses.
+pub fn unused_strings(d: &Draft) -> Result<BTreeSet<usize>, Error> {
+    let mut used = BTreeSet::new();
+    for s in cell_sheets(d)? {
+        if let Some(doc) = d.doc(&s)? {
+            used_in(&doc.root, &mut used);
+        }
+    }
+    let mut n = 0;
     for sst in d
         .linked("sharedStrings")?
         .into_iter()
         .filter_map(|l| l.part)
     {
-        let mut used = std::collections::BTreeSet::new();
-        let mut refs = 0usize;
-        for s in &sheets {
-            if let Some(doc) = d.doc(s)? {
-                doc.root.each(&mut |e| {
-                    if e.is(ns::S, "c")
-                        && let Some(i) = shared_index(e)
-                    {
-                        used.insert(i);
-                        refs += 1;
-                    }
-                });
-            }
+        if let Some(doc) = d.doc(&sst)? {
+            n = n.max(doc.root.els().filter(|e| e.is(ns::S, "si")).count());
         }
-        let map: HashMap<usize, usize> = used
-            .iter()
-            .enumerate()
-            .map(|(new, &old)| (old, new))
-            .collect();
+    }
+    Ok((0..n).filter(|i| !used.contains(i)).collect())
+}
+
+/// Empties every shared string that isn't `used` or `kept`, so cells keep their numbers and
+/// no text is left behind.
+pub fn blank_strings(
+    d: &mut Draft,
+    used: &BTreeSet<usize>,
+    kept: &BTreeSet<usize>,
+) -> Result<(), Error> {
+    for sst in d
+        .linked("sharedStrings")?
+        .into_iter()
+        .filter_map(|l| l.part)
+    {
         d.edit(&sst, |root| {
-            let mut i = 0;
-            root.kids.retain(|k| match k {
-                Node::El(e) if e.is(ns::S, "si") => {
-                    i += 1;
-                    map.contains_key(&(i - 1))
+            let mut changed = false;
+            for (i, si) in root.els_mut().filter(|e| e.is(ns::S, "si")).enumerate() {
+                if !used.contains(&i) && !kept.contains(&i) && !si.text().is_empty() {
+                    si.kids = vec![Node::El(El::like(si, "t"))];
+                    changed = true;
                 }
-                _ => true,
-            });
-            root.set("", "count", &refs.to_string());
-            root.set("", "uniqueCount", &map.len().to_string());
-            Ok(true)
+            }
+            Ok(changed)
         })?;
-        for s in &sheets {
-            d.edit(s, |root| {
-                let mut changed = false;
-                root.each_mut(&mut |e| {
-                    if e.is(ns::S, "c")
-                        && let Some(old) = shared_index(e)
-                        && let Some(&new) = map.get(&old)
-                        && new != old
-                        && let Some(v) = e.child_mut(ns::S, "v")
-                    {
-                        v.kids = vec![Node::Text(new.to_string())];
-                        changed = true;
-                    }
-                });
-                Ok(changed)
-            })?;
-        }
     }
     Ok(())
 }

@@ -320,7 +320,7 @@ fn leftovers_are_swept_unless_kept() {
 }
 
 #[test]
-fn unused_shared_strings_are_dropped_and_cells_renumbered() {
+fn unused_shared_strings_are_emptied() {
     let sheet = format!(
         "<worksheet xmlns=\"{S}\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"s\"><v>2</v></c><c r=\"B1\" t=\"s\"><v>0</v></c><c r=\"C1\"><v>0</v></c></row></sheetData></worksheet>"
     );
@@ -343,17 +343,22 @@ fn unused_shared_strings_are_dropped_and_cells_renumbered() {
     let out = run_in(&dir, &["clean", "a.xlsx"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stdout(&out).contains("  removed  leftover-data (1 string)\n"));
-    let copy = unzip(&fs::read(dir.join("a.clean.xlsx")).unwrap());
-    let part = |n: &str| String::from_utf8(copy.iter().find(|e| e.0 == n).unwrap().1.clone());
     assert_eq!(
-        part("xl/sharedStrings.xml").unwrap(),
+        String::from_utf8(part_of(&dir.join("a.clean.xlsx"), "xl/sharedStrings.xml")).unwrap(),
         format!(
-            "<sst xmlns=\"{S}\" count=\"2\" uniqueCount=\"2\"><si><t>first</t></si><si><t>third</t></si></sst>"
+            "<sst xmlns=\"{S}\" count=\"2\" uniqueCount=\"3\"><si><t>first</t></si><si><t/></si><si><t>third</t></si></sst>"
         )
     );
-    assert!(part("xl/worksheets/sheet1.xml").unwrap().contains(
-        "<c r=\"A1\" t=\"s\"><v>1</v></c><c r=\"B1\" t=\"s\"><v>0</v></c><c r=\"C1\"><v>0</v></c>"
+    // The cells keep their numbers, so no sheet is rewritten.
+    let sheet = String::from_utf8(part_of(
+        &dir.join("a.clean.xlsx"),
+        "xl/worksheets/sheet1.xml",
     ));
+    assert!(
+        sheet
+            .unwrap()
+            .contains("<c r=\"A1\" t=\"s\"><v>2</v></c><c r=\"B1\" t=\"s\"><v>0</v></c>")
+    );
 }
 
 /// The planted secrets left in a copy: in its bytes and in every inflated entry.
@@ -1063,4 +1068,161 @@ fn hidden_shapes_go_from_documents_and_sheets() {
         d.contains("name=\"Shown\"") && d.matches("<xdr:twoCellAnchor>").count() == 1,
         "{d}"
     );
+}
+
+/// The checks a file's check found, from its JSON.
+fn found_checks(f: &serde_json::Value) -> Vec<String> {
+    f["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "found")
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn every_kept_check_survives_and_shows_as_kept() {
+    let pictures = ["image-metadata", "cropped-images"];
+    for (name, bytes) in [
+        ("a.docx", leaky_docx("docx")),
+        ("a.xlsx", leaky_xlsx("xlsx")),
+        ("a.pptx", leaky_pptx("pptx")),
+    ] {
+        let dir = dir("clean-keep");
+        put(&dir, &[(name, &bytes)]);
+        let checked = json(&run_in(&dir, &[name, "--json"]));
+        for id in found_checks(&checked["files"][0]) {
+            if pictures.contains(&id.as_str()) || id == "signatures" {
+                continue;
+            }
+            // A hidden macro sheet is a hidden sheet too: removing hidden sheets removes it.
+            let also = if id == "macros" && name.ends_with("xlsx") {
+                ",hidden-sheets"
+            } else {
+                ""
+            };
+            let keep = format!("{id}{also},{}", pictures.join(","));
+            let out = run_in(
+                &dir,
+                &[
+                    "clean",
+                    name,
+                    "--keep",
+                    &keep,
+                    "-o",
+                    "out",
+                    "--overwrite",
+                    "--json",
+                ],
+            );
+            let f = &json(&out)["files"][0];
+            assert_eq!(f["status"], "cleaned", "{name} --keep {id}: {f}");
+            assert!(
+                f["kept"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|k| k == id.as_str()),
+                "{name} {id}"
+            );
+            let rechecked = f["recheck"]["checks"].as_array().unwrap();
+            assert_eq!(
+                rechecked.iter().find(|c| c["id"] == id.as_str()).unwrap()["status"],
+                "kept"
+            );
+            fs::rename(dir.join("out"), dir.join(format!("copy.{}", &name[2..]))).unwrap();
+            let copy = json(&run_in(&dir, &[&format!("copy.{}", &name[2..]), "--json"]));
+            let still = found_checks(&copy["files"][0]);
+            assert!(
+                still.contains(&id),
+                "{name}: {id} didn't survive: {still:?}"
+            );
+            let others: Vec<_> = still
+                .iter()
+                .filter(|c| **c != id && !keep.contains(c.as_str()))
+                .collect();
+            assert!(others.is_empty(), "{name} --keep {id}: {others:?} left");
+        }
+    }
+}
+
+#[test]
+fn the_leak_fixtures_clean_to_nothing_but_their_pictures() {
+    for (name, bytes) in [
+        ("a.docx", leaky_docx("docx")),
+        ("a.xlsx", leaky_xlsx("xlsx")),
+        ("a.pptx", leaky_pptx("pptx")),
+        ("a.docm", leaky_docx("docm")),
+        ("a.xlsm", leaky_xlsx("xlsm")),
+        ("a.pptm", leaky_pptx("pptm")),
+    ] {
+        let dir = dir("clean-leaks");
+        put(&dir, &[(name, &bytes)]);
+        let out = run_in(
+            &dir,
+            &[
+                "clean",
+                name,
+                "--keep",
+                "image-metadata,cropped-images",
+                "--json",
+            ],
+        );
+        let f = &json(&out)["files"][0];
+        assert_eq!(f["status"], "cleaned", "{name}: {f}");
+        let output = f["output"].as_str().unwrap();
+        assert!(!output.ends_with('m'), "{name} -> {output}");
+        let copy = json(&run_in(&dir, &[output, "--json"]));
+        let left: Vec<_> = found_checks(&copy["files"][0]);
+        let pictures: Vec<_> = left
+            .iter()
+            .filter(|c| !["image-metadata", "cropped-images"].contains(&c.as_str()))
+            .collect();
+        assert!(pictures.is_empty(), "{name}: {left:?}");
+        let secrets = copy_secrets(&dir.join(output));
+        let accepted = ["ins", "move"].map(|k| format!("SECRET-docx-{k}-1"));
+        assert!(
+            secrets.iter().all(|s| accepted.contains(s)),
+            "{name}: {secrets:?}"
+        );
+    }
+}
+
+/// Writes the leak fixtures, their twins and their cleaned copies to `DOC_SANITIZE_OUT` (or a
+/// test folder) for checks outside the tests: Office opening each copy, other validators.
+#[test]
+#[ignore = "writes fixtures for outside checks"]
+fn write_cleaned_fixtures() {
+    let out = std::env::var_os("DOC_SANITIZE_OUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir("cleaned"));
+    fs::create_dir_all(&out).unwrap();
+    for (name, bytes) in [
+        ("leaky.docx", leaky_docx("docx")),
+        ("leaky.xlsx", leaky_xlsx("xlsx")),
+        ("leaky.pptx", leaky_pptx("pptx")),
+        ("macros.docm", leaky_docx("docm")),
+        ("macros.xlsm", leaky_xlsx("xlsm")),
+        ("macros.pptm", leaky_pptx("pptm")),
+        ("twin.docx", twin_docx()),
+        ("twin.xlsx", twin_xlsx()),
+        ("twin.pptx", twin_pptx()),
+    ] {
+        fs::write(out.join(name), bytes).unwrap();
+        let o = run_in(
+            &out,
+            &[
+                "clean",
+                name,
+                "--keep",
+                "image-metadata,cropped-images",
+                "--overwrite",
+                "-o",
+                &format!("clean-{name}"),
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{name}: {}", stderr(&o));
+    }
+    println!("{}", out.display());
 }
