@@ -113,10 +113,7 @@ fn broken_structure_is_damaged_without_hanging() {
     );
 
     // 20,000 nested arrays.
-    let mut objects = raw_page("");
-    let deep = format!("{}{}", "[".repeat(20_000), "]".repeat(20_000));
-    objects[0].1 = format!("<< /Type /Catalog /Pages 2 0 R /Deep {deep} >>").into();
-    let f = check_pdf("deep_array.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+    let f = check_pdf("deep_array.pdf", &deep_array(), &[]);
     assert_eq!(f["error"]["code"], "damaged", "{f}");
 
     // /Prev points at the same cross-reference section.
@@ -201,10 +198,7 @@ fn an_object_only_in_the_hybrid_stream_is_read() {
 
 #[test]
 fn a_stream_that_inflates_past_256_mib_is_too_large() {
-    let mut objects = raw_page("/Contents 4 0 R");
-    let bomb = zlib_zeros(260 << 20);
-    objects.push((4, stream_body("/Filter /FlateDecode", &bomb)));
-    let f = check_pdf("flate_bomb.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+    let f = check_pdf("flate_bomb.pdf", &flate_bomb(), &[]);
     assert_eq!(
         error_of(&f),
         (
@@ -623,8 +617,20 @@ fn each_redaction_case_gives_exactly_its_kind() {
         bbox[0].as_f64().unwrap() >= 72.0 && bbox[3].as_f64().unwrap() <= 715.0,
         "{bbox:?}"
     );
-    let out = stdout(&run_in(&dir("x"), &["--version"]));
-    assert!(!out.contains("SECRET-"));
+    assert!(!f.to_string().contains("SECRET-"));
+    let shown = check_pdf("redacted.pdf", &redacted(), &["--show-values"]);
+    let values: Vec<_> = shown["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["value"].as_str())
+        .collect();
+    for page in [1, 6, 7, 8, 9, 10, 11, 12, 13] {
+        assert!(
+            values.contains(&format!("SECRET-pdf-case-{page}").as_str()),
+            "{page}: {values:?}"
+        );
+    }
 }
 
 /// A scanned page: a full-page picture with its text drawn before it, visible (as ABBYY's
@@ -705,22 +711,7 @@ fn an_ocr_layer_drawn_before_its_scan_is_not_hidden() {
 
 #[test]
 fn pages_that_cant_be_drawn_leave_the_rendered_checks_incomplete() {
-    let text = text_at(72, 700, "Some words to check");
-    let huge = stream_body(
-        "/Type /XObject /Subtype /Image /Width 100000 /Height 100000 /ColorSpace /DeviceGray /BitsPerComponent 8",
-        b"\0",
-    );
-    let mut objects = raw_page(
-        "/Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Huge 5 0 R >> >>",
-    );
-    let content = format!("{text}q 10 0 0 10 300 300 cm /Huge Do Q");
-    objects.push((4, stream_body("", content.as_bytes())));
-    objects.push((5, huge));
-    objects.push((
-        6,
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
-    ));
-    let f = check_pdf("huge_image.pdf", &raw(&objects, "/Root 1 0 R"), &[]);
+    let f = check_pdf("huge_image.pdf", &huge_image(), &[]);
     let note =
         "page 1: a picture on it is over 100 megapixels, so its text wasn't drawn and checked";
     for id in ["hidden-text", "fake-redactions"] {
@@ -738,13 +729,8 @@ fn pages_that_cant_be_drawn_leave_the_rendered_checks_incomplete() {
     }
     assert_eq!(f["status"], "incomplete");
 
-    let mut objects = raw_page("/Contents 4 0 R");
-    objects.push((4, stream_body("/Filter /FooDecode", text.as_bytes())));
     let dir = dir("unknown-filter");
-    put(
-        &dir,
-        &[("unknown_filter.pdf", &raw(&objects, "/Root 1 0 R"))],
-    );
+    put(&dir, &[("unknown_filter.pdf", &unknown_filter())]);
     let out = run_in(&dir, &["unknown_filter.pdf"]);
     assert_eq!(out.status.code(), Some(1));
     let note = "page 1: its content couldn't be decoded, so its text wasn't checked";
@@ -792,4 +778,79 @@ fn book_300_timing() {
     println!("book-300.pdf check: {:.1} s", start.elapsed().as_secs_f64());
     let f = &json(&out)["files"][0];
     assert_eq!(hidden_kinds(f).len(), 10, "{f}");
+}
+
+const WORDS: &str = "Some words to check";
+
+/// A page stream inflating past 256 MiB.
+fn flate_bomb() -> Vec<u8> {
+    let mut objects = raw_page("/Contents 4 0 R");
+    objects.push((
+        4,
+        stream_body("/Filter /FlateDecode", &zlib_zeros(260 << 20)),
+    ));
+    raw(&objects, "/Root 1 0 R")
+}
+
+/// 20,000 nested arrays in the catalog.
+fn deep_array() -> Vec<u8> {
+    let mut objects = raw_page("");
+    let deep = format!("{}{}", "[".repeat(20_000), "]".repeat(20_000));
+    objects[0].1 = format!("<< /Type /Catalog /Pages 2 0 R /Deep {deep} >>").into();
+    raw(&objects, "/Root 1 0 R")
+}
+
+/// Text beside a picture declaring 100,000 × 100,000 pixels.
+fn huge_image() -> Vec<u8> {
+    let text = text_at(72, 700, WORDS);
+    let huge = stream_body(
+        "/Type /XObject /Subtype /Image /Width 100000 /Height 100000 /ColorSpace /DeviceGray /BitsPerComponent 8",
+        b"\0",
+    );
+    let mut objects = raw_page(
+        "/Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Huge 5 0 R >> >>",
+    );
+    let content = format!("{text}q 10 0 0 10 300 300 cm /Huge Do Q");
+    objects.push((4, stream_body("", content.as_bytes())));
+    objects.push((5, huge));
+    objects.push((
+        6,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ));
+    raw(&objects, "/Root 1 0 R")
+}
+
+/// A page stream in a filter nobody knows.
+fn unknown_filter() -> Vec<u8> {
+    let mut objects = raw_page("/Contents 4 0 R");
+    objects.push((
+        4,
+        stream_body("/Filter /FooDecode", text_at(72, 700, WORDS).as_bytes()),
+    ));
+    raw(&objects, "/Root 1 0 R")
+}
+
+/// Writes the PDF fixtures into `DOC_SANITIZE_OUT`, for measuring and comparing outside the
+/// tests.
+#[test]
+#[ignore = "writes files: run with --ignored and DOC_SANITIZE_OUT set"]
+fn write_pdf_fixtures() {
+    let out = std::path::PathBuf::from(std::env::var_os("DOC_SANITIZE_OUT").unwrap());
+    let (rgb, size) = scan_of_text();
+    let files: [(&str, Vec<u8>); 11] = [
+        ("redacted.pdf", redacted()),
+        ("leaky.pdf", leaky_structure()),
+        ("plain.pdf", plain_structure()),
+        ("incremental.pdf", incremental()),
+        ("layers.pdf", layered(false)),
+        ("abbyy_style.pdf", scanned(false, &[200; 3], (1, 1))),
+        ("ocr_scan.pdf", scanned(true, &rgb, size)),
+        ("flate_bomb.pdf", flate_bomb()),
+        ("deep_array.pdf", deep_array()),
+        ("huge_image.pdf", huge_image()),
+        ("unknown_filter.pdf", unknown_filter()),
+    ];
+    for (name, bytes) in files {
+        std::fs::write(out.join(name), bytes).unwrap();
+    }
 }
