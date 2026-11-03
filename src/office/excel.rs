@@ -103,12 +103,12 @@ const CELL_KINDS: [(CheckId, &str, &str); 3] = [
     (
         CheckId::HiddenText,
         "same_colour",
-        "coloured like their fill",
+        "with text coloured like the cell fill",
     ),
     (
         CheckId::FakeRedactions,
         "same_colour",
-        "coloured like the dark fill behind them",
+        "with text coloured like the dark cell fill",
     ),
 ];
 

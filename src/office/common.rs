@@ -312,7 +312,7 @@ pub fn metadata(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         let f = Finding::new(
             CheckId::Metadata,
             kind,
-            Where::part(part),
+            ctx.place(part),
             n as u64,
             unit,
             detail,

@@ -539,16 +539,6 @@ fn part_names_with_control_characters_print_safely() {
     assert!(!stdout(&out).contains('\u{1b}'));
 }
 
-const CORE: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
-const CORE_TYPE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
-const APP_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
-
-fn core_xml(fields: &str) -> String {
-    format!(
-        "<cp:coreProperties xmlns:cp=\"{CORE}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">{fields}</cp:coreProperties>"
-    )
-}
-
 /// A document with every kind of metadata, each field holding a planted secret.
 fn metadata_docx() -> Vec<u8> {
     let core = core_xml(
@@ -781,72 +771,6 @@ fn empty_properties_are_not_metadata() {
     assert_eq!(kinds(&check_bytes("plain.docx", &doc), "metadata"), []);
 }
 
-const SHEET_TYPE: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
-const SLIDE_TYPE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
-
-/// A workbook whose sheets (name, state, body) are linked as rId1, rId2, … from workbook.xml
-/// and saved as xl/worksheets/sheetN.xml.
-fn workbook(sheets: &[(&str, &str, &str)]) -> Pkg {
-    let list: String = sheets
-        .iter()
-        .enumerate()
-        .map(|(i, (name, state, _))| {
-            format!(
-                "<sheet name=\"{name}\" sheetId=\"{}\" state=\"{state}\" r:id=\"rId{}\"/>",
-                i + 1,
-                i + 1
-            )
-        })
-        .collect();
-    let mut p = Pkg::new("xlsx").body(&format!(
-        "<workbook xmlns=\"{S}\" xmlns:r=\"{R}\"><sheets>{list}</sheets></workbook>"
-    ));
-    for (i, (_, _, body)) in sheets.iter().enumerate() {
-        p = p.part(
-            "xl/workbook.xml",
-            &format!("rId{}", i + 1),
-            "worksheet",
-            &format!("xl/worksheets/sheet{}.xml", i + 1),
-            SHEET_TYPE,
-            body.as_bytes(),
-        );
-    }
-    p
-}
-
-/// A presentation whose slides (bodies) are linked as rId1, rId2, … and saved as
-/// ppt/slides/slideN.xml.
-fn presentation(slides: &[&str]) -> Pkg {
-    let list: String = (1..=slides.len())
-        .map(|i| format!("<p:sldId id=\"{}\" r:id=\"rId{i}\"/>", 255 + i))
-        .collect();
-    let mut p = Pkg::new("pptx").body(&format!(
-        "<p:presentation xmlns:p=\"{P}\" xmlns:r=\"{R}\"><p:sldIdLst>{list}</p:sldIdLst><p:sldSz cx=\"12192000\" cy=\"6858000\"/></p:presentation>"
-    ));
-    for (i, body) in slides.iter().enumerate() {
-        p = p.part(
-            "ppt/presentation.xml",
-            &format!("rId{}", i + 1),
-            "slide",
-            &format!("ppt/slides/slide{}.xml", i + 1),
-            SLIDE_TYPE,
-            body.as_bytes(),
-        );
-    }
-    p
-}
-
-fn sheet_xml(data: &str) -> String {
-    format!("<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\"><sheetData>{data}</sheetData></worksheet>")
-}
-
-fn slide_xml(shapes: &str) -> String {
-    format!(
-        "<p:sld xmlns:p=\"{P}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"{R}\"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id=\"1\" name=\"\"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>{shapes}</p:spTree></p:cSld></p:sld>"
-    )
-}
-
 #[test]
 fn comments_and_their_authors_are_found() {
     let comments = format!(
@@ -1024,15 +948,6 @@ fn a_hidden_sheet_is_named_only_with_values() {
     );
 }
 
-fn doc_xml(body: &str) -> String {
-    format!(
-        "<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\" xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:o=\"urn:schemas-microsoft-com:office:office\"><w:body>{body}</w:body></w:document>"
-    )
-}
-
-const BY_SAM: &str = "w:author=\"Sam Sample\" w:date=\"2026-01-01T00:00:00Z\"";
-const BY_AVERY: &str = "w:author=\"Avery Example\"";
-
 #[test]
 fn tracked_changes_are_found_with_the_deleted_text() {
     let body = format!(
@@ -1191,20 +1106,6 @@ fn shared_workbook_logs_are_found() {
     assert_eq!(values("shared.xlsx", &book), ["", "", "SECRET-log-2"]);
 }
 
-fn theme_xml() -> String {
-    "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\"><a:themeElements><a:clrScheme name=\"Office\"><a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1><a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1><a:dk2><a:srgbClr val=\"44546A\"/></a:dk2><a:lt2><a:srgbClr val=\"E7E6E6\"/></a:lt2><a:accent1><a:srgbClr val=\"4472C4\"/></a:accent1></a:clrScheme></a:themeElements></a:theme>".into()
-}
-
-const THEME_TYPE: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
-
-fn run(props: &str, text: &str) -> String {
-    format!("<w:r><w:rPr>{props}</w:rPr><w:t xml:space=\"preserve\">{text}</w:t></w:r>")
-}
-
-fn para(runs: &str) -> String {
-    format!("<w:p>{runs}</w:p>")
-}
-
 /// A document with text hidden every way Word allows, and text that only looks like it.
 fn hidden_docx() -> Vec<u8> {
     let styles = format!(
@@ -1214,24 +1115,24 @@ fn hidden_docx() -> Vec<u8> {
          <w:style w:type=\"character\" w:styleId=\"Child\"><w:basedOn w:val=\"Secret\"/><w:rPr><w:b/></w:rPr></w:style></w:styles>"
     );
     let body = [
-        para(&run("", "Visible text")),
-        para(&(run("<w:vanish/>", "SECRET-hidden-1") + &run("", "shown"))),
-        para(&run("<w:rStyle w:val=\"Child\"/>", "SECRET-hidden-2")),
-        para(&run("<w:vanish w:val=\"0\"/>", "not hidden")),
+        para(&text_run("", "Visible text")),
+        para(&(text_run("<w:vanish/>", "SECRET-hidden-1") + &text_run("", "shown"))),
+        para(&text_run("<w:rStyle w:val=\"Child\"/>", "SECRET-hidden-2")),
+        para(&text_run("<w:vanish w:val=\"0\"/>", "not hidden")),
         "<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr></w:p>".into(),
-        para(&run("<w:sz w:val=\"1\"/>", "SECRET-tiny-1")),
-        para(&run("<w:color w:val=\"FFFFFF\"/>", "SECRET-white-1")),
-        para(&run("<w:color w:val=\"000000\" w:themeColor=\"background1\"/>", "SECRET-white-2")),
-        para(&run("<w:color w:val=\"000000\"/><w:highlight w:val=\"black\"/>", "SECRET-black-1")),
-        format!("<w:tbl><w:tr><w:tc><w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"000000\"/></w:tcPr>{}</w:tc></w:tr></w:tbl>", para(&run("<w:color w:val=\"111111\"/>", "SECRET-black-2"))),
-        para(&run("<w:color w:val=\"auto\"/><w:highlight w:val=\"black\"/>", "auto on black")),
-        para(&run("<w:color w:val=\"FFFFFF\"/><w:highlight w:val=\"darkBlue\"/>", "white on blue")),
-        para(&run("<w:color w:val=\"FFFFFF\"/><w:shd w:val=\"clear\" w:fill=\"auto\"/><w:highlight w:val=\"none\"/>", "SECRET-white-3")),
+        para(&text_run("<w:sz w:val=\"1\"/>", "SECRET-tiny-1")),
+        para(&text_run("<w:color w:val=\"FFFFFF\"/>", "SECRET-white-1")),
+        para(&text_run("<w:color w:val=\"000000\" w:themeColor=\"background1\"/>", "SECRET-white-2")),
+        para(&text_run("<w:color w:val=\"000000\"/><w:highlight w:val=\"black\"/>", "SECRET-black-1")),
+        format!("<w:tbl><w:tr><w:tc><w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"000000\"/></w:tcPr>{}</w:tc></w:tr></w:tbl>", para(&text_run("<w:color w:val=\"111111\"/>", "SECRET-black-2"))),
+        para(&text_run("<w:color w:val=\"auto\"/><w:highlight w:val=\"black\"/>", "auto on black")),
+        para(&text_run("<w:color w:val=\"FFFFFF\"/><w:highlight w:val=\"darkBlue\"/>", "white on blue")),
+        para(&text_run("<w:color w:val=\"FFFFFF\"/><w:shd w:val=\"clear\" w:fill=\"auto\"/><w:highlight w:val=\"none\"/>", "SECRET-white-3")),
     ]
     .concat();
     let header = format!(
         "<w:hdr xmlns:w=\"{W}\">{}</w:hdr>",
-        para(&run("", "Header text"))
+        para(&text_run("", "Header text"))
     );
     let wml = |t: &str| format!("{OX}.wordprocessingml.{t}+xml");
     Pkg::new("docx")
@@ -1285,7 +1186,7 @@ fn hidden_and_same_colour_text_is_found_in_documents() {
                 "same_colour",
                 "word/document.xml",
                 42,
-                "42 characters coloured like their background"
+                "42 characters coloured like the background"
             ),
         ]
     );
@@ -1295,7 +1196,7 @@ fn hidden_and_same_colour_text_is_found_in_documents() {
             "same_colour",
             "word/document.xml",
             28,
-            "28 characters coloured like the dark background behind them"
+            "28 characters coloured like the dark background"
         )]
     );
     assert_eq!(
@@ -1307,10 +1208,6 @@ fn hidden_and_same_colour_text_is_found_in_documents() {
             "SECRET-black-1"
         ]
     );
-}
-
-fn styles_xml(body: &str) -> String {
-    format!("<styleSheet xmlns=\"{S}\">{body}</styleSheet>")
 }
 
 #[test]
@@ -1373,7 +1270,7 @@ fn hidden_and_same_colour_cells_are_found() {
                 "same_colour",
                 "xl/worksheets/sheet1.xml",
                 2,
-                "2 cells coloured like their fill"
+                "2 cells with text coloured like the cell fill"
             ),
         ]
     );
@@ -1383,7 +1280,7 @@ fn hidden_and_same_colour_cells_are_found() {
             "same_colour",
             "xl/worksheets/sheet1.xml",
             2,
-            "2 cells coloured like the dark fill behind them"
+            "2 cells with text coloured like the dark cell fill"
         )]
     );
     let places: Vec<_> = f["findings"]
@@ -1407,7 +1304,7 @@ fn hidden_and_same_colour_cells_are_found() {
     let dir = dir("cells-text");
     put(&dir, &[("cells.xlsx", &book)]);
     assert!(stdout(&run_in(&dir, &["cells.xlsx"])).contains(
-        "  ✗ fake-redactions  sheet Data, D5:D6: 2 cells coloured like the dark fill behind them\n"
+        "  ✗ fake-redactions  sheet Data, D5:D6: 2 cells with text coloured like the dark cell fill\n"
     ));
 }
 
@@ -1477,17 +1374,6 @@ fn hidden_sheets_rows_and_columns_are_found() {
         values("hidden.xlsx", &book),
         ["Salaries", "Draft", "SECRET-row-1", "11"]
     );
-}
-
-fn shape(id: u32, hidden: bool, xfrm: &str, text: &str) -> String {
-    let hidden = if hidden { " hidden=\"1\"" } else { "" };
-    format!(
-        "<p:sp><p:nvSpPr><p:cNvPr id=\"{id}\" name=\"Shape {id}\"{hidden}/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr>{xfrm}</p:spPr><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp>"
-    )
-}
-
-fn xfrm(x: i64, y: i64, cx: i64, cy: i64) -> String {
-    format!("<a:xfrm><a:off x=\"{x}\" y=\"{y}\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>")
 }
 
 #[test]
@@ -1845,19 +1731,6 @@ fn workbook_and_deck_data_parts_are_found() {
     );
 }
 
-/// The `[Content_Types].xml` of `entries` with `part`'s Override changed to `ct`.
-fn zip_types_with(entries: &[Entry], part: &str, ct: &str) -> Vec<u8> {
-    let types = String::from_utf8(entries[0].data.clone()).unwrap();
-    let from = format!("<Override PartName=\"/{part}\" ContentType=\"{SHEET_TYPE}\"/>");
-    assert!(types.contains(&from));
-    types
-        .replace(
-            &from,
-            &format!("<Override PartName=\"/{part}\" ContentType=\"{ct}\"/>"),
-        )
-        .into_bytes()
-}
-
 #[test]
 fn links_to_local_files_are_found_and_web_links_are_not() {
     let settings = format!(
@@ -2058,44 +1931,6 @@ fn the_path_rule_tells_files_from_web_links() {
     assert!(!doc_sanitize::office::common::is_path("#Sheet2!A1", true));
 }
 
-/// A JPEG whose EXIF block holds `tags` (each a short), with optional bytes after the end.
-fn jpeg(tags: &[u16], after: &[u8]) -> Vec<u8> {
-    let mut exif = b"Exif\0\0II*\0\x08\0\0\0".to_vec();
-    exif.extend((tags.len() as u16).to_le_bytes());
-    for t in tags {
-        exif.extend(t.to_le_bytes());
-        exif.extend([3, 0, 1, 0, 0, 0, 6, 0, 0, 0]);
-    }
-    exif.extend([0; 4]);
-    let mut b = vec![0xFF, 0xD8, 0xFF, 0xE1];
-    b.extend(((exif.len() + 2) as u16).to_be_bytes());
-    b.extend(exif);
-    b.extend([0xFF, 0xDA, 0, 2, 0x12, 0x34, 0xFF, 0xD9]);
-    b.extend(after);
-    b
-}
-
-fn picture_doc(media: &[(&str, &[u8])], body: &str) -> Vec<u8> {
-    let mut p = Pkg::new("docx").body(&doc_xml(body));
-    for (i, (name, bytes)) in media.iter().enumerate() {
-        p = p.part(
-            "word/document.xml",
-            &format!("rId{}", i + 1),
-            "image",
-            name,
-            "",
-            bytes,
-        );
-    }
-    p.zip()
-}
-
-fn blip(id: &str, crop: &str) -> String {
-    format!(
-        "<w:p><w:r><w:drawing><wp:inline><wp:docPr id=\"1\" name=\"p\"/><a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed=\"{id}\"/>{crop}<a:stretch/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"
-    )
-}
-
 #[test]
 fn picture_metadata_and_crops_are_found() {
     let body = blip(
@@ -2201,4 +2036,329 @@ fn pivot_caches_and_data_models_are_found() {
         ]
     );
     assert_eq!(values("pivot.xlsx", &book), ["SECRET-pivot-1", ""]);
+}
+
+/// Each (check, kind) a file's findings name, once.
+fn found_kinds(f: &serde_json::Value) -> std::collections::BTreeSet<(String, String)> {
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    f["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| (s(&x["check"]), s(&x["kind"])))
+        .collect()
+}
+
+fn pairs(list: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String)> {
+    list.iter()
+        .map(|(c, k)| (c.to_string(), k.to_string()))
+        .collect()
+}
+
+const DOCX_LEAKS: [(&str, &str); 25] = [
+    ("metadata", "core_properties"),
+    ("metadata", "app_properties"),
+    ("metadata", "custom_properties"),
+    ("metadata", "thumbnail"),
+    ("metadata", "tracking_ids"),
+    ("metadata", "editor_names"),
+    ("comments", "comment"),
+    ("comments", "people"),
+    ("tracked-changes", "insertion"),
+    ("tracked-changes", "deletion"),
+    ("tracked-changes", "move"),
+    ("tracked-changes", "table_change"),
+    ("hidden-text", "hidden_formatting"),
+    ("hidden-text", "same_colour"),
+    ("fake-redactions", "same_colour"),
+    ("embedded-files", "embedded_object"),
+    ("custom-data", "data_binding"),
+    ("custom-data", "document_variables"),
+    ("custom-data", "custom_xml"),
+    ("external-links", "template_path"),
+    ("external-links", "mail_merge_source"),
+    ("external-links", "field_path"),
+    ("image-metadata", "picture_metadata"),
+    ("cropped-images", "cropped_picture"),
+    ("leftover-data", "glossary"),
+];
+
+const XLSX_LEAKS: [(&str, &str); 20] = [
+    ("metadata", "core_properties"),
+    ("metadata", "app_properties"),
+    ("metadata", "printer_settings"),
+    ("metadata", "editor_names"),
+    ("comments", "note"),
+    ("comments", "threaded_comment"),
+    ("comments", "people"),
+    ("hidden-text", "hidden_format"),
+    ("hidden-text", "same_colour"),
+    ("fake-redactions", "same_colour"),
+    ("hidden-sheets", "hidden_sheet"),
+    ("hidden-rows-columns", "hidden_rows"),
+    ("hidden-rows-columns", "hidden_columns"),
+    ("custom-data", "scenarios"),
+    ("macros", "macro_sheet"),
+    ("external-links", "external_workbook"),
+    ("external-links", "data_connection"),
+    ("external-links", "folder_path"),
+    ("pivot-caches", "pivot_cache"),
+    ("leftover-data", "unused_strings"),
+];
+
+const PPTX_LEAKS: [(&str, &str); 14] = [
+    ("metadata", "core_properties"),
+    ("metadata", "app_properties"),
+    ("metadata", "tracking_ids"),
+    ("comments", "comment"),
+    ("comments", "people"),
+    ("hidden-slides", "hidden_slide"),
+    ("speaker-notes", "notes"),
+    ("hidden-objects", "hidden_object"),
+    ("hidden-objects", "off_slide_object"),
+    ("embedded-files", "embedded_object"),
+    ("embedded-files", "chart_workbook"),
+    ("custom-data", "tags"),
+    ("custom-data", "add_in_data"),
+    ("cropped-images", "cropped_picture"),
+];
+
+#[test]
+fn the_leak_fixtures_show_every_planted_leak() {
+    let docx = check_bytes("leaky.docx", &leaky_docx("docx"));
+    assert_eq!(found_kinds(&docx), pairs(&DOCX_LEAKS), "{docx}");
+    let changes = kinds(&docx, "tracked-changes");
+    let counts: Vec<_> = changes.iter().map(|c| (c.0.as_str(), c.2)).collect();
+    assert_eq!(
+        counts,
+        [
+            ("insertion", 1),
+            ("deletion", 2),
+            ("move", 2),
+            ("table_change", 2)
+        ]
+    );
+    assert!(
+        changes.iter().all(|c| c.3.contains("by 1 author")),
+        "{changes:?}"
+    );
+    assert_eq!(kinds(&docx, "hidden-text")[0].2, 40);
+
+    let xlsx = check_bytes("leaky.xlsx", &leaky_xlsx("xlsx"));
+    assert_eq!(found_kinds(&xlsx), pairs(&XLSX_LEAKS), "{xlsx}");
+    let sheets: Vec<_> = findings_of(&xlsx, "hidden-sheets")
+        .iter()
+        .map(|x| x["where"]["sheet_index"].clone())
+        .collect();
+    assert_eq!(sheets, [2, 3, 4]);
+    let rows = findings_of(&xlsx, "hidden-rows-columns");
+    assert_eq!(
+        rows[0]["where"],
+        serde_json::json!({ "part": "xl/worksheets/sheet1.xml", "sheet_index": 1, "sheet": "Summary", "cells": "A5:A6" })
+    );
+    assert_eq!(
+        (rows[0]["count"].clone(), rows[1]["count"].clone()),
+        (2.into(), 1.into())
+    );
+
+    let pptx = check_bytes("leaky.pptx", &leaky_pptx("pptx"));
+    assert_eq!(found_kinds(&pptx), pairs(&PPTX_LEAKS), "{pptx}");
+    let slides: Vec<_> = ["hidden-slides", "speaker-notes", "hidden-objects"]
+        .iter()
+        .flat_map(|c| findings_of(&pptx, c))
+        .map(|x| x["where"]["slide"].clone())
+        .collect();
+    assert_eq!(slides, [2, 1, 1, 1]);
+}
+
+#[test]
+fn the_twins_find_nothing() {
+    for (name, bytes) in [
+        ("twin.docx", twin_docx()),
+        ("twin.xlsx", twin_xlsx()),
+        ("twin.pptx", twin_pptx()),
+    ] {
+        let f = check_bytes(name, &bytes);
+        assert_eq!(f["status"], "none_found", "{name}: {f}");
+        assert!(
+            f["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["status"] == "none_found")
+        );
+    }
+}
+
+#[test]
+fn planted_values_show_only_when_asked() {
+    for (name, bytes, secrets) in [
+        (
+            "leaky.docx",
+            leaky_docx("docx"),
+            &[
+                "docx-comment-1",
+                "docx-ins-1",
+                "docx-del-1",
+                "docx-move-1",
+                "docx-vanish-1",
+                "docx-white-1",
+                "docx-black-1",
+                "docx-var-1",
+                "docx-xml-1",
+                "docx-template-1",
+                "docx-merge-1",
+                "docx-field-1",
+                "docx-ed-1",
+                "docx-company-1",
+                "docx-custom-1",
+            ][..],
+        ),
+        (
+            "leaky.xlsx",
+            leaky_xlsx("xlsx"),
+            &[
+                "xlsx-note-1",
+                "xlsx-thread-1",
+                "xlsx-format-1",
+                "xlsx-white-1",
+                "xlsx-black-1",
+                "xlsx-row-1",
+                "xlsx-col-1",
+                "xlsx-scenario-1",
+                "xlsx-book-1",
+                "xlsx-dsn-1",
+                "xlsx-folder-1",
+                "xlsx-pivot-1",
+                "xlsx-unused-1",
+                "xlsx-user-1",
+            ][..],
+        ),
+        (
+            "leaky.pptx",
+            leaky_pptx("pptx"),
+            &[
+                "pptx-slide-1",
+                "pptx-notes-1",
+                "pptx-comment-1",
+                "pptx-comment-2",
+                "pptx-shape-1",
+                "pptx-offslide-1",
+                "pptx-tag-1",
+                "pptx-addin-1",
+            ][..],
+        ),
+    ] {
+        let shown = values(name, &bytes).join("\n");
+        for s in secrets {
+            assert!(
+                shown.contains(&format!("SECRET-{s}")),
+                "{name}: SECRET-{s} not in\n{shown}"
+            );
+        }
+    }
+}
+
+#[test]
+fn macro_variants_report_their_vba_project() {
+    for (name, bytes, part) in [
+        ("macros.docm", leaky_docx("docm"), "word/vbaProject.bin"),
+        ("macros.xlsm", leaky_xlsx("xlsm"), "xl/vbaProject.bin"),
+        ("macros.pptm", leaky_pptx("pptm"), "ppt/vbaProject.bin"),
+    ] {
+        let f = check_bytes(name, &bytes);
+        let vba: Vec<_> = kinds(&f, "macros")
+            .into_iter()
+            .filter(|k| k.0 == "vba_project")
+            .collect();
+        assert_eq!(
+            vba,
+            [found("vba_project", part, 1, "1 VBA macro project")],
+            "{name}"
+        );
+        assert_eq!(f["warnings"], serde_json::json!([]), "{name}");
+    }
+}
+
+/// `ledger.xlsx` (spec §9): 1,000,000 cells over 4 sheets, a tenth of them shared strings,
+/// with formulas and one hidden column.
+fn ledger() -> Vec<u8> {
+    use std::fmt::Write;
+    let mut sheets = vec![];
+    for s in 0..4 {
+        let mut data = String::with_capacity(8 << 20);
+        for row in 1..=25_000u32 {
+            write!(data, "<row r=\"{row}\">").unwrap();
+            for (c, col) in "ABCDEFGHIJ".chars().enumerate() {
+                match c {
+                    0 => write!(
+                        data,
+                        "<c r=\"{col}{row}\" t=\"s\"><v>{}</v></c>",
+                        row % 1000
+                    ),
+                    9 => write!(
+                        data,
+                        "<c r=\"{col}{row}\"><f>SUM(B{row}:I{row})</f><v>{}</v></c>",
+                        row * 8
+                    ),
+                    _ => write!(data, "<c r=\"{col}{row}\"><v>{}</v></c>", row + s),
+                }
+                .unwrap();
+            }
+            data += "</row>";
+        }
+        let cols =
+            "<cols><col min=\"5\" max=\"5\" width=\"9\" hidden=\"1\" customWidth=\"1\"/></cols>";
+        sheets.push(format!(
+            "<worksheet xmlns=\"{S}\">{cols}<sheetData>{data}</sheetData></worksheet>"
+        ));
+    }
+    let named: Vec<_> = sheets
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (format!("Sheet{}", i + 1), b))
+        .collect();
+    let list: Vec<_> = named
+        .iter()
+        .map(|(n, b)| (n.as_str(), "visible", b.as_str()))
+        .collect();
+    let sst: String = (0..1000)
+        .map(|i| format!("<si><t>Account {i}</t></si>"))
+        .collect();
+    workbook(&list)
+        .part(
+            "xl/workbook.xml",
+            "rId9",
+            "sharedStrings",
+            "xl/sharedStrings.xml",
+            &format!("{OX}.spreadsheetml.sharedStrings+xml"),
+            format!("<sst xmlns=\"{S}\">{sst}</sst>").as_bytes(),
+        )
+        .zip()
+}
+
+/// Writes the leak fixtures, their twins and `ledger.xlsx` to `$DOC_SANITIZE_FIXTURES` (or a
+/// folder under the test target), for timing and for opening in Office.
+#[test]
+#[ignore = "writes files for measuring by hand"]
+fn write_fixtures() {
+    let out = std::env::var_os("DOC_SANITIZE_FIXTURES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir("fixtures"));
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, bytes) in [
+        ("leaky.docx", leaky_docx("docx")),
+        ("leaky.xlsx", leaky_xlsx("xlsx")),
+        ("leaky.pptx", leaky_pptx("pptx")),
+        ("macros.docm", leaky_docx("docm")),
+        ("macros.xlsm", leaky_xlsx("xlsm")),
+        ("macros.pptm", leaky_pptx("pptm")),
+        ("twin.docx", twin_docx()),
+        ("twin.xlsx", twin_xlsx()),
+        ("twin.pptx", twin_pptx()),
+        ("ledger.xlsx", ledger()),
+    ] {
+        std::fs::write(out.join(name), bytes).unwrap();
+    }
+    println!("{}", out.display());
 }

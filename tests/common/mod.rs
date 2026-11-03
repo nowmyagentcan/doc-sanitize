@@ -2,7 +2,13 @@
 
 #![allow(dead_code)]
 
+pub mod build;
+pub mod leaky;
 pub mod pkg;
+#[allow(unused_imports)]
+pub use build::*;
+#[allow(unused_imports)]
+pub use leaky::*;
 #[allow(unused_imports)]
 pub use pkg::*;
 

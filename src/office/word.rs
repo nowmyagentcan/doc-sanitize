@@ -303,12 +303,12 @@ const HIDDEN_RUNS: [(CheckId, &str, &str); 4] = [
     (
         CheckId::HiddenText,
         "same_colour",
-        "coloured like their background",
+        "coloured like the background",
     ),
     (
         CheckId::FakeRedactions,
         "same_colour",
-        "coloured like the dark background behind them",
+        "coloured like the dark background",
     ),
 ];
 
