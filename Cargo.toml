@@ -1,0 +1,13 @@
+[package]
+name = "doc-sanitize"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Find and remove hidden data in PDF, Word, Excel and PowerPoint files"
+repository = "https://github.com/nowmyagentcan/doc-sanitize"
+publish = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
