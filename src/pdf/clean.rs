@@ -181,56 +181,52 @@ impl Copy {
     }
 
     /// Drops the annotations `pick` picks (by page number and dictionary) from every page,
-    /// with the pop-ups of those dropped; gives how many went.
-    fn drop_annots(&mut self, pick: impl Fn(usize, &Dictionary) -> bool) -> usize {
-        let mut gone = 0;
+    /// with their pop-ups.
+    fn drop_annots(&mut self, pick: impl Fn(usize, &Dictionary) -> bool) {
         for (i, &page) in self.pages.clone().iter().enumerate() {
             let Some(list) = self.annots(page) else {
                 continue;
             };
-            let dicts: Vec<Option<(Option<ObjectId>, Dictionary)>> = list
+            let dicts: Vec<Option<Dictionary>> = list
                 .iter()
-                .map(|a| {
-                    let id = a.as_reference().ok();
-                    let d = match id {
-                        Some(id) => self.doc.get_dictionary(id).ok().cloned(),
-                        None => a.as_dict().ok().cloned(),
-                    };
-                    d.map(|d| (id, d))
+                .map(|a| match a.as_reference() {
+                    Ok(id) => self.doc.get_dictionary(id).ok().cloned(),
+                    Err(_) => a.as_dict().ok().cloned(),
                 })
                 .collect();
-            let picked: HashSet<ObjectId> = dicts
+            let picked = |d: &Option<Dictionary>| d.as_ref().is_some_and(|d| pick(i + 1, d));
+            // The picked annotations and the pop-ups they name.
+            let linked: HashSet<ObjectId> = list
                 .iter()
+                .zip(&dicts)
+                .filter(|(_, d)| picked(d))
+                .flat_map(|(a, d)| {
+                    let popup = d.as_ref().and_then(|d| d.get(b"Popup").ok());
+                    [
+                        a.as_reference().ok(),
+                        popup.and_then(|p| p.as_reference().ok()),
+                    ]
+                })
                 .flatten()
-                .filter(|(_, d)| pick(i + 1, d))
-                .filter_map(|(id, _)| *id)
                 .collect();
-            let popups: HashSet<ObjectId> = dicts
+            let reference = |d: &Dictionary, key: &[u8]| d.get(key).and_then(Object::as_reference);
+            let keep: Vec<bool> = list
                 .iter()
-                .flatten()
-                .filter(|(_, d)| pick(i + 1, d))
-                .filter_map(|(_, d)| d.get(b"Popup").and_then(Object::as_reference).ok())
-                .collect();
-            let keep: Vec<bool> = dicts
-                .iter()
-                .map(|e| match e {
-                    None => true,
-                    Some((id, d)) => {
-                        let parent = d.get(b"Parent").and_then(Object::as_reference).ok();
-                        !(pick(i + 1, d)
-                            || id.is_some_and(|id| popups.contains(&id))
-                            || subtype(d) == b"Popup"
-                                && parent.is_some_and(|p| picked.contains(&p)))
-                    }
+                .zip(&dicts)
+                .map(|(a, d)| {
+                    let popup = d.as_ref().is_some_and(|d| {
+                        subtype(d) == b"Popup"
+                            && (a.as_reference().is_ok_and(|id| linked.contains(&id))
+                                || reference(d, b"Parent").is_ok_and(|p| linked.contains(&p)))
+                    });
+                    !picked(d) && !popup
                 })
                 .collect();
-            gone += keep.iter().filter(|k| !**k).count();
             if let Some(list) = self.annots_mut(page) {
                 let mut k = keep.iter();
                 list.retain(|_| *k.next().unwrap_or(&true));
             }
         }
-        gone
     }
 
     /// A page's annotations as listed.
@@ -290,27 +286,24 @@ impl Copy {
             Object::Dictionary(d) => bad(d),
             _ => false,
         };
-        each(&mut self.doc, &mut |o| match o {
-            Object::Array(a) => a.retain(|o| !cut(o)),
-            Object::Dictionary(_) | Object::Stream(_) => {
-                let d = match o {
-                    Object::Stream(s) => &mut s.dict,
-                    Object::Dictionary(d) => d,
-                    _ => unreachable!(),
-                };
-                let gone: Vec<Vec<u8>> = d
-                    .iter()
-                    .filter(|(_, v)| cut(v))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                for k in gone {
-                    d.remove(&k);
-                }
-                if macros {
-                    d.remove(b"JavaScript");
-                }
+        each(&mut self.doc, &mut |o| {
+            let d = match o {
+                Object::Array(a) => return a.retain(|o| !cut(o)),
+                Object::Stream(s) => &mut s.dict,
+                Object::Dictionary(d) => d,
+                _ => return,
+            };
+            let gone: Vec<Vec<u8>> = d
+                .iter()
+                .filter(|(_, v)| cut(v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in gone {
+                d.remove(&k);
             }
-            _ => {}
+            if macros {
+                d.remove(b"JavaScript");
+            }
         });
         self.drop_annots(|_, a| subtype(a) == b"Link" && !a.has(b"A") && !a.has(b"Dest"));
     }
@@ -554,7 +547,7 @@ impl Copy {
             )])
         };
         let first = *pictures.first().expect("a page to draw");
-        let drawing = raster::open(saved).ok_or_else(|| blocked(first))?;
+        let drawing = hayro::hayro_syntax::Pdf::new(saved).map_err(|_| blocked(first))?;
         let pages = drawing.pages();
         let cache = RenderCache::new();
         let (mut flattened, mut marks, mut fields) = (0, vec![], HashSet::new());

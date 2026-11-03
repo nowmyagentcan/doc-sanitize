@@ -6,7 +6,6 @@ use std::io::Write;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use hayro::hayro_interpret::InterpreterSettings;
-use hayro::hayro_syntax::Pdf as Pages;
 use hayro::hayro_syntax::page::{Page, Rotation};
 use hayro::kurbo::{Affine, Rect};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -102,11 +101,6 @@ pub fn draw<'a>(
         rotated: !matches!(page.rotation(), Rotation::None),
         redactions,
     })
-}
-
-/// The pages of the document saved as `bytes`.
-pub fn open(bytes: Vec<u8>) -> Option<Pages> {
-    Pages::new(bytes).ok()
 }
 
 /// A /Redact mark's /IC colour; black when it has none.
