@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Find and remove hidden data</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><rect width='256' height='256' rx='57' fill='%23dc2626'/><path transform='translate(48 48) scale(.625)' fill='%23fff' d='M56.88,31.93A12,12,0,1,0,39.12,48.07l16,17.65C20.67,88.66,5.72,121.58,5,123.13a12.08,12.08,0,0,0,0,9.75c.37.82,9.13,20.26,28.49,39.61C59.37,198.34,92,212,128,212a131.34,131.34,0,0,0,51-10l20.09,22.1a12,12,0,0,0,17.76-16.14ZM128,188c-29.59,0-55.47-10.73-76.91-31.88A130.69,130.69,0,0,1,29.52,128c5.27-9.31,18.79-29.9,42-44.29l90.09,99.11A109.33,109.33,0,0,1,128,188Zm123-55.12c-.36.81-9,20-28,39.16a12,12,0,1,1-17-16.9A130.48,130.48,0,0,0,226.48,128a130.36,130.36,0,0,0-21.57-28.12C183.46,78.73,157.59,68,128,68c-3.35,0-6.7.14-10,.42a12,12,0,1,1-2-23.91c3.93-.34,8-.51,12-.51,36,0,68.63,13.67,94.49,39.52,19.35,19.35,28.11,38.8,28.48,39.61A12.08,12.08,0,0,1,251,132.88Z'/></svg>">
+<style>
+:root { --bg:#fafaf9; --fg:#1c1b1a; --muted:#6b6966; --line:#e7e5e2; --field:#f2f1ef; --accent:#0f7b4a; --danger:#b42318; --r:8px;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace; }
+@media (prefers-color-scheme: dark) { :root { --bg:#121110; --fg:#ecebe9; --muted:#9a9894; --line:#2a2826; --field:#1b1a19; --accent:#5fd38d; --danger:#f97066; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 28px 16px 20px; display: grid; gap: 16px; }
+h1 { margin: 0; font-size: 19px; font-weight: 600; text-align: center; letter-spacing: -0.01em; }
+p, h2, pre, ul { margin: 0; }
+ul { padding: 0; list-style: none; }
+svg { width: 16px; height: 16px; fill: currentColor; flex: none; }
+.visual { width: auto; height: 64px; justify-self: center; color: var(--muted); }
+form { display: grid; gap: 12px; }
+#zone { display: grid; gap: 2px; place-content: center; min-height: 96px; padding: 16px; font: inherit; color: var(--fg); text-align: center;
+  white-space: normal; background: none; border: 2px dashed var(--line); border-radius: var(--r); cursor: pointer; }
+#zone:hover, #zone.over { border-color: var(--accent); background: var(--field); }
+#chosen { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+input { width: 100%; min-height: 40px; padding: 8px 10px; font: inherit; font-size: 15px; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: var(--r); }
+input[type=checkbox] { width: 18px; min-height: 18px; margin: 0; accent-color: var(--accent); }
+.opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+.check { display: flex; align-items: center; gap: 8px; align-self: end; min-height: 40px; font-size: 15px; color: var(--fg); }
+summary { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--muted); cursor: pointer; list-style: none; border-radius: var(--r); }
+summary::-webkit-details-marker { display: none; }
+details[open] > summary svg { transform: rotate(90deg); }
+button { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 10px; font: inherit; font-size: 14px; color: var(--fg); background: var(--field); border: 1px solid var(--line); border-radius: var(--r); cursor: pointer; white-space: nowrap; }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .55; cursor: default; }
+.go { justify-self: center; min-height: 40px; padding: 8px 40px; font-size: 15px; font-weight: 600; color: var(--bg); background: var(--accent); border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#out { display: grid; gap: 16px; min-height: 88px; padding: 16px; border: 1px solid var(--line); border-radius: var(--r); align-content: start; }
+.muted { color: var(--muted); }
+.bar { width: 100%; height: 3px; overflow: hidden; border-radius: var(--r); }
+.bar::after { content: ""; display: block; width: 40%; height: 100%; background: var(--accent); animation: slide 1.1s linear infinite; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .bar::after { width: 100%; animation: none; } }
+.head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; }
+.sum { font-size: 17px; font-weight: 600; }
+.acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.file { display: grid; gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); }
+h2 { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+h2 span { font-weight: 400; color: var(--muted); }
+.found { color: var(--danger); font-weight: 600; }
+.rows { display: grid; gap: 8px; }
+.row { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; padding: 10px 12px; background: var(--field); border-radius: var(--r); }
+.id { font: 600 14px/1.5 var(--mono); }
+.row label { grid-column: 2; grid-row: 1; display: flex; align-items: center; gap: 6px; font-size: 14px; color: var(--fg); }
+.finds { grid-column: 1 / -1; display: grid; gap: 2px; font-size: 14px; }
+.where { color: var(--muted); }
+.nw { white-space: nowrap; }
+pre { margin: 2px 0 4px; padding: 2px 0 2px 10px; font: 13px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); }
+.finds summary { font-size: 13px; }
+.note, .err { display: flex; gap: 8px; align-items: baseline; }
+.note svg, .err svg { position: relative; top: 3px; }
+.note code { font: 14px var(--mono); white-space: nowrap; }
+.err { color: var(--danger); font-weight: 600; }
+.hint { padding-left: 24px; }
+.cleaned { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r); }
+.kv { display: grid; grid-template-columns: 72px 1fr; gap: 8px; font-size: 14px; }
+.kv span:first-child { color: var(--muted); }
+footer { display: flex; justify-content: center; align-items: center; gap: 16px; font-size: 13px; }
+footer a { display: inline-flex; color: var(--muted); border-radius: 4px; }
+footer a:hover { color: var(--fg); }
+footer svg { width: 18px; height: 18px; }
+@media (max-width: 520px) { .opts { grid-template-columns: 1fr; } .kv { grid-template-columns: 1fr; gap: 0; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Find and remove hidden data in PDF, Word, Excel and PowerPoint files.</h1>
+  <svg class="visual" viewBox="0 0 160 64" role="img" aria-label="A document with a hidden line becomes the same document without it">
+    <g transform="translate(0 8) scale(.1875)">
+      <path d="M213.66,82.34l-56-56A8,8,0,0,0,152,24H56A16,16,0,0,0,40,40V216a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V88A8,8,0,0,0,213.66,82.34ZM160,51.31,188.69,80H160ZM200,216H56V40h88V88a8,8,0,0,0,8,8h48V216Zm-32-80a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,136Zm0,32a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,168Z"/>
+      <line x1="96" y1="200" x2="160" y2="200" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-dasharray="4 26"/>
+    </g>
+    <path transform="translate(64 16) scale(.125)" d="M221.66,133.66l-72,72a8,8,0,0,1-11.32-11.32L196.69,136H40a8,8,0,0,1,0-16H196.69L138.34,61.66a8,8,0,0,1,11.32-11.32l72,72A8,8,0,0,1,221.66,133.66Z"/>
+    <path transform="translate(112 8) scale(.1875)" d="M213.66,82.34l-56-56A8,8,0,0,0,152,24H56A16,16,0,0,0,40,40V216a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V88A8,8,0,0,0,213.66,82.34ZM160,51.31,188.69,80H160ZM200,216H56V40h88V88a8,8,0,0,0,8,8h48V216Zm-32-80a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,136Zm0,32a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,168Z"/>
+  </svg>
+
+  <form>
+    <button type="button" id="zone" aria-describedby="chosen">
+      <span>Drop files here, or click to choose</span>
+      <span id="chosen"></span>
+    </button>
+    <input type="file" id="files" multiple hidden accept=".pdf,.docx,.docm,.dotx,.dotm,.xlsx,.xlsm,.xltx,.xltm,.pptx,.pptm,.potx,.potm,.ppsx,.ppsm">
+    <details>
+      <summary><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M181.66,133.66l-80,80a8,8,0,0,1-11.32-11.32L164.69,128,90.34,53.66a8,8,0,0,1,11.32-11.32l80,80A8,8,0,0,1,181.66,133.66Z"/></svg>Options</summary>
+      <div class="opts">
+        <label>PDF password
+          <input id="password" type="password" autocomplete="off">
+        </label>
+        <label class="check"><input id="values" type="checkbox">Show the hidden text in results</label>
+      </div>
+    </details>
+    <button class="go">Check</button>
+  </form>
+
+  <section id="out" aria-live="polite" aria-label="Result">
+    <p class="muted">What each file hides, and every check that ran, will show here.</p>
+  </section>
+
+  <footer>
+    <a href="https://nowmyagentcan.com">nowmyagentcan.com</a>
+    <a href="https://github.com/nowmyagentcan/doc-sanitize" aria-label="doc-sanitize on GitHub"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M208.31,75.68A59.78,59.78,0,0,0,202.93,28,8,8,0,0,0,196,24a59.75,59.75,0,0,0-48,24H124A59.75,59.75,0,0,0,76,24a8,8,0,0,0-6.93,4,59.78,59.78,0,0,0-5.38,47.68A58.14,58.14,0,0,0,56,104v8a56.06,56.06,0,0,0,48.44,55.47A39.8,39.8,0,0,0,96,192v8H72a24,24,0,0,1-24-24A40,40,0,0,0,8,136a8,8,0,0,0,0,16,24,24,0,0,1,24,24,40,40,0,0,0,40,40H96v16a8,8,0,0,0,16,0V192a24,24,0,0,1,48,0v40a8,8,0,0,0,16,0V192a39.8,39.8,0,0,0-8.44-24.53A56.06,56.06,0,0,0,216,112v-8A58.14,58.14,0,0,0,208.31,75.68ZM200,112a40,40,0,0,1-40,40H112a40,40,0,0,1-40-40v-8a41.74,41.74,0,0,1,6.9-22.48A8,8,0,0,0,80,73.83a43.81,43.81,0,0,1,.79-33.58,43.88,43.88,0,0,1,32.32,20.06A8,8,0,0,0,119.82,64h32.35a8,8,0,0,0,6.74-3.69,43.87,43.87,0,0,1,32.32-20.06A43.81,43.81,0,0,1,192,73.83a8.09,8.09,0,0,0,1,7.65A41.72,41.72,0,0,1,200,104Z"/></svg></a>
+    <a href="https://x.com/chayp05" aria-label="nowmyagentcan on X"><svg viewBox="0 0 256 256" aria-hidden="true"><path d="M214.75,211.71l-62.6-98.38,61.77-67.95a8,8,0,0,0-11.84-10.76L143.24,99.34,102.75,35.71A8,8,0,0,0,96,32H48a8,8,0,0,0-6.75,12.3l62.6,98.37-61.77,68a8,8,0,1,0,11.84,10.76l58.84-64.72,40.49,63.63A8,8,0,0,0,160,224h48a8,8,0,0,0,6.75-12.29ZM164.39,208,62.57,48h29L193.43,208Z"/></svg></a>
+  </footer>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const form = $("form"), zone = $("#zone"), input = $("#files"), out = $("#out");
+const icon = d => `<svg viewBox="0 0 256 256" aria-hidden="true"><path d="${d}"/></svg>`;
+const COPY = icon("M216,32H88a8,8,0,0,0-8,8V80H40a8,8,0,0,0-8,8V216a8,8,0,0,0,8,8H168a8,8,0,0,0,8-8V176h40a8,8,0,0,0,8-8V40A8,8,0,0,0,216,32ZM160,208H48V96H160Zm48-48H176V88a8,8,0,0,0-8-8H96V48H208Z");
+const SAVE = icon("M224,144v64a8,8,0,0,1-8,8H40a8,8,0,0,1-8-8V144a8,8,0,0,1,16,0v56H208V144a8,8,0,0,1,16,0Zm-101.66,5.66a8,8,0,0,0,11.32,0l40-40a8,8,0,0,0-11.32-11.32L136,124.69V32a8,8,0,0,0-16,0v92.69L93.66,98.34a8,8,0,0,0-11.32,11.32Z");
+const WARN = icon("M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM222.93,203.8a8.5,8.5,0,0,1-7.48,4.2H40.55a8.5,8.5,0,0,1-7.48-4.2,7.59,7.59,0,0,1,0-7.72L120.52,44.21a8.75,8.75,0,0,1,15,0l87.45,151.87A7.59,7.59,0,0,1,222.93,203.8ZM120,144V104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,180Z");
+const FAIL = icon("M165.66,101.66,139.31,128l26.35,26.34a8,8,0,0,1-11.32,11.32L128,139.31l-26.34,26.35a8,8,0,0,1-11.32-11.32L116.69,128,90.34,101.66a8,8,0,0,1,11.32-11.32L128,116.69l26.34-26.35a8,8,0,0,1,11.32,11.32ZM232,128A104,104,0,1,1,128,24,104.11,104.11,0,0,1,232,128Zm-16,0a88,88,0,1,0-88,88A88.1,88.1,0,0,0,216,128Z");
+const DONE = icon("M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z");
+const INFO = icon("M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm16-40a8,8,0,0,1-8,8,16,16,0,0,1-16-16V128a8,8,0,0,1,0-16,16,16,0,0,1,16,16v40A8,8,0,0,1,144,176ZM112,84a12,12,0,1,1,12,12A12,12,0,0,1,112,84Z");
+const PICTURE = icon("M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,16V158.75l-26.07-26.06a16,16,0,0,0-22.63,0l-20,20-44-44a16,16,0,0,0-22.62,0L40,149.37V56ZM40,172l52-52,80,80H40Zm176,28H194.63l-36-36,20-20L216,181.38V200ZM144,100a12,12,0,1,1,12,12A12,12,0,0,1,144,100Z");
+
+// Sample answers in the shape of the server's answers (files[0] of check --json; the X-Result of clean), until the page talks to it.
+const ORDER = {
+  pdf: "metadata comments hidden-text fake-redactions hidden-layers embedded-files macros external-links image-metadata old-revisions leftover-data signatures form-data",
+  docx: "metadata comments tracked-changes hidden-text fake-redactions hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images leftover-data signatures",
+  xlsx: "metadata comments tracked-changes hidden-text fake-redactions hidden-sheets hidden-rows-columns hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images pivot-caches leftover-data signatures",
+  pptx: "metadata comments hidden-slides speaker-notes hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images leftover-data signatures",
+};
+const SAMPLES = {
+  docx: { findings: [
+    ["metadata", "core_properties", { part: "docProps/core.xml" }, 3, "fields", "3 document properties, including the author", "dc:creator=Avery Example; cp:lastModifiedBy=Sam Sample; dc:title=Northwind supply agreement"],
+    ["metadata", "tracking_ids", { part: "word/settings.xml" }, 214, "ids", "214 editing-session ids"],
+    ["comments", "comment", { part: "word/comments.xml" }, 3, "comments", "3 comments by 2 people", "Don't send this draft to Northwind before legal signs off."],
+    ["comments", "people", { part: "word/people.xml" }, 2, "people", "2 comment authors"],
+    ["tracked-changes", "deletion", { part: "word/document.xml" }, 4, "changes", "4 deletions by 1 author, with the deleted text", "a fee of $48,000 per quarter"],
+    ["tracked-changes", "insertion", { part: "word/document.xml" }, 6, "changes", "6 insertions by 2 authors"],
+    ["hidden-text", "hidden_formatting", { part: "word/document.xml" }, 48, "characters", "48 characters with hidden formatting", "Internal floor price: 31,500"],
+    ["image-metadata", "picture_metadata", { part: "word/media/image1.jpeg" }, 1, "pictures", "1 picture with EXIF and GPS"],
+    ["image-metadata", "picture_metadata", { part: "word/media/image2.png" }, 1, "pictures", "1 picture with text chunks"],
+  ], incomplete: { "cropped-images": "word/media/image3.emf is a vector picture, so its cropped area wasn't checked" } },
+  pdf: { findings: [
+    ["metadata", "info_dict", { field: "/Info" }, 4, "fields", "4 document properties, including the author", "/Author=Avery Example; /Creator=Word; /Producer=Acrobat PDFMaker; /Title=Filing draft 3"],
+    ["fake-redactions", "text_under_box", { page: 3, bbox: [72, 640.2, 210.5, 652] }, 11, "characters", "11 characters under a black box", "Sam Sample"],
+    ["fake-redactions", "text_under_box", { page: 3, bbox: [72, 610.4, 318, 622.2] }, 27, "characters", "27 characters under a black box", "account 0042-7781-0093"],
+    ["fake-redactions", "unapplied_redaction", { page: 7, bbox: [90, 400, 260, 414] }, 19, "characters", "19 characters under 1 redaction mark that was never applied", "Riverside clinic, room 4"],
+    ["old-revisions", "earlier_revision", { revision: 1 }, 1, "revisions", "1 earlier revision; 6 objects were changed or removed after it"],
+  ], incomplete: {} },
+  xlsx: { findings: [
+    ["hidden-sheets", "hidden_sheet", { sheet_index: 3 }, 1, "sheets", "1 very hidden sheet", "Salaries"],
+    ["hidden-rows-columns", "hidden_columns", { sheet_index: 1, sheet: "Summary", cells: "F1:F40" }, 1, "columns", "1 hidden column holding 40 values"],
+    ["pivot-caches", "pivot_cache", { part: "xl/pivotCache/pivotCacheRecords1.xml" }, 1, "parts", "1 pivot cache with 1,284 source rows"],
+  ], incomplete: {} },
+  pptx: { findings: [], incomplete: {} },
+};
+const FORMATS = { pdf: "pdf", docx: "docx", docm: "docx", dotx: "docx", dotm: "docx", xlsx: "xlsx", xlsm: "xlsx", xltx: "xlsx", xltm: "xlsx",
+  pptx: "pptx", pptm: "pptx", potx: "pptx", potm: "pptx", ppsx: "pptx", ppsm: "pptx" };
+const ext = n => (n.match(/\.([^.]+)$/) || [, ""])[1].toLowerCase();
+const stem = n => n.replace(/\.[^.]+$/, "");
+const fail = (code, message, hint) => ({ code, message, hint });
+
+function sampleCheck(file, opts) {
+  const n = file.name, variant = ext(n), format = FORMATS[variant] || null;
+  const base = { path: n, format, variant: format && variant, status: "error", checks: [], findings: [], warnings: [], error: null };
+  if (/\.(doc|xls|ppt)$/i.test(n)) return { ...base, error: fail("legacy_office", `${n} is an older Office file (.doc, .xls or .ppt).`, "Save it as .docx, .xlsx or .pptx in Office, then check the new file.") };
+  if (!format) return { ...base, error: fail("unsupported_format", `${n} isn't a PDF, Word, Excel or PowerPoint file.`, "doc-sanitize reads .pdf, .docx, .xlsx and .pptx files, and their macro and template versions.") };
+  if (/locked/i.test(n) && !opts.password) return { ...base, error: fail("password_required", `${n} needs a password to open.`, "Open Options and enter the password, then press Check.") };
+  const s = SAMPLES[format], findings = s.findings.map(([check, kind, where, count, unit, detail, value]) =>
+    ({ check, kind, where, count, unit, detail, ...(opts.show_values && value ? { value } : {}) }));
+  const checks = ORDER[format].split(" ").map(id => {
+    const count = findings.filter(f => f.check === id).length;
+    return s.incomplete[id] ? { id, status: "incomplete", count, note: s.incomplete[id] } : { id, status: count ? "found" : "none_found", count };
+  });
+  const status = findings.length ? "found" : checks.some(c => c.status === "incomplete") ? "incomplete" : "none_found";
+  return { ...base, status, checks, findings };
+}
+
+function sampleClean(file, opts, checked) {
+  const keep = opts.keep || [], blocked = /pivot/i.test(file.name) && !keep.includes("pivot-caches");
+  if (blocked) return { path: file.name, format: "xlsx", variant: "xlsx", output: null, status: "not_cleaned", removed: [], kept: [], changes: [],
+    recheck: null, warnings: [], error: fail("cannot_clean", `Can't remove pivot-caches from ${file.name}: its pivot table has slicers.`,
+      "Remove the slicers in Excel, or run clean again with --keep pivot-caches.") };
+  const removed = [], kept = [];
+  for (const c of checked.checks.filter(c => c.count)) {
+    if (keep.includes(c.id)) { kept.push(c.id); continue; }
+    for (const f of checked.findings.filter(f => f.check === c.id)) {
+      const r = removed.find(r => r.check === c.id && r.unit === f.unit);
+      if (r) r.count += f.count; else removed.push({ check: c.id, count: f.count, unit: f.unit, detail: "" });
+    }
+  }
+  const changes = { pdf: [
+    { code: "pages_rasterised", pages: [3, 7], detail: "Pages 3 and 7 are now pictures; their text can't be selected or searched." },
+    { code: "redactions_applied", count: 1, detail: "1 redaction mark was applied: its area is now filled in black." }],
+    xlsx: [{ code: "formulas_to_values", count: 40, detail: "40 formulas were replaced by their saved results." },
+      { code: "charts_to_values", count: 2, detail: "2 charts now hold their numbers directly instead of reading the deleted sheet." }] }[checked.format] || [];
+  if (keep.includes("fake-redactions")) changes.length = 0;
+  const checks = checked.checks.map(c => ({ id: c.id, status: kept.includes(c.id) ? "kept" : c.status === "incomplete" ? "incomplete" : "none_found",
+    count: kept.includes(c.id) ? c.count : 0, ...(c.note ? { note: c.note } : {}) }));
+  const incomplete = checks.some(c => c.status === "incomplete");
+  return { status: incomplete ? "cleaned_incomplete" : "cleaned", output: `${stem(file.name)}.clean.${ext(file.name)}`, removed, kept, changes,
+    recheck: { status: incomplete ? "incomplete" : "none_found", checks }, blob: new Blob(["sample"]) };
+}
+
+async function api(path, file, options) {
+  await new Promise(r => setTimeout(r, path === "/api/clean" ? 700 : 500));
+  return path === "/api/check" ? sampleCheck(file, options) : sampleClean(file, options, results.find(f => f.file === file));
+}
+
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const button = (svg, label) => { const b = el("button"); b.type = "button"; b.innerHTML = svg; b.append(label); return b; };
+const line = (cls, svg, ...parts) => { const p = el("p", cls); p.innerHTML = svg; p.append(el("span")); p.lastChild.append(...parts); return p; };
+const code = t => el("code", null, t);
+const name = p => p.split(/[\\/]/).pop();
+const plural = (n, w) => `${n.toLocaleString("en")} ${w}${n === 1 ? "" : "s"}`;
+const qty = (n, unit) => `${n.toLocaleString("en")} ${n !== 1 ? unit : unit === "people" ? "person" : unit.slice(0, -1)}`;
+const removedText = c => Object.entries(Object.groupBy(c.removed, r => r.check)).map(([id, rs]) => `${id} (${rs.map(r => qty(r.count, r.unit)).join(", ")})`).join(", ");
+const cap = s => s[0].toUpperCase() + s.slice(1);
+const KIND = { pdf: "PDF", docx: "Word", xlsx: "Excel", pptx: "PowerPoint" };
+const ALWAYS = ["signatures", "old-revisions"];
+const where = w => [w.page && `page ${w.page}`, w.slide && `slide ${w.slide}`, w.sheet ? `sheet ${w.sheet}` : w.sheet_index && `sheet ${w.sheet_index}`,
+  w.cells, w.revision && `revision ${w.revision}`, w.object && `object ${w.object}`, w.field, !(w.page || w.slide || w.sheet_index) && w.part].filter(Boolean).join(", ");
+const findingText = f => (where(f.where) ? `${where(f.where)}: ` : "") + f.detail;
+const counts = f => ({ found: f.checks.filter(c => c.status === "found"), incomplete: f.checks.filter(c => c.status === "incomplete"), none: f.checks.filter(c => c.status === "none_found") });
+
+function status(f) {
+  const { found, incomplete } = counts(f);
+  if (found.length) return `found ${found.length} ${found.length === 1 ? "kind" : "kinds"} of hidden data`;
+  return incomplete.length ? `${f.checks.length} checks, ${incomplete.length} incomplete` : `nothing found by ${f.checks.length} checks`;
+}
+
+function summary(files) {
+  const failed = files.filter(f => f.error).length;
+  if (files.length === 1) return failed ? "Couldn't check this file" : cap(status(files[0]));
+  return `${files.filter(f => f.status === "found").length} of ${files.length} files have hidden data` + (failed ? ` · ${failed} failed` : "");
+}
+
+// The report is the command line's text output, so it reads the same wherever it is pasted.
+const arg = n => /[\s"'$`\\]/.test(n) ? `"${n.replace(/["\\$`]/g, "\\$&")}"` : n;
+function reportLines(f) {
+  if (f.error) return [`✗ ${f.error.message}`, ...(f.error.hint ? ["  " + f.error.hint] : [])];
+  const { found, incomplete, none } = counts(f), w = Math.max(0, ...[...found, ...incomplete].map(c => c.id.length)) + 2, L = [`${name(f.path)}  ${status(f)}`];
+  for (const c of found) {
+    const fs = f.findings.filter(x => x.check === c.id);
+    L.push(`  ✗ ${c.id.padEnd(w)}${fs.map(findingText).join("; ")}`);
+    for (const x of fs) if (x.value != null) L.push(`    ${" ".repeat(w)}${where(x.where) ? where(x.where) + ": " : ""}${x.value}`);
+  }
+  for (const c of incomplete) L.push(`  ! ${c.id.padEnd(w)}${c.note}`);
+  if (none.length) L.push(`  ✓ ${plural(none.length, "check")} found nothing: ${none.map(c => c.id).join(", ")}`);
+  for (const x of f.warnings) L.push(`  ! ${x.message}`);
+  if (f.clean) L.push(...cleanLines(f));
+  else if (found.length) L.push(`  Remove it: doc-sanitize clean ${arg(name(f.path))}`);
+  return L;
+}
+
+function cleanLines(f) {
+  const c = f.clean;
+  if (c.status === "not_cleaned") return [`  ✗ ${c.error.message}`, ...(c.error.hint ? ["    " + c.error.hint] : [])];
+  return [`  ${name(f.path)} → ${c.output}`, ...(c.removed.length ? [`  removed  ${removedText(c)}`] : []),
+    ...(c.kept.length ? [`  kept     ${c.kept.join(", ")}`] : []), ...c.changes.map((x, i) => `  ${i ? "         " : "changed  "}${x.detail}`),
+    ...(c.warnings || []).map(x => `  ! ${x.message}`), `  ${c.status === "cleaned" ? "✓" : "!"} ${recheck(c)}`,
+    ...c.recheck.checks.filter(x => x.status === "incomplete").map(x => `    ! ${x.id}  ${x.note}`)];
+}
+
+function recheck(c) {
+  const n = c.recheck.checks.length, inc = c.recheck.checks.filter(x => x.status === "incomplete").length;
+  return `re-checked: ${plural(n, "check")}, ${inc ? `${inc} incomplete` : "nothing left"}` + (c.kept.length ? ` (${c.kept.length} kept)` : "");
+}
+
+const report = files => files.map(f => reportLines(f).join("\n")).join("\n\n") + (files.length > 1 ? `\n\n${summary(files)}` : "") + "\n";
+
+// The page has no --keep flag: its Remove ticks do the same job.
+function failure(box, e) {
+  box.append(line("err", FAIL, e.message));
+  if (e.hint) box.append(el("p", "hint", e.hint.replace(/run clean again with --keep ([a-z-]+)/, "untick $1 and save again")));
+}
+
+function row(f, c) {
+  const li = el("li", "row"), fs = f.findings.filter(x => x.check === c.id), list = el("div", "finds"), more = el("details");
+  const box = el("label"), tick = el("input");
+  tick.type = "checkbox"; tick.checked = true; tick.dataset.check = c.id; tick.disabled = ALWAYS.includes(c.id);
+  tick.setAttribute("aria-label", tick.disabled ? `${c.id} is always removed` : `Remove ${c.id}`);
+  box.append(tick, tick.disabled ? "Always removed" : "Remove");
+  for (const [i, x] of fs.entries()) {
+    const p = el("p");
+    if (where(x.where)) p.append(el("span", "where", where(x.where)), " ");
+    p.append(x.detail);
+    (i < 5 ? list : more).append(p);
+    if (x.value != null) (i < 5 ? list : more).append(el("pre", null, x.value));
+  }
+  if (fs.length > 5) { more.prepend(el("summary", null, `${fs.length - 5} more`)); list.append(more); }
+  li.append(el("p", "id", c.id), box, list);
+  return li;
+}
+
+function fileBlock(f) {
+  const box = el("article", "file"), h = el("h2", null, name(f.path));
+  if (f.format) h.append(" ", el("span", null, KIND[f.format] + (f.variant !== f.format ? ` · .${f.variant}` : "")));
+  box.append(h);
+  if (f.error) { failure(box, f.error); return box; }
+  const { found, incomplete, none } = counts(f);
+  if (results.length > 1 && f.status !== "none_found") box.append(el("p", found.length ? "found" : "", cap(status(f))));
+  if (found.length) { const ul = el("ul", "rows"); ul.append(...found.map(c => row(f, c))); box.append(ul); }
+  if (none.length) box.append(line("note muted", DONE, `${plural(none.length, "check")} found nothing: `, ...none.flatMap((c, i) => [i ? ", " : "", el("span", "nw", c.id)])));
+  for (const c of incomplete) box.append(line("note", WARN, code(c.id), " " + c.note));
+  for (const w of f.warnings) box.append(line("note", WARN, w.message));
+  if (found.length) {
+    const acts = el("div", "acts"), save = button(SAVE, "Save cleaned copy"), slot = el("div");
+    slot.style.display = "contents";
+    save.addEventListener("click", () => clean(f, box, save, slot));
+    acts.append(save);
+    box.append(acts, slot);
+  }
+  return box;
+}
+
+function cleanedBlock(f) {
+  const c = f.clean, box = el("div", "cleaned"), kv = (k, v) => { const d = el("p", "kv"); d.append(el("span", null, k), el("span", null, v)); return d; };
+  if (c.status === "not_cleaned") { failure(box, c.error); return box; }
+  const head = el("div", "head"), again = button(SAVE, "Save again");
+  again.addEventListener("click", () => download(c));
+  head.append(line("note", DONE, "Cleaned copy: ", el("strong", null, c.output)), again);
+  box.append(head);
+  if (c.removed.length) box.append(kv("Removed", removedText(c)));
+  if (c.kept.length) box.append(kv("Kept", c.kept.join(", ")));
+  for (const x of c.changes) box.append(line("note", x.code === "pages_rasterised" ? PICTURE : INFO, x.detail));
+  for (const w of c.warnings || []) box.append(line("note", WARN, w.message));
+  box.append(line("note muted", c.status === "cleaned" ? DONE : WARN, cap(recheck(c))));
+  for (const x of c.recheck.checks.filter(x => x.status === "incomplete")) box.append(line("note", WARN, code(x.id), " " + x.note));
+  return box;
+}
+
+function download(c) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(c.blob);
+  a.download = c.output;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function clean(f, box, save, slot) {
+  const keep = [...box.querySelectorAll("[data-check]")].filter(t => !t.checked).map(t => t.dataset.check);
+  save.disabled = true;
+  save.lastChild.textContent = "Cleaning…";
+  const wait = setTimeout(() => slot.replaceChildren(el("div", "bar"), el("p", "muted", `Cleaning ${name(f.path)}`)), 150);
+  let c;
+  try { c = await api("/api/clean", f.file, { ...options(), keep }); }
+  catch { c = { error: unreachable }; }
+  clearTimeout(wait);
+  save.disabled = false;
+  save.lastChild.textContent = "Save cleaned copy";
+  if (!c.status) { const d = el("div", "cleaned"); failure(d, c.error); slot.replaceChildren(d); return; }
+  f.clean = c;
+  slot.replaceChildren(cleanedBlock(f));
+  if (c.blob) download(c);
+}
+
+const unreachable = { message: "Can't reach doc-sanitize.", hint: "Start it again with: doc-sanitize ui" };
+const options = () => $("#password").value ? { password: $("#password").value } : {};
+
+// The page server takes uploads up to 256 MiB, the same limit as the command line.
+const LIMIT = 256 * 2 ** 20;
+const tooBig = file => ({ path: file.name, checks: [], error: fail("too_large", `${file.name} is too large to check (the file is over 256 MiB).`, "Check a smaller copy, or split the file.") });
+
+let chosen = [], results = [], latest = 0;
+const copyAll = button(COPY, "Copy report");
+
+function choose(files) {
+  if (!files.length) return;
+  chosen = [...files];
+  $("#chosen").textContent = chosen.length === 1 ? chosen[0].name : `${chosen.length} files: ${chosen.slice(0, 2).map(f => f.name).join(", ")}${chosen.length > 2 ? ` and ${chosen.length - 2} more` : ""}`;
+  form.requestSubmit();
+}
+
+form.addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const run = ++latest;
+  results = [];
+  out.removeAttribute("aria-busy");
+  if (!chosen.length) {
+    out.replaceChildren();
+    failure(out, { message: "No file chosen.", hint: "Drop a PDF, Word, Excel or PowerPoint file above, or click the box to choose one." });
+    return;
+  }
+  const opts = { ...options(), ...($("#values").checked ? { show_values: true } : {}) };
+  const head = el("div", "head");
+  out.replaceChildren(head);
+  for (const [i, file] of chosen.entries()) {
+    const wait = setTimeout(() => {
+      out.setAttribute("aria-busy", "true");
+      head.replaceChildren(el("div", "bar"), el("p", "muted", `Checking ${i + 1} of ${chosen.length} · ${file.name}`));
+      head.firstChild.setAttribute("role", "progressbar");
+      head.firstChild.setAttribute("aria-label", "Checking");
+    }, 150);
+    let f;
+    try { f = file.size > LIMIT ? tooBig(file) : await api("/api/check", file, opts); }
+    catch { f = { error: unreachable }; }
+    clearTimeout(wait);
+    if (run !== latest) return;
+    if (!f.checks) { out.removeAttribute("aria-busy"); out.replaceChildren(); failure(out, f.error); return; }
+    f.file = file;
+    results.push(f);
+  }
+  out.removeAttribute("aria-busy");
+  out.append(...results.map(fileBlock));
+  head.replaceChildren(el("p", "sum", summary(results)), copyAll);
+});
+
+copyAll.addEventListener("click", async () => {
+  const label = copyAll.lastChild;
+  try { await navigator.clipboard.writeText(report(results)); label.textContent = "Copied"; }
+  catch { label.textContent = "Can't copy"; }
+  setTimeout(() => { label.textContent = "Copy report"; }, 1500);
+});
+
+zone.addEventListener("click", () => input.click());
+input.addEventListener("change", () => { choose(input.files); input.value = ""; });
+document.addEventListener("dragover", ev => { ev.preventDefault(); zone.classList.add("over"); });
+document.addEventListener("dragleave", ev => { if (!ev.relatedTarget) zone.classList.remove("over"); });
+document.addEventListener("drop", ev => { ev.preventDefault(); zone.classList.remove("over"); choose(ev.dataTransfer.files); });
+document.addEventListener("keydown", ev => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "o") { ev.preventDefault(); input.click(); }
+  else if (ev.key === "Enter" && document.activeElement === document.body) form.requestSubmit();
+});
+</script>
+</body>
+</html>
