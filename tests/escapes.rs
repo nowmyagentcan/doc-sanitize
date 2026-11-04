@@ -273,6 +273,21 @@ fn a_page_timestamp_goes_even_when_nothing_else_is_metadata() {
     gone("a.pdf", &b.bytes(), "/LastModified");
 }
 
+#[test]
+#[ignore = "known bug: T02"]
+fn an_update_section_with_no_objects_is_not_an_earlier_revision() {
+    // Office's PDF export ends with `xref 0 0` and a trailer pointing back at the real table.
+    let mut pdf = raw(&raw_page(""), "/Root 1 0 R");
+    let table = pdf.windows(5).position(|w| w == b"xref\n").unwrap();
+    let update = pdf.len();
+    let tail = format!(
+        "xref\n0 0\ntrailer\n<< /Size 4 /Root 1 0 R /Prev {table} >>\nstartxref\n{update}\n%%EOF\n"
+    );
+    pdf.extend(tail.as_bytes());
+    let f = check("a.pdf", &pdf);
+    assert!(findings_of(&f, "old-revisions").is_empty(), "{f}");
+}
+
 // Excel.
 
 fn hidden_sheet_cells(cols: &str, row: &str) -> Vec<u8> {
@@ -297,7 +312,7 @@ fn a_hidden_formula_with_no_saved_result_is_removed() {
 #[ignore = "known bug: F06"]
 fn a_hidden_formula_that_gives_an_empty_text_is_removed() {
     // What Excel saves for =IF(A1>1,"…","") when the condition is false.
-    let cell = "<c r=\"B1\" t=\"str\"><f>IF(A1&gt;1,\"SECRET-formula-2\",\"\")</f><v></v></c>";
+    let cell = "<c r=\"B1\" t=\"str\"><f>IF(A1&gt;1,\"SECRET-formula-2\",\"\")</f><v/></c>";
     let xlsx = hidden_sheet_cells(HIDDEN_B, cell);
     assert_eq!(check("a.xlsx", &xlsx)["status"], "found");
     gone("a.xlsx", &xlsx, "SECRET-formula-2");
@@ -469,6 +484,29 @@ fn a_story_part_over_64_mib_is_too_large_and_one_under_is_read() {
     };
     assert_eq!(check("a.docx", &story(63 << 20))["status"], "none_found");
     refused("a.docx", &story(65 << 20), "too_large");
+}
+
+#[test]
+#[ignore = "known bug: T01"]
+fn a_package_stored_inside_a_package_is_not_a_second_end_record() {
+    // Word and PowerPoint store a chart's workbook without compressing it.
+    let workbook = zip(&package("xlsx", &[], &[]));
+    let ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    let docx = Pkg::new("docx")
+        .part(
+            "word/document.xml",
+            "rId5",
+            "package",
+            "word/embeddings/Microsoft_Excel_Worksheet.xlsx",
+            ct,
+            &workbook,
+        )
+        .zip();
+    let f = check("a.docx", &docx);
+    assert_eq!(f["error"], Value::Null, "{f}");
+    let (f, copy) = clean("a.docx", &docx);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert!(copy.is_some());
 }
 
 // Names from the file stay out of the default output.
