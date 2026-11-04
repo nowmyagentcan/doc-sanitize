@@ -18,6 +18,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --locked
+      - run: bash scripts/smoke.sh target/debug/doc-sanitize${{ runner.os == 'Windows' && '.exe' || '' }}
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo fmt --check
   licenses:
