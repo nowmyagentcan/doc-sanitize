@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::thread;
 
-use crate::input::{self, Kind};
+use crate::input::{self, Input, Kind};
 use crate::office::{self, Package};
 use crate::pdf;
 use crate::report::{
-    CheckId, CleanResult, CleanStatus, Cleaned, Error, FileResult, Format, Recheck, Status,
+    CHECKS, CheckId, CleanResult, CleanStatus, Cleaned, Error, FileResult, Format, Recheck, Status,
     Warning, removed, safe,
 };
 
@@ -33,6 +33,17 @@ pub struct Options {
     pub show_values: bool,
     /// The PDF user password to try after the empty one.
     pub password: Option<String>,
+}
+
+/// Checks one input; a path that gave no file is that file's error.
+pub fn check_input(input: &Input, options: &Options) -> (FileResult, Option<String>) {
+    match input {
+        Input::File(path) => check(path, options),
+        Input::Failed(path, e) => (
+            FileResult::failed(safe(&path.to_string_lossy()), e.clone()),
+            None,
+        ),
+    }
 }
 
 /// Checks the file at `path`. A caught panic comes back as `internal`, with where it happened
@@ -128,6 +139,100 @@ pub struct CleanOptions {
     pub target: Target,
     /// Replace an existing `-o` file.
     pub overwrite: bool,
+}
+
+impl CleanOptions {
+    /// The options of a clean run over `inputs`, refusing a `keep` id that is unknown or can't
+    /// be kept, `output` with `dir` or with several files, and an `output` that is the input.
+    pub fn new(
+        check: Options,
+        keep: &[String],
+        output: Option<PathBuf>,
+        dir: Option<PathBuf>,
+        overwrite: bool,
+        inputs: &[Input],
+    ) -> Result<Self, Error> {
+        let target = match (output, dir) {
+            (Some(_), Some(_)) => {
+                return Err(Error::usage(
+                    "-o and --out-dir can't go together.",
+                    "Use one of them.",
+                ));
+            }
+            (Some(file), None) => {
+                if inputs.len() != 1 {
+                    return Err(Error::usage(
+                        format!("-o works with one file; you gave {}.", inputs.len()),
+                        "Use --out-dir for several files.",
+                    ));
+                }
+                if same_file(&file, inputs[0].path()) {
+                    return Err(Error::usage(
+                        "The output would replace the input file.",
+                        "Choose another name with -o.",
+                    ));
+                }
+                Target::File(file)
+            }
+            (None, Some(dir)) => Target::Dir(dir),
+            (None, None) => Target::Beside,
+        };
+        Ok(Self {
+            check,
+            keep: keep_ids(keep)?,
+            target,
+            overwrite,
+        })
+    }
+}
+
+/// The checks `ids` name, refusing an unknown id and the two checks that can't be kept.
+pub fn keep_ids(ids: &[String]) -> Result<Vec<CheckId>, Error> {
+    let mut keep = vec![];
+    for id in ids.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+        match CheckId::parse(id) {
+            Some(CheckId::Signatures) => {
+                return Err(Error::usage(
+                    "Signatures can't be kept: any change to a signed file breaks its signature.",
+                    "Leave signatures out of --keep.",
+                ));
+            }
+            Some(CheckId::OldRevisions) => {
+                return Err(Error::usage(
+                    "Old revisions can't be kept: a cleaned PDF is always written as one revision.",
+                    "Leave old-revisions out of --keep.",
+                ));
+            }
+            Some(c) => keep.push(c),
+            None => {
+                let ids: Vec<_> = CHECKS.iter().map(|c| c.0).collect();
+                return Err(Error::usage(
+                    format!("Unknown check \"{}\".", safe(id)),
+                    &format!("Checks: {}.", ids.join(", ")),
+                ));
+            }
+        }
+    }
+    Ok(keep)
+}
+
+/// Whether two paths name one existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Cleans one input; a path that gave no file is that file's error.
+pub fn clean_input(input: &Input, options: &CleanOptions) -> (CleanResult, Option<String>) {
+    match input {
+        Input::File(path) => clean(path, options),
+        Input::Failed(path, e) => {
+            let failed = FileResult::failed(safe(&path.to_string_lossy()), e.clone());
+            (CleanResult::failed(failed, e.clone()), None)
+        }
+    }
 }
 
 /// Cleans the file at `path`: checks it, removes every found check but the kept ones,

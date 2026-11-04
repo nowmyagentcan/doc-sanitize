@@ -1,9 +1,11 @@
 //! The report every face prints: what each check found in each file, as one JSON shape.
 
+use schemars::JsonSchema;
 use serde::{Serialize, Serializer};
 
 /// The checks, in the order every `checks` array and every report lists them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
+#[schemars(rename_all = "kebab-case")]
 pub enum CheckId {
     Metadata,
     Comments,
@@ -133,7 +135,7 @@ impl Serialize for CheckId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     Pdf,
@@ -142,7 +144,7 @@ pub enum Format {
     Pptx,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Found,
@@ -154,7 +156,7 @@ pub enum Status {
 }
 
 /// Where a finding is. Every field is a place in the file's structure, never a found value.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, JsonSchema)]
 pub struct Where {
     /// 1-based page number.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,7 +248,7 @@ impl Where {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Finding {
     pub check: CheckId,
     pub kind: &'static str,
@@ -291,7 +293,7 @@ fn position(w: &Where) -> usize {
     w.page.or(w.slide).or(w.sheet_index).unwrap_or(0)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct CheckResult {
     pub id: CheckId,
     pub status: Status,
@@ -312,7 +314,7 @@ pub struct Cleaned {
     pub kept: Vec<CheckId>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Warning {
     pub code: &'static str,
     pub message: String,
@@ -346,7 +348,7 @@ impl Warning {
 
 /// A file that couldn't be checked, or a usage error. Messages name the file as `{name}`
 /// until [`Error::named`] fills it in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Error {
     pub code: &'static str,
     pub message: String,
@@ -507,6 +509,15 @@ impl Error {
         Self::new("usage", message, hint)
     }
 
+    /// The MCP server or the page's server couldn't run.
+    pub fn server(reason: impl std::fmt::Display) -> Self {
+        Self::new(
+            "server",
+            format!("Can't run the server: {}.", safe(&reason.to_string())),
+            REPORT_BUG,
+        )
+    }
+
     /// `cannot_clean`, one line per blocking check: (check, reason, hint).
     pub fn cannot_clean(blocks: &[(CheckId, String, String)]) -> Self {
         let message: Vec<_> = blocks
@@ -551,7 +562,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self.code {
             "usage" => 2,
-            "internal" | "write_failed" => 3,
+            "internal" | "write_failed" | "server" => 3,
             _ => 1,
         }
     }
@@ -567,7 +578,7 @@ impl Error {
 }
 
 /// One checked file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct FileResult {
     pub path: String,
     pub format: Option<Format>,
@@ -658,7 +669,7 @@ impl FileResult {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Summary {
     pub files: usize,
     pub with_findings: usize,
@@ -667,7 +678,7 @@ pub struct Summary {
 }
 
 /// The whole run, as `--json` prints it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Report<'a> {
     pub version: &'static str,
     pub command: &'static str,
@@ -692,7 +703,7 @@ impl<'a> Report<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanStatus {
     Cleaned,
@@ -701,7 +712,7 @@ pub enum CleanStatus {
 }
 
 /// What clean removed of one check, in one unit.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Removed {
     pub check: CheckId,
     pub count: u64,
@@ -710,7 +721,7 @@ pub struct Removed {
 }
 
 /// Something about the copy that a reader will see differently.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct Change {
     pub code: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,7 +753,7 @@ impl Change {
 }
 
 /// The check of the copy: kept checks show as `kept`, and the status leaves them out.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct Recheck {
     pub status: Status,
     pub checks: Vec<CheckResult>,
@@ -779,7 +790,7 @@ impl Recheck {
 }
 
 /// One cleaned (or not cleaned) file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct CleanResult {
     pub path: String,
     pub format: Option<Format>,
@@ -854,7 +865,7 @@ pub fn quantity(n: u64, unit: &str) -> String {
     counted(n, one, unit)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct CleanSummary {
     pub files: usize,
     pub cleaned: usize,
@@ -863,7 +874,7 @@ pub struct CleanSummary {
 }
 
 /// A clean run, as `--json` prints it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct CleanReport<'a> {
     pub version: &'static str,
     pub command: &'static str,
