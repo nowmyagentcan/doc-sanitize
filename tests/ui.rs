@@ -371,6 +371,16 @@ fn malformed_uploads_and_options_are_refused() {
 }
 
 #[test]
+#[ignore = "known bug: F16"]
+fn options_a_client_gets_wrong_are_422_with_the_usage_object() {
+    let s = Server::start();
+    for options in [json!({"show_values": "yes"}), json!({"other": 1})] {
+        let (got, _, answer) = s.post("/api/check", "a.pdf", &options, PDF);
+        assert_eq!(got, 422, "{options}");
+        assert_eq!(error(&answer).0, "usage", "{options}");
+    }
+}
+#[test]
 fn a_check_answers_as_the_cli_does_and_never_writes() {
     let dir = dir("ui-check");
     let docx = leaky_docx("docx");
