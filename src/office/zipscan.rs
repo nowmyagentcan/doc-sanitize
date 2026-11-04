@@ -1,8 +1,8 @@
-//! A raw scan of a ZIP's bytes before anything is inflated. It finds the one end record, reads
+//! A raw scan of a ZIP's bytes before anything is inflated. It finds the last end record, reads
 //! the central directory and every local header, and refuses a file that two readers could
-//! read differently: two end records, overlapping entries, a local header that disagrees with
-//! the directory, a local header the directory doesn't list, duplicate or case-equal names,
-//! or a Unicode-path field that disagrees with the name.
+//! read differently: an end record outside every entry's data, overlapping entries, a local
+//! header that disagrees with the directory, a local header the directory doesn't list,
+//! duplicate or case-equal names, or a Unicode-path field that disagrees with the name.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -101,12 +101,26 @@ pub fn scan(b: &[u8]) -> Result<Zip, Error> {
     let ends: Vec<usize> = (0..b.len().saturating_sub(21))
         .filter(|&p| at(b, p, END) && directory(b, p).is_some())
         .collect();
-    let p = match ends.as_slice() {
-        [p] => *p,
-        [] if b.starts_with(LOCAL) => return Err(structure()),
-        [] => return Err(Error::unsupported_format()),
-        _ => return Err(index()),
+    let Some((&p, others)) = ends.split_last() else {
+        return Err(match b.starts_with(LOCAL) {
+            true => structure(),
+            false => Error::unsupported_format(),
+        });
     };
+    let zip = read(b, p);
+    if others.is_empty() {
+        return zip;
+    }
+    // Office stores an embedded workbook uncompressed, so its end record is a part's bytes.
+    // Any other is a second index.
+    let inside = |z: &Zip, at| z.entries.iter().any(|e| e.data.contains(at));
+    zip.ok()
+        .filter(|z| others.iter().all(|at| inside(z, at)))
+        .ok_or_else(index)
+}
+
+/// The package the end record at `p` describes.
+fn read(b: &[u8], p: usize) -> Result<Zip, Error> {
     let (start, end, count, offset) = directory(b, p).ok_or_else(structure)?;
     if count > MAX_ENTRIES {
         return Err(Error::too_large("its entry count", "10,000"));

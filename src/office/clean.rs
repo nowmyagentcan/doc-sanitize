@@ -912,6 +912,17 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             d.prune_linked(&part, |e| e.is(CHART, "externalData"))?;
         }
     }
+    // An object only a relationship points at shows nowhere, so nothing else marks it.
+    for short in ["oleObject", "package"] {
+        for l in d.linked(short)? {
+            let named = d
+                .doc(&l.source)?
+                .is_some_and(|s| ids(&s.root).contains(&l.rel.id));
+            if let Some(part) = l.part.filter(|_| !named) {
+                d.delete(&part)?;
+            }
+        }
+    }
     for (code, n, one, many) in [
         (
             "objects_to_pictures",

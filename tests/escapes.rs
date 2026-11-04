@@ -484,7 +484,6 @@ fn a_story_part_over_64_mib_is_too_large_and_one_under_is_read() {
 }
 
 #[test]
-#[ignore = "known bug: T01"]
 fn a_package_stored_inside_a_package_is_not_a_second_end_record() {
     // Word and PowerPoint store a chart's workbook without compressing it.
     let workbook = zip(&package("xlsx", &[], &[]));
