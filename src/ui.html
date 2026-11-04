@@ -126,90 +126,14 @@ const DONE = icon("M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.
 const INFO = icon("M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm16-40a8,8,0,0,1-8,8,16,16,0,0,1-16-16V128a8,8,0,0,1,0-16,16,16,0,0,1,16,16v40A8,8,0,0,1,144,176ZM112,84a12,12,0,1,1,12,12A12,12,0,0,1,112,84Z");
 const PICTURE = icon("M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,16V158.75l-26.07-26.06a16,16,0,0,0-22.63,0l-20,20-44-44a16,16,0,0,0-22.62,0L40,149.37V56ZM40,172l52-52,80,80H40Zm176,28H194.63l-36-36,20-20L216,181.38V200ZM144,100a12,12,0,1,1,12,12A12,12,0,0,1,144,100Z");
 
-// Sample answers in the shape of the server's answers (files[0] of check --json; the X-Result of clean), until the page talks to it.
-const ORDER = {
-  pdf: "metadata comments hidden-text fake-redactions hidden-layers embedded-files macros external-links image-metadata old-revisions leftover-data signatures form-data",
-  docx: "metadata comments tracked-changes hidden-text fake-redactions hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images leftover-data signatures",
-  xlsx: "metadata comments tracked-changes hidden-text fake-redactions hidden-sheets hidden-rows-columns hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images pivot-caches leftover-data signatures",
-  pptx: "metadata comments hidden-slides speaker-notes hidden-objects embedded-files custom-data macros external-links image-metadata cropped-images leftover-data signatures",
-};
-const SAMPLES = {
-  docx: { findings: [
-    ["metadata", "core_properties", { part: "docProps/core.xml" }, 3, "fields", "3 document properties, including the author", "dc:creator=Avery Example; cp:lastModifiedBy=Sam Sample; dc:title=Northwind supply agreement"],
-    ["metadata", "tracking_ids", { part: "word/settings.xml" }, 214, "ids", "214 editing-session ids"],
-    ["comments", "comment", { part: "word/comments.xml" }, 3, "comments", "3 comments by 2 people", "Don't send this draft to Northwind before legal signs off."],
-    ["comments", "people", { part: "word/people.xml" }, 2, "people", "2 comment authors"],
-    ["tracked-changes", "deletion", { part: "word/document.xml" }, 4, "changes", "4 deletions by 1 author, with the deleted text", "a fee of $48,000 per quarter"],
-    ["tracked-changes", "insertion", { part: "word/document.xml" }, 6, "changes", "6 insertions by 2 authors"],
-    ["hidden-text", "hidden_formatting", { part: "word/document.xml" }, 48, "characters", "48 characters with hidden formatting", "Internal floor price: 31,500"],
-    ["image-metadata", "picture_metadata", { part: "word/media/image1.jpeg" }, 1, "pictures", "1 picture with EXIF and GPS"],
-    ["image-metadata", "picture_metadata", { part: "word/media/image2.png" }, 1, "pictures", "1 picture with text chunks"],
-  ], incomplete: { "cropped-images": "word/media/image3.emf is a vector picture, so its cropped area wasn't checked" } },
-  pdf: { findings: [
-    ["metadata", "info_dict", { field: "/Info" }, 4, "fields", "4 document properties, including the author", "/Author=Avery Example; /Creator=Word; /Producer=Acrobat PDFMaker; /Title=Filing draft 3"],
-    ["fake-redactions", "text_under_box", { page: 3, bbox: [72, 640.2, 210.5, 652] }, 11, "characters", "11 characters under a black box", "Sam Sample"],
-    ["fake-redactions", "text_under_box", { page: 3, bbox: [72, 610.4, 318, 622.2] }, 27, "characters", "27 characters under a black box", "account 0042-7781-0093"],
-    ["fake-redactions", "unapplied_redaction", { page: 7, bbox: [90, 400, 260, 414] }, 19, "characters", "19 characters under 1 redaction mark that was never applied", "Riverside clinic, room 4"],
-    ["old-revisions", "earlier_revision", { revision: 1 }, 1, "revisions", "1 earlier revision; 6 objects were changed or removed after it"],
-  ], incomplete: {} },
-  xlsx: { findings: [
-    ["hidden-sheets", "hidden_sheet", { sheet_index: 3 }, 1, "sheets", "1 very hidden sheet", "Salaries"],
-    ["hidden-rows-columns", "hidden_columns", { sheet_index: 1, sheet: "Summary", cells: "F1:F40" }, 1, "columns", "1 hidden column holding 40 values"],
-    ["pivot-caches", "pivot_cache", { part: "xl/pivotCache/pivotCacheRecords1.xml" }, 1, "parts", "1 pivot cache with 1,284 source rows"],
-  ], incomplete: {} },
-  pptx: { findings: [], incomplete: {} },
-};
-const FORMATS = { pdf: "pdf", docx: "docx", docm: "docx", dotx: "docx", dotm: "docx", xlsx: "xlsx", xlsm: "xlsx", xltx: "xlsx", xltm: "xlsx",
-  pptx: "pptx", pptm: "pptx", potx: "pptx", potm: "pptx", ppsx: "pptx", ppsm: "pptx" };
-const ext = n => (n.match(/\.([^.]+)$/) || [, ""])[1].toLowerCase();
-const stem = n => n.replace(/\.[^.]+$/, "");
 const fail = (code, message, hint) => ({ code, message, hint });
 
-function sampleCheck(file, opts) {
-  const n = file.name, variant = ext(n), format = FORMATS[variant] || null;
-  const base = { path: n, format, variant: format && variant, status: "error", checks: [], findings: [], warnings: [], error: null };
-  if (/\.(doc|xls|ppt)$/i.test(n)) return { ...base, error: fail("legacy_office", `${n} is an older Office file (.doc, .xls or .ppt).`, "Save it as .docx, .xlsx or .pptx in Office, then check the new file.") };
-  if (!format) return { ...base, error: fail("unsupported_format", `${n} isn't a PDF, Word, Excel or PowerPoint file.`, "doc-sanitize reads .pdf, .docx, .xlsx and .pptx files, and their macro and template versions.") };
-  if (/locked/i.test(n) && !opts.password) return { ...base, error: fail("password_required", `${n} needs a password to open.`, "Open Options and enter the password, then press Check.") };
-  const s = SAMPLES[format], findings = s.findings.map(([check, kind, where, count, unit, detail, value]) =>
-    ({ check, kind, where, count, unit, detail, ...(opts.show_values && value ? { value } : {}) }));
-  const checks = ORDER[format].split(" ").map(id => {
-    const count = findings.filter(f => f.check === id).length;
-    return s.incomplete[id] ? { id, status: "incomplete", count, note: s.incomplete[id] } : { id, status: count ? "found" : "none_found", count };
-  });
-  const status = findings.length ? "found" : checks.some(c => c.status === "incomplete") ? "incomplete" : "none_found";
-  return { ...base, status, checks, findings };
-}
-
-function sampleClean(file, opts, checked) {
-  const keep = opts.keep || [], blocked = /pivot/i.test(file.name) && !keep.includes("pivot-caches");
-  if (blocked) return { path: file.name, format: "xlsx", variant: "xlsx", output: null, status: "not_cleaned", removed: [], kept: [], changes: [],
-    recheck: null, warnings: [], error: fail("cannot_clean", `Can't remove pivot-caches from ${file.name}: its pivot table has slicers.`,
-      "Remove the slicers in Excel, or run clean again with --keep pivot-caches.") };
-  const removed = [], kept = [];
-  for (const c of checked.checks.filter(c => c.count)) {
-    if (keep.includes(c.id)) { kept.push(c.id); continue; }
-    for (const f of checked.findings.filter(f => f.check === c.id)) {
-      const r = removed.find(r => r.check === c.id && r.unit === f.unit);
-      if (r) r.count += f.count; else removed.push({ check: c.id, count: f.count, unit: f.unit, detail: "" });
-    }
-  }
-  const changes = { pdf: [
-    { code: "pages_rasterised", pages: [3, 7], detail: "Pages 3 and 7 are now pictures; their text can't be selected or searched." },
-    { code: "redactions_applied", count: 1, detail: "1 redaction mark was applied: its area is now filled in black." }],
-    xlsx: [{ code: "formulas_to_values", count: 40, detail: "40 formulas were replaced by their saved results." },
-      { code: "charts_to_values", count: 2, detail: "2 charts now hold their numbers directly instead of reading the deleted sheet." }] }[checked.format] || [];
-  if (keep.includes("fake-redactions")) changes.length = 0;
-  const checks = checked.checks.map(c => ({ id: c.id, status: kept.includes(c.id) ? "kept" : c.status === "incomplete" ? "incomplete" : "none_found",
-    count: kept.includes(c.id) ? c.count : 0, ...(c.note ? { note: c.note } : {}) }));
-  const incomplete = checks.some(c => c.status === "incomplete");
-  return { status: incomplete ? "cleaned_incomplete" : "cleaned", output: `${stem(file.name)}.clean.${ext(file.name)}`, removed, kept, changes,
-    recheck: { status: incomplete ? "incomplete" : "none_found", checks }, blob: new Blob(["sample"]) };
-}
-
 async function api(path, file, options) {
-  await new Promise(r => setTimeout(r, path === "/api/clean" ? 700 : 500));
-  return path === "/api/check" ? sampleCheck(file, options) : sampleClean(file, options, results.find(f => f.file === file));
+  // Header values must be Latin-1, so non-ASCII in the password goes as JSON \u escapes.
+  const json = JSON.stringify(options).replace(/[\u007f-\uffff]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  const r = await fetch(path, { method: "POST", headers: { "X-File-Name": encodeURIComponent(file.name), "X-Options": json }, body: file });
+  if (path === "/api/clean" && r.ok) return { ...JSON.parse(decodeURIComponent(r.headers.get("X-Result"))), blob: await r.blob() };
+  return r.json();
 }
 
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -242,8 +166,12 @@ function summary(files) {
 
 // The report is the command line's text output, so it reads the same wherever it is pasted.
 const arg = n => /[\s"'$`\\]/.test(n) ? `"${n.replace(/["\\$`]/g, "\\$&")}"` : n;
+const errorLines = e => {
+  const messages = e.message.split("\n"), hints = e.hint.split("\n");
+  return messages.length > 1 && messages.length === hints.length ? messages.flatMap((m, i) => [`✗ ${m}`, `  ${hints[i]}`]) : [`✗ ${e.message}`, `  ${e.hint}`];
+};
 function reportLines(f) {
-  if (f.error) return [`✗ ${f.error.message}`, ...(f.error.hint ? ["  " + f.error.hint] : [])];
+  if (f.error) return errorLines(f.error);
   const { found, incomplete, none } = counts(f), w = Math.max(0, ...[...found, ...incomplete].map(c => c.id.length)) + 2, L = [`${name(f.path)}  ${status(f)}`];
   for (const c of found) {
     const fs = f.findings.filter(x => x.check === c.id);
@@ -260,7 +188,7 @@ function reportLines(f) {
 
 function cleanLines(f) {
   const c = f.clean;
-  if (c.status === "not_cleaned") return [`  ✗ ${c.error.message}`, ...(c.error.hint ? ["    " + c.error.hint] : [])];
+  if (c.status === "not_cleaned") return errorLines(c.error).map(l => "  " + l);
   return [`  ${name(f.path)} → ${c.output}`, ...(c.removed.length ? [`  removed  ${removedText(c)}`] : []),
     ...(c.kept.length ? [`  kept     ${c.kept.join(", ")}`] : []), ...c.changes.map((x, i) => `  ${i ? "         " : "changed  "}${x.detail}`),
     ...(c.warnings || []).map(x => `  ! ${x.message}`), `  ${c.status === "cleaned" ? "✓" : "!"} ${recheck(c)}`,
@@ -276,8 +204,11 @@ const report = files => files.map(f => reportLines(f).join("\n")).join("\n\n") +
 
 // The page has no --keep flag: its Remove ticks do the same job.
 function failure(box, e) {
-  box.append(line("err", FAIL, e.message));
-  if (e.hint) box.append(el("p", "hint", e.hint.replace(/run clean again with --keep ([a-z-]+)/, "untick $1 and save again")));
+  const hints = (e.hint || "").split("\n");
+  for (const [i, message] of e.message.split("\n").entries()) {
+    box.append(line("err", FAIL, message));
+    if (hints[i]) box.append(el("p", "hint", hints[i].replace("Pass it with --password.", "Open Options and enter the password, then press Check.").replace(/run clean again with --keep ([a-z-]+)/, "untick $1 and save again")));
+  }
 }
 
 function row(f, c) {

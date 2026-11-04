@@ -3,6 +3,7 @@
 mod interactive;
 mod mcp;
 mod text;
+mod ui;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -18,6 +19,22 @@ use doc_sanitize::report::{
 };
 use doc_sanitize::run;
 use text::{Look, Out};
+
+/// `doc-sanitize ui`
+#[derive(Parser)]
+#[command(
+    name = "doc-sanitize ui",
+    about = "Open the local page in your browser.",
+    disable_version_flag = true
+)]
+struct Ui {
+    /// The port on 127.0.0.1; leave it out for a free one
+    #[arg(long, value_name = "N")]
+    port: Option<String>,
+    /// Don't open the browser
+    #[arg(long)]
+    no_open: bool,
+}
 
 /// `doc-sanitize mcp`
 #[derive(Parser)]
@@ -65,11 +82,13 @@ pub const ABOUT: &str = "Find and remove hidden data in PDF, Word, Excel and Pow
 const USAGE: &str = "\
 Usage: doc-sanitize [check] <PATH>... [OPTIONS]
        doc-sanitize clean <PATH>... [OPTIONS]
+       doc-sanitize ui [--port N] [--no-open]
        doc-sanitize mcp
 
 Commands:
   check  Report hidden data (the default when the first argument is a path)
   clean  Write a copy without it, check the copy again, and keep it only if nothing is left
+  ui     Open the local page in your browser
   mcp    Run the MCP server on stdio
 
 Options:
@@ -98,7 +117,8 @@ Examples:
   doc-sanitize clean contract.docx
   doc-sanitize clean deck.pptx --keep speaker-notes -o deck-to-send.pptx
   doc-sanitize clean exports/ -r --out-dir outbox/
-  doc-sanitize check filing.pdf --show-values";
+  doc-sanitize check filing.pdf --show-values
+  doc-sanitize ui";
 
 fn help() -> String {
     let checks: String = CHECKS
@@ -111,7 +131,24 @@ fn help() -> String {
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     let bare = args.len() == 1;
+    if bare && double_clicked() {
+        let dot = Look::stdout().pick("·", "-");
+        return served(ui::serve(
+            0,
+            true,
+            &format!(" {dot} close this window to stop."),
+        ));
+    }
     // Only an exact first argument is a command: `./check` is a file.
+    if args.get(1).is_some_and(|a| a == "ui") {
+        return match parsed::<Ui>(&args[1..]) {
+            Ok(ui) => match port(ui.port.as_deref()) {
+                Ok(port) => served(ui::serve(port, !ui.no_open, "  (Ctrl+C to stop)")),
+                Err(e) => fail(&e, false),
+            },
+            Err(code) => code,
+        };
+    }
     if args.get(1).is_some_and(|a| a == "mcp") {
         return match parsed::<Mcp>(&args[1..]) {
             Ok(_) => served(mcp::serve()),
@@ -188,6 +225,17 @@ fn parsed<T: Parser>(args: &[OsString]) -> Result<T, ExitCode> {
             let _ = e.print();
             ExitCode::SUCCESS
         }
+    })
+}
+
+/// The port asked for, or 0 for a free one.
+fn port(asked: Option<&str>) -> Result<u16, Error> {
+    let Some(asked) = asked else { return Ok(0) };
+    asked.parse().ok().filter(|p| *p != 0).ok_or_else(|| {
+        Error::usage(
+            format!("Port {} isn't valid.", safe(asked)),
+            "Use a number from 1 to 65535.",
+        )
     })
 }
 
@@ -366,6 +414,21 @@ fn progress(verb: &str, look: Look, path: &Path, i: usize, n: usize) -> String {
         1 => format!("{verb} {name}"),
         n => format!("{verb} {} of {n} {} {name}", i + 1, look.pick("·", "-")),
     }
+}
+
+/// Whether Explorer started this process: it then has a console to itself, while a terminal
+/// shares its console with the shell.
+#[cfg(windows)]
+fn double_clicked() -> bool {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut ids = [0u32; 2];
+    // SAFETY: the call writes at most `ids.len()` process ids into `ids`.
+    io::stdin().is_terminal() && unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) == 1 }
+}
+
+#[cfg(not(windows))]
+fn double_clicked() -> bool {
+    false
 }
 
 /// A clap error as our usage error: `Unknown option --x.` or clap's own sentence.

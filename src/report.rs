@@ -509,6 +509,19 @@ impl Error {
         Self::new("usage", message, hint)
     }
 
+    /// A request to the page's server that gets no result.
+    pub fn request(code: &'static str, message: &str) -> Self {
+        Self::new(code, message, "")
+    }
+
+    pub fn port_in_use(port: u16) -> Self {
+        Self::new(
+            "port_in_use",
+            format!("Port {port} is in use."),
+            "Choose another with --port, or leave it out for a free one.",
+        )
+    }
+
     /// The MCP server or the page's server couldn't run.
     pub fn server(reason: impl std::fmt::Display) -> Self {
         Self::new(
@@ -562,7 +575,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self.code {
             "usage" => 2,
-            "internal" | "write_failed" | "server" => 3,
+            "internal" | "write_failed" | "server" | "port_in_use" => 3,
             _ => 1,
         }
     }

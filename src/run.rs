@@ -239,51 +239,98 @@ pub fn clean_input(input: &Input, options: &CleanOptions) -> (CleanResult, Optio
 /// re-checks the copy and writes it only when nothing is left outside the kept checks.
 pub fn clean(path: &Path, options: &CleanOptions) -> (CleanResult, Option<String>) {
     let name = safe(&path.to_string_lossy());
-    let unread = |e: Error| {
-        Box::new(CleanResult::failed(
-            FileResult::failed(name.clone(), e.clone()),
-            e,
-        ))
-    };
     let result = on_worker(|| {
-        let bytes = input::load(path).map_err(unread)?;
-        let (checked, opened) =
-            examine(&name, Some(path), &bytes, &options.check).map_err(unread)?;
-        let ran: Vec<CheckId> = checked.checks.iter().map(|c| c.id).collect();
-        let keep: Vec<CheckId> = ran
-            .iter()
-            .copied()
-            .filter(|c| options.keep.contains(c))
-            .collect();
-        let remove: Vec<CheckId> = ran.iter().copied().filter(|c| !keep.contains(c)).collect();
-        let cleaned = match opened {
-            Opened::Office(pkg) => office::clean::clean(&pkg, &checked.findings, &remove),
-            Opened::Pdf(pdf) => pdf::clean::clean(&pdf, &checked.findings, &remove),
-        };
-        let cleaned = match cleaned {
-            Ok(c) => c,
-            Err(e) => return Err(Box::new(CleanResult::failed(checked, e))),
-        };
-        Ok(conclude(path, checked, &keep, cleaned, options))
+        let bytes = input::load(path).map_err(|e| unread(&name, e))?;
+        let store = |copy: Vec<u8>, variants: Variants| save(path, &copy, variants, options);
+        remove(&name, path, &bytes, &options.check, &options.keep, store)
     });
     match result {
         Ok(Ok(r)) => (r, None),
         Ok(Err(r)) => (*r, None),
-        Err(at) => (*unread(Error::internal()), Some(at)),
+        Err(at) => (*unread(&name, Error::internal()), Some(at)),
     }
 }
 
-/// Re-checks the copy of the file at `path` (whose check is `checked`) and writes it when the
-/// re-check finds nothing outside the `keep` checks.
-fn conclude(
+/// Checks `bytes`, an upload called `name` that stays in memory.
+pub fn check_bytes(name: &str, bytes: &[u8], options: &Options) -> FileResult {
+    let result = on_worker(|| examine(name, Some(Path::new(name)), bytes, options));
+    match result {
+        Ok(Ok((file, _))) => file,
+        Ok(Err(e)) => FileResult::failed(name.into(), e),
+        Err(_) => FileResult::failed(name.into(), Error::internal()),
+    }
+}
+
+/// Cleans `bytes`, an upload called `name`, as [`clean`] does, giving the copy back instead of
+/// writing it; its `output` is the name to save it under.
+pub fn clean_bytes(
+    name: &str,
+    bytes: &[u8],
+    options: &Options,
+    keep: &[CheckId],
+) -> (CleanResult, Option<Vec<u8>>) {
+    let path = Path::new(name);
+    let mut kept = None;
+    let result = on_worker(|| {
+        let store = |copy, (_, variant): Variants| {
+            kept = Some(copy);
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            Ok(format!("{stem}.clean.{variant}"))
+        };
+        remove(name, path, bytes, options, keep, store)
+    });
+    let file = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(r)) => *r,
+        Err(_) => *unread(name, Error::internal()),
+    };
+    (file, kept)
+}
+
+/// The input's variant, when known, and the copy's.
+type Variants<'a> = (Option<&'a str>, &'a str);
+
+fn unread(name: &str, e: Error) -> Box<CleanResult> {
+    let failed = FileResult::failed(name.into(), e.clone());
+    Box::new(CleanResult::failed(failed, e))
+}
+
+/// Checks `bytes`, makes the copy without every found check but the `keep` ones, and hands it
+/// to `store` when the re-check allows.
+fn remove(
+    name: &str,
     path: &Path,
+    bytes: &[u8],
+    options: &Options,
+    keep: &[CheckId],
+    store: impl FnOnce(Vec<u8>, Variants) -> Result<String, Error>,
+) -> Result<CleanResult, Box<CleanResult>> {
+    let (checked, opened) =
+        examine(name, Some(path), bytes, options).map_err(|e| unread(name, e))?;
+    let ran: Vec<CheckId> = checked.checks.iter().map(|c| c.id).collect();
+    let keep: Vec<CheckId> = ran.iter().copied().filter(|c| keep.contains(c)).collect();
+    let remove: Vec<CheckId> = ran.iter().copied().filter(|c| !keep.contains(c)).collect();
+    let cleaned = match opened {
+        Opened::Office(pkg) => office::clean::clean(&pkg, &checked.findings, &remove),
+        Opened::Pdf(pdf) => pdf::clean::clean(&pdf, &checked.findings, &remove),
+    };
+    match cleaned {
+        Ok(c) => Ok(conclude(checked, &keep, c, options, store)),
+        Err(e) => Err(Box::new(CleanResult::failed(checked, e))),
+    }
+}
+
+/// Re-checks the copy of a file whose check is `checked` and stores it when the re-check finds
+/// nothing outside the `keep` checks.
+fn conclude(
     checked: FileResult,
     keep: &[CheckId],
     mut cleaned: Cleaned,
-    options: &CleanOptions,
+    options: &Options,
+    store: impl FnOnce(Vec<u8>, Variants) -> Result<String, Error>,
 ) -> CleanResult {
     let keep = &[keep, &cleaned.kept].concat();
-    let recheck = match examine(&checked.path, None, &cleaned.bytes, &options.check) {
+    let recheck = match examine(&checked.path, None, &cleaned.bytes, options) {
         Ok((copy, _)) => Recheck::of(copy, keep),
         Err(_) => return CleanResult::failed(checked, Error::internal()),
     };
@@ -311,14 +358,9 @@ fn conclude(
     };
     let error = match recheck.findings.first() {
         Some(f) => Some(Error::recheck_failed(f.check)),
-        None => save(
-            path,
-            &cleaned.bytes,
-            (checked.variant, cleaned.variant),
-            options,
-        )
-        .map(|out| result.output = Some(out))
-        .err(),
+        None => store(cleaned.bytes, (checked.variant, cleaned.variant))
+            .map(|out| result.output = Some(out))
+            .err(),
     };
     result.recheck = Some(recheck);
     if let Some(e) = error {
@@ -334,7 +376,7 @@ fn conclude(
 fn save(
     input: &Path,
     bytes: &[u8],
-    variants: (Option<&str>, &str),
+    variants: Variants,
     options: &CleanOptions,
 ) -> Result<String, Error> {
     let out = output(input, variants, &options.target);
@@ -352,7 +394,7 @@ fn save(
 
 /// Where the copy of `input` goes: the `-o` file, or `<stem>.clean.<ext>` (the copy's
 /// variant) beside the input or in `--out-dir`, with `-2` … `-999` while the name is taken.
-fn output(input: &Path, (was, variant): (Option<&str>, &str), target: &Target) -> PathBuf {
+fn output(input: &Path, (was, variant): Variants, target: &Target) -> PathBuf {
     let dir = match target {
         // An -o name with the macro extension the copy no longer has takes the new one.
         Target::File(f) => match f.extension() {
@@ -498,7 +540,8 @@ trailer
             variant: "pdf",
             ..Cleaned::default()
         };
-        let r = conclude(&input, checked, &[], held, &options);
+        let store = |_: Vec<u8>, _: Variants| unreachable!("the copy still holds a finding");
+        let r = conclude(checked, &[], held, &options.check, store);
         assert_eq!(r.status, CleanStatus::NotCleaned);
         assert_eq!(r.output, None);
         let e = r.error.unwrap();
