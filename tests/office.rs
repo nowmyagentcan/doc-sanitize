@@ -2340,8 +2340,77 @@ fn ledger() -> Vec<u8> {
         .zip()
 }
 
-/// Writes the leak fixtures, their twins and `ledger.xlsx` to `$DOC_SANITIZE_FIXTURES` (or a
-/// folder under the test target), for timing and for opening in Office.
+/// A real `side` × `side` JPEG of noise with EXIF and GPS: about a byte per pixel, like a photo.
+fn noisy_photo(seed: u32, side: u32) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+    let image = image::RgbImage::from_fn(side, side, |_, _| {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let [r, g, b, _] = x.to_le_bytes();
+        image::Rgb([r, g, b])
+    });
+    let mut out = vec![];
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 60)
+        .encode_image(&image)
+        .unwrap();
+    let exif = jpeg(&[0x0112, 0x8825], b"");
+    [&out[..2], &exif[2..exif.len() - 8], &out[2..]].concat()
+}
+
+/// `memo.docx` (spec §9): about 60 KB of text.
+fn memo() -> Vec<u8> {
+    let words = [
+        "fee", "term", "party", "notice", "clause", "payment", "date", "scope",
+    ];
+    let mut x = 7u32;
+    let mut body = String::new();
+    for _ in 0..180 {
+        let mut text = String::new();
+        for _ in 0..24 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            text += words[(x >> 28) as usize % 8];
+            text += &format!(" {} ", x >> 20);
+        }
+        body += &para(&text_run("", &text));
+    }
+    Pkg::new("docx").body(&doc_xml(&body)).zip()
+}
+
+/// `photos.docx` (spec §9): 12 MB, 20 JPEGs with EXIF.
+fn photos() -> Vec<u8> {
+    let media: Vec<_> = (0..20)
+        .map(|i| (format!("image{i}.jpeg"), noisy_photo(i + 1, 800)))
+        .collect();
+    let list: Vec<_> = media.iter().map(|(n, b)| (n.as_str(), &b[..])).collect();
+    let body: String = (1..=20)
+        .map(|i| format!("<w:p>{}</w:p>", drawing(&format!("rId{i}"), "", "Photo")))
+        .collect();
+    picture_doc(&list, &body)
+}
+
+/// `deck.pptx` (spec §9): 200 slides, 60 MB of pictures.
+fn deck() -> Vec<u8> {
+    let slide = slide_xml(&format!(
+        "<p:pic><p:nvPicPr><p:cNvPr id=\"2\" name=\"Picture\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed=\"rId1\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr>{}<a:prstGeom prst=\"rect\"/></p:spPr></p:pic>",
+        xfrm(0, 0, 3_000_000, 3_000_000)
+    ));
+    let mut p = presentation(&vec![slide.as_str(); 200]);
+    for i in 1..=200 {
+        p = p.part(
+            &format!("ppt/slides/slide{i}.xml"),
+            "rId1",
+            "image",
+            &format!("ppt/media/image{i}.jpeg"),
+            "",
+            &noisy_photo(i, 560),
+        );
+    }
+    p.zip()
+}
+
+/// Writes the leak fixtures, their twins and the spec §9 inputs to `$DOC_SANITIZE_FIXTURES` (or
+/// a folder under the test target), for timing and for opening in Office.
 #[test]
 #[ignore = "writes files for measuring by hand"]
 fn write_fixtures() {
@@ -2360,6 +2429,9 @@ fn write_fixtures() {
         ("twin.xlsx", twin_xlsx()),
         ("twin.pptx", twin_pptx()),
         ("ledger.xlsx", ledger()),
+        ("memo.docx", memo()),
+        ("photos.docx", photos()),
+        ("deck.pptx", deck()),
     ] {
         std::fs::write(out.join(name), bytes).unwrap();
     }
