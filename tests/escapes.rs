@@ -7,7 +7,6 @@ use common::*;
 use lopdf::{Dictionary, Document, Object, dictionary};
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -290,20 +289,19 @@ fn an_update_section_with_no_objects_is_not_an_earlier_revision() {
 
 // Excel.
 
-fn hidden_sheet_cells(cols: &str, row: &str) -> Vec<u8> {
+/// A workbook whose hidden column B holds `cell`.
+fn hidden_column(cell: &str) -> Vec<u8> {
     let xml = format!(
-        "<worksheet xmlns=\"{S}\">{cols}<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Visible</t></is></c>{row}</row></sheetData></worksheet>"
+        "<worksheet xmlns=\"{S}\"><cols><col min=\"2\" max=\"2\" width=\"9\" hidden=\"1\"/></cols><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Visible</t></is></c>{cell}</row></sheetData></worksheet>"
     );
     workbook(&[("Sheet1", "visible", &xml)]).zip()
 }
-
-const HIDDEN_B: &str = "<cols><col min=\"2\" max=\"2\" width=\"9\" hidden=\"1\"/></cols>";
 
 #[test]
 #[ignore = "known bug: F06"]
 fn a_hidden_formula_with_no_saved_result_is_removed() {
     let cell = "<c r=\"B1\"><f>\"SECRET-formula-1\"</f><v></v></c>";
-    let xlsx = hidden_sheet_cells(HIDDEN_B, cell);
+    let xlsx = hidden_column(cell);
     assert_eq!(check("a.xlsx", &xlsx)["status"], "found");
     gone("a.xlsx", &xlsx, "SECRET-formula-1");
 }
@@ -313,7 +311,7 @@ fn a_hidden_formula_with_no_saved_result_is_removed() {
 fn a_hidden_formula_that_gives_an_empty_text_is_removed() {
     // What Excel saves for =IF(A1>1,"…","") when the condition is false.
     let cell = "<c r=\"B1\" t=\"str\"><f>IF(A1&gt;1,\"SECRET-formula-2\",\"\")</f><v/></c>";
-    let xlsx = hidden_sheet_cells(HIDDEN_B, cell);
+    let xlsx = hidden_column(cell);
     assert_eq!(check("a.xlsx", &xlsx)["status"], "found");
     gone("a.xlsx", &xlsx, "SECRET-formula-2");
 }
@@ -577,5 +575,5 @@ fn every_readme_example_is_a_valid_command() {
             stderr(&out)
         );
     }
-    assert!(Path::new(&dir.join("outbox/a.clean.docx")).exists());
+    assert!(dir.join("outbox/a.clean.docx").exists());
 }
