@@ -369,7 +369,6 @@ fn hidden_in(kind: &str, root: &str, part: &str, ct: &str, secret: &str) -> Vec<
 }
 
 #[test]
-#[ignore = "known bug: F07"]
 fn a_hidden_shape_on_a_master_is_found_and_removed() {
     let ct = "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
     let part = "ppt/slideMasters/slideMaster1.xml";
@@ -379,7 +378,6 @@ fn a_hidden_shape_on_a_master_is_found_and_removed() {
 }
 
 #[test]
-#[ignore = "known bug: F07"]
 fn a_hidden_shape_on_a_layout_is_found_and_removed() {
     let ct = "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
     let part = "ppt/slideLayouts/slideLayout1.xml";

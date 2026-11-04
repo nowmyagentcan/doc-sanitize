@@ -8,6 +8,10 @@ use crate::report::{CheckId, Error, Finding, Format, counted, plural};
 
 const VML: &str = "urn:schemas-microsoft-com:vml";
 const DRAWING_PART: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
+const LAYOUT_PART: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+const MASTER_PART: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
 
 /// Elements that are one object on the page.
 const OBJECTS: [&str; 10] = [
@@ -23,13 +27,20 @@ const OBJECTS: [&str; 10] = [
     "wgp",
 ];
 
-/// The parts whose drawings are checked: Word's text parts, Excel's drawings, the slides.
+/// The parts whose drawings are checked: Word's text parts, Excel's drawings, the slides with
+/// their layouts and masters.
 pub fn drawing_parts<'c>(ctx: &'c Ctx) -> Vec<&'c str> {
     let pkg = ctx.pkg;
     match pkg.format {
         Format::Docx => word::pages(ctx).collect(),
         Format::Xlsx => pkg.typed(DRAWING_PART).collect(),
-        _ => ctx.slides.iter().map(String::as_str).collect(),
+        _ => ctx
+            .slides
+            .iter()
+            .map(String::as_str)
+            .chain(pkg.typed(LAYOUT_PART))
+            .chain(pkg.typed(MASTER_PART))
+            .collect(),
     }
 }
 
