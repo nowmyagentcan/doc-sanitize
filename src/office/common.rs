@@ -1,6 +1,6 @@
 //! Checks that work the same in Word, Excel and PowerPoint packages.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use quick_xml::events::Event;
 
@@ -157,13 +157,17 @@ fn unused_strings<'n>(
     sheets: impl Iterator<Item = &'n String>,
     values: bool,
 ) -> Result<Option<Finding>, Error> {
-    let mut used = HashSet::new();
+    let mut left = strings(pkg, sst)?;
     for sheet in sheets {
+        if left.is_empty() {
+            return Ok(None);
+        }
         let bytes = pkg.read(sheet)?;
         let text = xml::decode(&bytes, sheet)?;
         let mut r = xml::Reader::new(&text, sheet);
         let (mut shared, mut cell_value, mut index) = (false, false, String::new());
-        loop {
+        // Stops at the last string found: most workbooks use every one, often early on.
+        while !left.is_empty() {
             match r.event()? {
                 Event::Start(e) if r.is(&e, SPREADSHEET, "c") => {
                     shared = r.attr(&e, "t")?.as_deref() == Some("s");
@@ -171,7 +175,7 @@ fn unused_strings<'n>(
                 Event::Start(e) if shared && r.is(&e, SPREADSHEET, "v") => cell_value = true,
                 Event::End(e) if cell_value && e.local_name().as_ref() == "v" => {
                     if let Ok(i) = index.trim().parse::<usize>() {
-                        used.insert(i);
+                        left.remove(&i);
                     }
                     (cell_value, shared) = (false, false);
                     index.clear();
@@ -182,10 +186,23 @@ fn unused_strings<'n>(
             }
         }
     }
+    let Some(first) = left.values().next().cloned() else {
+        return Ok(None);
+    };
+    let unused = left.len() as u64;
+    let detail = format!("{} that no cell uses", plural(unused, "shared string"));
+    let mut f = finding("unused_strings", Some(sst), unused, "strings", detail);
+    f.value = values.then(|| value(&first));
+    Ok(Some(f))
+}
+
+/// The strings of the shared-strings part `sst` by index. An empty string holds nothing, so it
+/// isn't leftover data and isn't listed.
+fn strings(pkg: &Package, sst: &str) -> Result<BTreeMap<usize, String>, Error> {
     let bytes = pkg.read(sst)?;
     let text = xml::decode(&bytes, sst)?;
     let mut r = xml::Reader::new(&text, sst);
-    let (mut count, mut unused, mut depth, mut first) = (0usize, 0u64, 0usize, None::<String>);
+    let (mut count, mut depth, mut out) = (0usize, 0usize, BTreeMap::new());
     let mut current = String::new();
     loop {
         let ev = r.event()?;
@@ -194,17 +211,13 @@ fn unused_strings<'n>(
                 current.clear();
             }
             Event::Empty(e) if depth == 1 && r.is(e, SPREADSHEET, "si") => count += 1,
-            // An empty string holds nothing, so it isn't leftover data.
             Event::End(e) if depth == 2 && e.local_name().as_ref() == "si" => {
-                if !used.contains(&count) && !current.is_empty() {
-                    unused += 1;
-                    if values && first.is_none() {
-                        first = Some(current.clone());
-                    }
+                if !current.is_empty() {
+                    out.insert(count, std::mem::take(&mut current));
                 }
                 count += 1;
             }
-            Event::Eof => break,
+            Event::Eof => return Ok(out),
             _ if depth >= 2 => current += &xml::text(&ev).unwrap_or_default(),
             _ => {}
         }
@@ -214,13 +227,6 @@ fn unused_strings<'n>(
             _ => {}
         }
     }
-    if unused == 0 {
-        return Ok(None);
-    }
-    let detail = format!("{} that no cell uses", plural(unused, "shared string"));
-    let mut f = finding("unused_strings", Some(sst), unused, "strings", detail);
-    f.value = first.filter(|_| values).map(|t| value(&t));
-    Ok(Some(f))
 }
 
 /// The distinct parts that relationships of type `short` point at.
@@ -1030,6 +1036,17 @@ fn custom_properties(pkg: &Package, part: &str) -> Result<Vec<(String, String)>,
 fn tracking_ids(pkg: &Package, part: &str, revision: bool) -> Result<(usize, Vec<String>), Error> {
     let (mut ids, mut names) = (0, vec![]);
     let format = pkg.format;
+    // A sheet can be most of a workbook, and searching its text is far quicker than parsing it.
+    if format == Format::Xlsx {
+        let bytes = pkg.read(part)?;
+        let text = xml::decode(&bytes, part)?;
+        if !["uid", "revisionPtr", "fileSharing"]
+            .iter()
+            .any(|n| text.contains(n))
+        {
+            return Ok((ids, names));
+        }
+    }
     pkg.walk(part, |r, ev| {
         let (Event::Start(e) | Event::Empty(e)) = ev else {
             return Ok(());
