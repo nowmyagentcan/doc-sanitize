@@ -411,18 +411,15 @@ fn save(
 /// so runs at the same moment can't end up with one name.
 fn claim(names: &[PathBuf]) -> Result<&PathBuf, Error> {
     for out in names {
-        let created = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(out);
-        match created {
+        match fs::File::create_new(out) {
             Ok(_) => return Ok(out),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(Error::write_failed(&out.to_string_lossy(), e)),
         }
     }
-    let last = names.last().map(|n| n.to_string_lossy());
-    Err(Error::output_exists(&last.unwrap_or_default()))
+    Err(Error::output_exists(
+        &names[names.len() - 1].to_string_lossy(),
+    ))
 }
 
 /// The names the copy of `input` may take, in order: the `-o` file, or `<stem>.clean.<ext>`

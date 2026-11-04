@@ -396,7 +396,8 @@ impl Copy {
             .iter()
             .filter(|f| f.stores_anything() && f.unseen(&listed))
         {
-            for id in f.parents.iter().filter(|id| !shared.contains(id)) {
+            let above = f.parents.iter().filter(|id| !shared.contains(id));
+            for id in above.chain(&f.id) {
                 if let Ok(d) = self.doc.get_dictionary_mut(*id) {
                     for key in VALUE_KEYS {
                         d.remove(key);
@@ -406,9 +407,6 @@ impl Copy {
             let Some(Ok(d)) = f.id.map(|id| self.doc.get_dictionary_mut(id)) else {
                 continue;
             };
-            for key in VALUE_KEYS {
-                d.remove(key);
-            }
             d.remove(b"AP");
             if f.parents.iter().any(|id| shared.contains(id)) {
                 // What it would inherit stays, so empty ones of its own hide it.
