@@ -62,7 +62,6 @@ fn refused(name: &str, bytes: &[u8], code: &str) {
 // Writing the copy.
 
 #[test]
-#[ignore = "known bug: F01"]
 fn a_macro_file_named_docx_is_not_replaced_through_its_new_extension() {
     let dir = dir("escapes-input");
     let input = leaky_docx("docm");
@@ -97,7 +96,6 @@ fn every_spelling_of_the_input_is_refused_as_the_output() {
 }
 
 #[test]
-#[ignore = "known bug: F02"]
 fn same_named_files_cleaned_at_once_each_keep_their_own_copy() {
     const RUNS: usize = 16;
     let dir = dir("escapes-race");

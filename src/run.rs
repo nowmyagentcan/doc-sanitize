@@ -5,6 +5,7 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
 use std::fs;
+use std::io::ErrorKind;
 use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -167,10 +168,7 @@ impl CleanOptions {
                     ));
                 }
                 if same_file(&file, inputs[0].path()) {
-                    return Err(Error::usage(
-                        "The output would replace the input file.",
-                        "Choose another name with -o.",
-                    ));
+                    return Err(replaces_input());
                 }
                 Target::File(file)
             }
@@ -184,6 +182,13 @@ impl CleanOptions {
             overwrite,
         })
     }
+}
+
+fn replaces_input() -> Error {
+    Error::usage(
+        "The output would replace the input file.",
+        "Choose another name with -o.",
+    )
 }
 
 /// The checks `ids` name, refusing an unknown id and the two checks that can't be kept.
@@ -379,42 +384,69 @@ fn save(
     variants: Variants,
     options: &CleanOptions,
 ) -> Result<String, Error> {
-    let out = output(input, variants, &options.target);
-    let shown = safe(&out.to_string_lossy());
-    let replace = options.overwrite && matches!(options.target, Target::File(_));
-    if fs::symlink_metadata(&out).is_ok() && !replace {
-        return Err(Error::output_exists(&shown));
+    let names = outputs(input, variants, &options.target);
+    let shown = |p: &Path| safe(&p.to_string_lossy());
+    let file = matches!(options.target, Target::File(_));
+    // The extension can change after the run began, so only now is the final name known.
+    if file && same_file(&names[0], input) {
+        return Err(replaces_input());
     }
     if let Target::Dir(dir) = &options.target {
-        fs::create_dir_all(dir).map_err(|e| Error::write_failed(&shown, e))?;
+        fs::create_dir_all(dir).map_err(|e| Error::write_failed(&shown(&names[0]), e))?;
     }
-    write(&out, bytes).map_err(|e| Error::write_failed(&shown, e))?;
-    Ok(shown)
+    let replace = file && options.overwrite;
+    let out = match replace {
+        true => &names[0],
+        false => claim(&names)?,
+    };
+    let written = write(out, bytes);
+    if written.is_err() && !replace {
+        let _ = fs::remove_file(out);
+    }
+    written.map_err(|e| Error::write_failed(&shown(out), e))?;
+    Ok(shown(out))
 }
 
-/// Where the copy of `input` goes: the `-o` file, or `<stem>.clean.<ext>` (the copy's
-/// variant) beside the input or in `--out-dir`, with `-2` … `-999` while the name is taken.
-fn output(input: &Path, (was, variant): Variants, target: &Target) -> PathBuf {
+/// Takes the first free name by creating it empty: finding it free and taking it are one step,
+/// so runs at the same moment can't end up with one name.
+fn claim(names: &[PathBuf]) -> Result<&PathBuf, Error> {
+    for out in names {
+        let created = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out);
+        match created {
+            Ok(_) => return Ok(out),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::write_failed(&out.to_string_lossy(), e)),
+        }
+    }
+    let last = names.last().map(|n| n.to_string_lossy());
+    Err(Error::output_exists(&last.unwrap_or_default()))
+}
+
+/// The names the copy of `input` may take, in order: the `-o` file, or `<stem>.clean.<ext>`
+/// (the copy's variant) then `-2` … `-999` beside the input or in `--out-dir`.
+fn outputs(input: &Path, (was, variant): Variants, target: &Target) -> Vec<PathBuf> {
     let dir = match target {
         // An -o name with the macro extension the copy no longer has takes the new one.
-        Target::File(f) => match f.extension() {
-            Some(e) if was.is_some_and(|w| w != variant && e.eq_ignore_ascii_case(w)) => {
-                return f.with_extension(variant);
-            }
-            _ => return f.clone(),
-        },
+        Target::File(f) => {
+            return vec![match f.extension() {
+                Some(e) if was.is_some_and(|w| w != variant && e.eq_ignore_ascii_case(w)) => {
+                    f.with_extension(variant)
+                }
+                _ => f.clone(),
+            }];
+        }
         Target::Dir(d) => d.clone(),
         Target::Beside => input.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    let mut out = dir.join(format!("{stem}.clean.{variant}"));
-    for n in 2..=999 {
-        if fs::symlink_metadata(&out).is_err() {
-            break;
-        }
-        out = dir.join(format!("{stem}.clean-{n}.{variant}"));
-    }
-    out
+    let numbered = (2..=999).map(|n| format!("{stem}.clean-{n}.{variant}"));
+    std::iter::once(format!("{stem}.clean.{variant}"))
+        .chain(numbered)
+        .map(|name| dir.join(name))
+        .collect()
 }
 
 /// Writes `bytes` to `<out>.tmp-<pid>` and renames it to `out`, which replaces a link rather
