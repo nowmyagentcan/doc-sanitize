@@ -183,7 +183,6 @@ fn text_field(name: &str) -> Dictionary {
 }
 
 #[test]
-#[ignore = "known bug: F04"]
 fn a_hidden_fields_inherited_value_is_removed_at_its_source() {
     let pdf = form(|b| {
         let parent = b.doc.new_object_id();
@@ -200,7 +199,6 @@ fn a_hidden_fields_inherited_value_is_removed_at_its_source() {
 }
 
 #[test]
-#[ignore = "known bug: F04"]
 fn a_hidden_fields_saved_default_is_removed_with_its_value() {
     let pdf = form(|b| {
         let mut d = text_field("Hidden");
@@ -213,7 +211,6 @@ fn a_hidden_fields_saved_default_is_removed_with_its_value() {
 }
 
 #[test]
-#[ignore = "known bug: F04"]
 fn a_hidden_field_with_only_a_default_is_found_and_removed() {
     let pdf = form(|b| {
         let mut d = text_field("Hidden");
@@ -222,6 +219,35 @@ fn a_hidden_field_with_only_a_default_is_found_and_removed() {
     });
     assert_eq!(check("a.pdf", &pdf)["status"], "found");
     gone("a.pdf", &pdf, "SECRET-form-4");
+}
+
+#[test]
+fn a_value_a_shown_field_inherits_stays_and_its_hidden_sibling_hides_it() {
+    let mut b = PdfBuilder::new();
+    let page = b.page("BT /F1 12 Tf 72 700 Td (Visible) Tj ET");
+    let parent = b.doc.new_object_id();
+    let kid = |name: &str, flags: i64| {
+        dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "T" => Object::string_literal(name),
+            "Rect" => vec![10.into(), 10.into(), 90.into(), 30.into()],
+            "F" => flags, "Parent" => parent,
+        }
+    };
+    let (shown, hidden) = (b.add(kid("Shown", 4)), b.add(kid("Hidden", 2)));
+    let mut d = text_field("Parent");
+    d.set("V", Object::string_literal("PUBLIC-shared"));
+    d.set("Kids", vec![shown.into(), hidden.into()]);
+    b.doc.objects.insert(parent, d.into());
+    b.doc
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("Annots", vec![shown.into(), hidden.into()]);
+    b.catalog
+        .set("AcroForm", dictionary! { "Fields" => vec![parent.into()] });
+    let (f, copy) = clean("a.pdf", &b.bytes());
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let copy = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(copy.contains("PUBLIC-shared"), "the shown value went");
 }
 
 #[test]

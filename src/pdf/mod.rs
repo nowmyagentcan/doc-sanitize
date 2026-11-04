@@ -763,13 +763,20 @@ fn triggers<'a>(c: &Ctx<'a>, d: &'a Dictionary) -> Vec<&'a Object> {
         .unwrap_or_default()
 }
 
-/// A terminal form field with its inherited type and value, and its widgets.
+/// What a field stores and hands down to the fields below it: its value, the default a reset
+/// restores, and its rich text.
+const VALUE_KEYS: [&[u8]; 3] = [b"V", b"DV", b"RV"];
+
+/// A terminal form field with its inherited type and values, its widgets and the fields above
+/// it.
 struct Field<'a> {
     id: Option<ObjectId>,
     dict: &'a Dictionary,
     kind: &'a [u8],
-    value: Option<&'a Object>,
+    /// What each of [`VALUE_KEYS`] holds, its own or inherited.
+    values: [Option<&'a Object>; 3],
     widgets: Vec<(Option<ObjectId>, &'a Dictionary)>,
+    parents: Vec<ObjectId>,
 }
 
 /// The terminal fields of the AcroForm, walking /Kids with inheritance.
@@ -782,9 +789,9 @@ fn form_fields<'a>(c: &Ctx<'a>) -> Vec<Field<'a>> {
     let mut pending: Vec<_> = c
         .array(form, b"Fields")
         .iter()
-        .map(|f| (f, &b""[..], None))
+        .map(|f| (f, &b""[..], [None; 3], vec![]))
         .collect();
-    while let Some((o, kind, value)) = pending.pop() {
+    while let Some((o, kind, mut values, mut parents)) = pending.pop() {
         if o.as_reference().is_ok_and(|id| !seen.insert(id)) {
             continue;
         }
@@ -792,7 +799,9 @@ fn form_fields<'a>(c: &Ctx<'a>) -> Vec<Field<'a>> {
             continue;
         };
         let kind = dict.get(b"FT").and_then(Object::as_name).unwrap_or(kind);
-        let value = c.get(dict, b"V").or(value);
+        for (value, key) in values.iter_mut().zip(VALUE_KEYS) {
+            *value = c.get(dict, key).or(*value);
+        }
         let kids = c.array(dict, b"Kids");
         let (children, widgets): (Vec<_>, Vec<_>) = kids
             .iter()
@@ -809,23 +818,53 @@ fn form_fields<'a>(c: &Ctx<'a>) -> Vec<Field<'a>> {
                 id: o.as_reference().ok(),
                 dict,
                 kind,
-                value,
+                values,
                 widgets: own,
+                parents,
             });
         } else {
-            pending.extend(children.into_iter().map(|k| (k, kind, value)));
+            parents.extend(o.as_reference().ok());
+            pending.extend(
+                children
+                    .into_iter()
+                    .map(|k| (k, kind, values, parents.clone())),
+            );
         }
     }
     fields
 }
 
 /// A value that isn't empty or an unticked box.
-fn has_value(f: &Field) -> bool {
-    match f.value {
+fn filled(value: Option<&Object>) -> bool {
+    match value {
         None | Some(Object::Null) => false,
         Some(Object::String(s, _)) => !s.is_empty(),
         Some(Object::Name(n)) => n != b"Off",
         Some(_) => true,
+    }
+}
+
+/// The widgets the pages list.
+fn listed_widgets(c: &Ctx) -> HashSet<ObjectId> {
+    c.pages()
+        .flat_map(|(_, p)| c.annots(p))
+        .filter_map(|(id, _)| id)
+        .collect()
+}
+
+impl Field<'_> {
+    fn stores_anything(&self) -> bool {
+        self.values.iter().any(|v| filled(*v))
+    }
+
+    /// Whether no page shows it: a field that isn't a signature, with every widget Hidden,
+    /// NoView or on no page.
+    fn unseen(&self, listed: &HashSet<ObjectId>) -> bool {
+        self.kind != b"Sig"
+            && self.widgets.iter().all(|(id, w)| {
+                let flags = w.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+                flags & (2 | 32) != 0 || !id.is_some_and(|id| listed.contains(&id))
+            })
     }
 }
 
@@ -836,7 +875,7 @@ fn fields(c: &Ctx) -> Vec<Finding> {
     let signed = fields
         .iter()
         .filter(|f| f.kind == b"Sig")
-        .filter(|f| has_value(f))
+        .filter(|f| filled(f.values[0]))
         .count();
     let rights = c
         .catalog()
@@ -869,21 +908,10 @@ fn fields(c: &Ctx) -> Vec<Finding> {
             None,
         ));
     }
-    let shown: HashSet<ObjectId> = c
-        .pages()
-        .flat_map(|(_, p)| c.annots(p))
-        .filter_map(|(id, _)| id)
-        .collect();
+    let listed = listed_widgets(c);
     let hidden: Vec<_> = fields
         .iter()
-        .filter(|f| f.kind != b"Sig")
-        .filter(|f| has_value(f))
-        .filter(|f| {
-            f.widgets.iter().all(|(id, w)| {
-                let flags = w.get(b"F").and_then(Object::as_i64).unwrap_or(0);
-                flags & (2 | 32) != 0 || !id.is_some_and(|id| shown.contains(&id))
-            })
-        })
+        .filter(|f| f.stores_anything() && f.unseen(&listed))
         .collect();
     if let Some(first) = hidden.first() {
         found.push(c.finding(
@@ -895,7 +923,7 @@ fn fields(c: &Ctx) -> Vec<Finding> {
                 "form field with a value no page shows",
                 "form fields with values no page shows",
             ),
-            first.value.and_then(|v| c.text(v)),
+            first.values.iter().flatten().find_map(|v| c.text(v)),
         ));
     }
     found

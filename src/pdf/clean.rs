@@ -9,8 +9,8 @@ use hayro::RenderCache;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
 use super::{
-    COMMENTS, Ctx, Pdf, as_dict, bytes, form_fields, has_value, layers, pages_text, raster,
-    subtype, xmp_of,
+    COMMENTS, Ctx, Pdf, VALUE_KEYS, as_dict, bytes, form_fields, layers, listed_widgets,
+    pages_text, raster, subtype, xmp_of,
 };
 use crate::pictures;
 use crate::report::{Change, CheckId, Cleaned, Error, Finding, Warning, counted};
@@ -381,34 +381,44 @@ impl Copy {
         self.drop_annots(|_, a| subtype(a) == b"FileAttachment");
     }
 
-    /// `form-data`: the XFA form, and values no page shows (with their widgets' appearances).
+    /// `form-data`: the XFA form, and what no page shows: values, defaults and rich text, with
+    /// their widgets' appearances, where they are stored, on the field or on the fields above.
     fn form_data(&mut self, c: &Ctx) {
-        let shown: HashSet<ObjectId> = c
-            .pages()
-            .flat_map(|(_, p)| c.annots(p))
-            .filter_map(|(id, _)| id)
+        let listed = listed_widgets(c);
+        let fields = form_fields(c);
+        // A field above a shown one keeps what it stores: that is on the page.
+        let shared: HashSet<ObjectId> = fields
+            .iter()
+            .filter(|f| !f.unseen(&listed))
+            .flat_map(|f| f.parents.iter().copied())
             .collect();
-        for f in form_fields(c) {
-            let hidden = f.widgets.iter().all(|(id, w)| {
-                let flags = w.get(b"F").and_then(Object::as_i64).unwrap_or(0);
-                flags & (2 | 32) != 0 || !id.is_some_and(|id| shown.contains(&id))
-            });
-            if f.kind == b"Sig" || !has_value(&f) || !hidden {
-                continue;
+        for f in fields
+            .iter()
+            .filter(|f| f.stores_anything() && f.unseen(&listed))
+        {
+            for id in f.parents.iter().filter(|id| !shared.contains(id)) {
+                if let Ok(d) = self.doc.get_dictionary_mut(*id) {
+                    for key in VALUE_KEYS {
+                        d.remove(key);
+                    }
+                }
             }
             let Some(Ok(d)) = f.id.map(|id| self.doc.get_dictionary_mut(id)) else {
                 continue;
             };
-            let own = d.remove(b"V").is_some();
-            d.remove(b"RV");
+            for key in VALUE_KEYS {
+                d.remove(key);
+            }
             d.remove(b"AP");
-            if !own {
-                // The value is inherited: an empty one of its own hides it.
+            if f.parents.iter().any(|id| shared.contains(id)) {
+                // What it would inherit stays, so empty ones of its own hide it.
                 let empty = match f.kind {
                     b"Btn" => Object::Name(b"Off".to_vec()),
                     _ => Object::string_literal(""),
                 };
-                d.set("V", empty);
+                for key in VALUE_KEYS {
+                    d.set(key, empty.clone());
+                }
             }
             for (id, _) in &f.widgets {
                 if let Some(Ok(w)) = id.map(|id| self.doc.get_dictionary_mut(id)) {
