@@ -298,7 +298,6 @@ fn hidden_column(cell: &str) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "known bug: F06"]
 fn a_hidden_formula_with_no_saved_result_is_removed() {
     let cell = "<c r=\"B1\"><f>\"SECRET-formula-1\"</f><v></v></c>";
     let xlsx = hidden_column(cell);
@@ -307,13 +306,29 @@ fn a_hidden_formula_with_no_saved_result_is_removed() {
 }
 
 #[test]
-#[ignore = "known bug: F06"]
 fn a_hidden_formula_that_gives_an_empty_text_is_removed() {
     // What Excel saves for =IF(A1>1,"…","") when the condition is false.
     let cell = "<c r=\"B1\" t=\"str\"><f>IF(A1&gt;1,\"SECRET-formula-2\",\"\")</f><v/></c>";
     let xlsx = hidden_column(cell);
     assert_eq!(check("a.xlsx", &xlsx)["status"], "found");
     gone("a.xlsx", &xlsx, "SECRET-formula-2");
+}
+
+#[test]
+fn a_hidden_formula_with_no_result_shows_its_formula_when_values_are_asked_for() {
+    let dir = dir("escapes-formula");
+    let cell = "<c r=\"B1\"><f>\"PUBLIC-formula\"</f></c>";
+    put(&dir, &[("a.xlsx", &hidden_column(cell))]);
+    let f = &json(&run_in(&dir, &["a.xlsx", "--json", "--show-values"]))["files"][0];
+    let found = findings_of(f, "hidden-rows-columns");
+    assert_eq!(found[0]["value"], "\"PUBLIC-formula\"", "{f}");
+}
+
+#[test]
+fn a_shared_formula_with_no_text_or_result_still_counts_as_a_hidden_cell() {
+    let cell = "<c r=\"B1\"><f t=\"shared\" si=\"0\"/></c>";
+    let f = check("a.xlsx", &hidden_column(cell));
+    assert_eq!(findings_of(&f, "hidden-rows-columns").len(), 1, "{f}");
 }
 
 #[test]

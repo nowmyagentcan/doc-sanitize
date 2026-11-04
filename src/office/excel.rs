@@ -277,6 +277,18 @@ impl Cells {
     }
 }
 
+/// The cell being read.
+#[derive(Default)]
+struct OpenCell {
+    at: (u32, u32),
+    style: usize,
+    /// Its text is an index into the shared strings.
+    shared: bool,
+    text: String,
+    /// Its `<f>`, when it has one.
+    formula: Option<String>,
+}
+
 /// The cell kinds of hidden-rows-columns, with the noun each counts.
 const LINE_KINDS: [(&str, &str, &str, &str); 2] = [
     ("hidden_rows", "rows", "hidden row", "hidden rows"),
@@ -306,8 +318,7 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         let mut kinds: Vec<Cells> = (0..CELL_KINDS.len()).map(|_| Cells::default()).collect();
         let mut lines: [Cells; 2] = Default::default();
         let mut hidden_cols: Vec<(u32, u32)> = vec![];
-        // The open cell: where it is, its style, whether it holds a shared string, its text.
-        let mut cell: Option<((u32, u32), usize, bool, String)> = None;
+        let mut cell: Option<OpenCell> = None;
         let (mut row, mut col, mut row_hidden) = (0u32, 0u32, false);
         // Scenarios, their saved values and the first one; custom sheet properties.
         let (mut scenarios, mut saved, mut first_saved) = (0usize, 0usize, None);
@@ -355,25 +366,44 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     if matches!(ev, Event::Start(_)) {
                         let style = r.attr(e, "s")?.and_then(|v| v.parse().ok()).unwrap_or(0);
                         let shared = r.attr(e, "t")?.as_deref() == Some("s");
-                        cell = Some((at, style, shared, String::new()));
+                        cell = Some(OpenCell {
+                            at,
+                            style,
+                            shared,
+                            ..OpenCell::default()
+                        });
+                    }
+                }
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "f") => {
+                    if let Some(c) = &mut cell {
+                        c.formula = Some(String::new());
                     }
                 }
                 Event::End(_) if r.closes(ns::S, "c") => {
-                    let Some((at, style, shared, text)) = cell.take().filter(|c| !c.3.is_empty())
+                    let Some(c) = cell
+                        .take()
+                        .filter(|c| !c.text.is_empty() || c.formula.is_some())
                     else {
                         return Ok(());
                     };
-                    let text = match shared {
-                        true => text
+                    let at = c.at;
+                    let text = match c.shared {
+                        true => c
+                            .text
                             .trim()
                             .parse::<usize>()
                             .ok()
                             .and_then(|i| strings.get(i))
                             .cloned()
                             .unwrap_or_default(),
+                        false => c.text,
+                    };
+                    // With no saved result, the formula is all the cell holds.
+                    let text = match text.is_empty() {
+                        true => c.formula.unwrap_or_default(),
                         false => text,
                     };
-                    if let Some(&Some(kind)) = styles.get(style) {
+                    if let Some(&Some(kind)) = styles.get(c.style) {
                         kinds[kind].add(at, at.1, &text);
                     }
                     if row_hidden {
@@ -388,7 +418,14 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 }
                 ev if matches!(r.parent(), Some((ns::S, "v" | "t"))) => {
                     if let (Some(c), Some(t)) = (&mut cell, xml::text(ev)) {
-                        c.3 += &t;
+                        c.text += &t;
+                    }
+                }
+                ev if r.parent() == Some((ns::S, "f")) => {
+                    if let (Some(Some(f)), Some(t)) =
+                        (cell.as_mut().map(|c| c.formula.as_mut()), xml::text(ev))
+                    {
+                        *f += &t;
                     }
                 }
                 _ => {}
@@ -399,7 +436,7 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
             let mut place = ctx.place(part);
             place.cells = cells.shown();
             let f = Finding::new(check, kind, place, n as u64, unit, detail);
-            found.push(f.with_value(ctx.values, cells.first.as_deref()));
+            found.push(f.with_value(ctx.values, cells.first.as_deref().filter(|t| !t.is_empty())));
         };
         for ((check, kind, what), cells) in CELL_KINDS.iter().zip(&kinds) {
             if cells.n > 0 {
