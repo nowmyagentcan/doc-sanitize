@@ -387,3 +387,28 @@ fn a_run_checks_at_most_10000_files() {
         "More than 10,000 files to check."
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_with_no_arguments_gets_the_prompt() {
+    use std::io::Write;
+    let mut session = std::process::Command::new("script")
+        .args(["-qec", env!("CARGO_BIN_EXE_doc-sanitize"), "/dev/null"])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut typed = session.stdin.take().unwrap();
+    typed
+        .write_all(
+            b"/help
+/quit
+",
+        )
+        .unwrap();
+    let out = session.wait_with_output().unwrap();
+    let screen = stdout(&out);
+    assert!(screen.contains("✻ doc-sanitize 0.1.0"), "{screen}");
+    assert!(screen.contains("/clean   write a cleaned copy"), "{screen}");
+}

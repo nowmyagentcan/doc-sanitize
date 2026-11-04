@@ -12,8 +12,8 @@ use doc_sanitize::report::{
     CleanResult, CleanStatus, FileResult, Finding, Status, plural, quantity,
 };
 
-const BOLD: &str = "1";
-const DIM: &str = "2";
+pub const BOLD: &str = "1";
+pub const DIM: &str = "2";
 const RED: &str = "31";
 const GREEN: &str = "32";
 const YELLOW: &str = "33";
@@ -46,7 +46,7 @@ impl Look {
     }
 
     /// `s` in the SGR style `sgr` when colour is on.
-    fn paint(self, sgr: &str, s: &str) -> String {
+    pub fn paint(self, sgr: &str, s: &str) -> String {
         if self.colour {
             format!("\x1b[{sgr}m{s}\x1b[0m")
         } else {
@@ -107,15 +107,24 @@ mod console {
 pub struct Out<W> {
     pub w: W,
     pub look: Look,
+    /// Interactive mode: lines sit under the prompt, and `/clean` removes what was found.
+    pub prompted: bool,
 }
 
 impl<W: Write> Out<W> {
     pub fn new(w: W, look: Look) -> Self {
-        Self { w, look }
+        Self {
+            w,
+            look,
+            prompted: false,
+        }
     }
 
-    fn line(&mut self, s: &str) -> io::Result<()> {
-        writeln!(self.w, "{s}")
+    pub fn line(&mut self, s: &str) -> io::Result<()> {
+        match s.is_empty() || !self.prompted {
+            true => writeln!(self.w, "{s}"),
+            false => writeln!(self.w, "  {s}"),
+        }
     }
 }
 
@@ -195,11 +204,19 @@ pub fn file(
     for w in &f.warnings {
         out.line(&format!("  {} {}", look.paint(YELLOW, "!"), w.message))?;
     }
-    if !found.is_empty() {
+    if !found.is_empty() && !out.prompted {
         let hint = format!("Remove it: doc-sanitize clean {}", quoted(&f.path));
         out.line(&format!("  {}", look.paint(DIM, &hint)))?;
     }
     Ok(())
+}
+
+/// Interactive mode's one hint for everything the last line found.
+pub fn clean_prompt(out: &mut Out<impl Write>) -> io::Result<()> {
+    match out.prompted {
+        true => out.line(&out.look.paint(DIM, "Remove it: /clean")),
+        false => Ok(()),
+    }
 }
 
 /// A path as a shell argument: in double quotes when it holds spaces, quotes or characters a
@@ -364,8 +381,10 @@ pub fn spin<T>(err: &Out<impl Write>, label: &str, work: impl FnOnce() -> T) -> 
     }
     let (stop, stopped) = mpsc::channel();
     let look = err.look;
+    let indent = if err.prompted { "  " } else { "" };
+    let line = format!("{indent}{{}} {label}");
     thread::scope(|s| {
-        s.spawn(|| spinner(io::stderr(), look, &format!("{{}} {label}"), stopped));
+        s.spawn(|| spinner(io::stderr(), look, &line, stopped));
         let result = work();
         drop(stop);
         result

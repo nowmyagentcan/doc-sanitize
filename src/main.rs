@@ -1,9 +1,10 @@
 //! The command line: `doc-sanitize [check] <PATH>... [OPTIONS]`.
 
+mod interactive;
 mod text;
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -12,12 +13,12 @@ use clap::Parser;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use doc_sanitize::input::{self, Input};
 use doc_sanitize::report::{
-    CHECKS, CheckId, CleanReport, CleanResult, Error, FileResult, Report, safe,
+    CHECKS, CheckId, CleanReport, CleanResult, Error, FileResult, Report, Status, safe,
 };
 use doc_sanitize::run;
 use text::{Look, Out};
 
-#[derive(Parser)]
+#[derive(Parser, Default)]
 #[command(
     name = "doc-sanitize",
     disable_help_flag = true,
@@ -49,7 +50,7 @@ struct Cli {
     version: bool,
 }
 
-const ABOUT: &str = "Find and remove hidden data in PDF, Word, Excel and PowerPoint files.";
+pub const ABOUT: &str = "Find and remove hidden data in PDF, Word, Excel and PowerPoint files.";
 
 const USAGE: &str = "\
 Usage: doc-sanitize [check] <PATH>... [OPTIONS]
@@ -97,6 +98,7 @@ fn help() -> String {
 
 fn main() -> ExitCode {
     let mut args: Vec<OsString> = std::env::args_os().collect();
+    let bare = args.len() == 1;
     // Only an exact first argument is a command: `./check` is a file.
     let clean = args.get(1).is_some_and(|a| a == "clean");
     if clean || args.get(1).is_some_and(|a| a == "check") {
@@ -115,12 +117,17 @@ fn main() -> ExitCode {
         let text = if cli.help {
             help()
         } else {
-            format!("doc-sanitize {}\n", env!("CARGO_PKG_VERSION"))
+            format!(
+                "doc-sanitize {}
+",
+                env!("CARGO_PKG_VERSION")
+            )
         };
         let _ = io::stdout().write_all(text.as_bytes());
         return ExitCode::SUCCESS;
     }
-    if cli.paths.is_empty() {
+    let interactive = bare && io::stdin().is_terminal() && io::stdout().is_terminal();
+    if cli.paths.is_empty() && !interactive {
         let e = Error::usage("No file given.", "Try: doc-sanitize contract.docx");
         return fail(&e, cli.json);
     }
@@ -131,20 +138,13 @@ fn main() -> ExitCode {
         );
         return fail(&e, cli.json);
     }
-    let inputs = match input::expand(&cli.paths, cli.recursive) {
-        Ok(inputs) => inputs,
-        Err(e) => return fail(&e, cli.json),
-    };
-    let options = match clean.then(|| clean_options(&cli, &inputs)).transpose() {
-        Ok(o) => o,
-        Err(e) => return fail(&e, cli.json),
-    };
     let mut out = Out::new(io::stdout().lock(), Look::stdout());
     let mut err = Out::new(io::stderr(), Look::stderr());
     let mut code = 0;
-    let done = match &options {
-        Some(o) => clean_all(&cli, o, &inputs, &mut out, &mut err, &mut code),
-        None => check(&cli, &inputs, &mut out, &mut err, &mut code),
+    let done = if interactive {
+        interactive::run(io::stdin().lock(), &mut out, &mut err, ask)
+    } else {
+        run(&cli, clean, &mut out, &mut err, &mut code)
     };
     match done {
         Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
@@ -157,6 +157,47 @@ fn main() -> ExitCode {
         }
         // A reader that hung up ends the run quietly with the code earned so far.
         _ => ExitCode::from(code),
+    }
+}
+
+/// One line of interactive mode: the paths with no options, whatever exit code they earn.
+fn ask(
+    paths: &[PathBuf],
+    clean: bool,
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+) -> io::Result<()> {
+    let cli = Cli {
+        paths: paths.to_vec(),
+        ..Cli::default()
+    };
+    run(&cli, clean, out, err, &mut 0)
+}
+
+/// Checks or cleans `cli.paths`; `code` follows the highest exit code earned. An error that
+/// stops the whole run prints like any other report.
+fn run(
+    cli: &Cli,
+    clean: bool,
+    out: &mut Out<impl Write>,
+    err: &mut Out<impl Write>,
+    code: &mut u8,
+) -> io::Result<()> {
+    let prepared = input::expand(&cli.paths, cli.recursive).and_then(|inputs| {
+        let options = clean.then(|| clean_options(cli, &inputs)).transpose()?;
+        Ok((inputs, options))
+    });
+    match prepared {
+        Ok((inputs, Some(options))) => clean_all(cli, &options, &inputs, out, err, code),
+        Ok((inputs, None)) => check(cli, &inputs, out, err, code),
+        Err(e) => {
+            *code = e.exit_code();
+            if cli.json {
+                writeln!(out.w, "{}", e.to_json())
+            } else {
+                text::error(err, &e.message, &e.hint)
+            }
+        }
     }
 }
 
@@ -204,8 +245,13 @@ fn check(
     if cli.json {
         serde_json::to_writer_pretty(&mut out.w, &Report::check(&files))?;
         writeln!(out.w)?;
-    } else if files.len() > 1 {
-        text::summary(out, &files)?;
+    } else {
+        if files.len() > 1 {
+            text::summary(out, &files)?;
+        }
+        if files.iter().any(|f| f.status == Status::Found) {
+            text::clean_prompt(out)?;
+        }
     }
     out.w.flush()
 }
@@ -375,4 +421,69 @@ fn fail(e: &Error, json: bool) -> ExitCode {
         )
     };
     ExitCode::from(e.exit_code())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_checks_quoted_paths_and_cleans_them_beside_the_file() {
+        let dir = std::env::temp_dir().join(format!("doc-sanitize-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a b.pdf");
+        let pdf = b"%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+            << /Type /Pages /Kids [] /Count 0 >>
+endobj
+trailer
+            << /Root 1 0 R /Info << /Author (Avery Example) >> >>
+%%EOF
+";
+        std::fs::write(&file, pdf).unwrap();
+        let typed = format!(
+            "\"{}\"
+/clean
+/quit
+",
+            file.display()
+        );
+        let (mut out, mut err) = (
+            Out::new(vec![], Look::default()),
+            Out::new(vec![], Look::default()),
+        );
+        interactive::run(typed.as_bytes(), &mut out, &mut err, ask).unwrap();
+        let out = String::from_utf8(out.w).unwrap();
+        let name = file.display();
+        assert!(
+            out.contains(&format!(
+                "›   {name}  found 1 kind of hidden data
+"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "
+  Remove it: /clean
+
+"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("doc-sanitize clean"), "{out}");
+        assert!(
+            out.contains(
+                "  ✓ re-checked: 13 checks, nothing left
+"
+            ),
+            "{out}"
+        );
+        assert!(dir.join("a b.clean.pdf").exists());
+        assert!(err.w.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
