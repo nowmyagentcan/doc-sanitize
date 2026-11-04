@@ -440,7 +440,6 @@ fn names_equal_after_percent_decoding_are_two_versions_of_a_part() {
 }
 
 #[test]
-#[ignore = "known bug: F10"]
 fn tracking_ids_in_style_definitions_are_removed() {
     let styles = format!(
         "<w:styles xmlns:w=\"{W}\"><w:style w:type=\"paragraph\" w:styleId=\"Custom\"><w:name w:val=\"Custom\"/><w:rsid w:val=\"00AB12CD\"/></w:style></w:styles>"

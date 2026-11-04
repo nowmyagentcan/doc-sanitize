@@ -1400,6 +1400,8 @@ fn metadata(d: &mut Draft) -> Result<(), Error> {
                     });
                     n += root.prune(&|e: &El| {
                         e.is(ns::W, "rsids")
+                            || e.is(ns::W, "rsid")
+                            || e.is(ns::W, "rsidRoot")
                             || e.is(ns::W14, "docId")
                             || e.is(ns::W15, "docId")
                             || e.is(ns::W, "permStart")
