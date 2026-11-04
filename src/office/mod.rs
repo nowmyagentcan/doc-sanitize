@@ -231,6 +231,9 @@ impl<'p> Ctx<'p> {
 /// The most one entry may inflate to, and the whole package.
 const MAX_PART: u64 = 256 << 20;
 const MAX_PACKAGE: u64 = 1 << 30;
+/// The most an XML part may hold when `clean` reads it as a tree, which takes up to 25 times
+/// its size. A workbook's own parts are exempt: its sheets can be big and honest.
+const MAX_TREE: u64 = 64 << 20;
 
 pub const CONTENT_TYPES: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
 pub const RELATIONSHIPS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -508,10 +511,15 @@ impl<'a> Package<'a> {
             .find(|(t, ..)| *t == content_type)
             .ok_or_else(Error::unsupported_format)?;
         (pkg.format, pkg.variant) = (*format, variant);
-        for e in &pkg.zip.entries {
-            let xml = pkg
-                .content_type(&e.name)
-                .is_some_and(|t| t.ends_with("xml"));
+        for (e, &size) in pkg.zip.entries.iter().zip(&pkg.sizes) {
+            let content_type = pkg.content_type(&e.name).unwrap_or_default();
+            let xml = content_type.ends_with("xml");
+            if xml && size > MAX_TREE && !content_type.contains("spreadsheetml") {
+                return Err(Error::too_large(
+                    &format!("part {}", safe(&e.name)),
+                    "64 MiB",
+                ));
+            }
             if part_name(&e.name) && (xml || e.name.to_ascii_lowercase().ends_with(".rels")) {
                 let bytes = pkg.read(&e.name)?;
                 xml::Reader::new(&xml::decode(&bytes, &e.name)?, &e.name).validate()?;

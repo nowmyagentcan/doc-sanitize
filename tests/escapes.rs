@@ -509,7 +509,6 @@ fn xml_no_parser_accepts_is_damage() {
 }
 
 #[test]
-#[ignore = "known bug: F14"]
 fn a_story_part_over_64_mib_is_too_large_and_one_under_is_read() {
     let story = |size: usize| {
         let unit = "<w:p/>";
@@ -518,6 +517,30 @@ fn a_story_part_over_64_mib_is_too_large_and_one_under_is_read() {
     };
     assert_eq!(check("a.docx", &story(63 << 20))["status"], "none_found");
     refused("a.docx", &story(65 << 20), "too_large");
+}
+
+#[test]
+fn any_part_clean_reads_as_a_tree_has_the_limit_and_a_workbooks_sheet_does_not() {
+    let filler = |size: usize| format!("<a>{}</a>", "<b/>".repeat(size / 4)).into_bytes();
+    let big = 65 << 20;
+    let docx = Pkg::new("docx")
+        .part(
+            "word/document.xml",
+            "rId5",
+            "settings",
+            "word/settings.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+            &filler(big),
+        )
+        .zip();
+    refused("a.docx", &docx, "too_large");
+    let row = "<row><c><v>1</v></c></row>";
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\"><sheetData>{}</sheetData></worksheet>",
+        row.repeat(big / row.len())
+    );
+    let f = check("a.xlsx", &workbook(&[("Sheet1", "visible", &sheet)]).zip());
+    assert_eq!(f["error"], Value::Null, "{f}");
 }
 
 #[test]
