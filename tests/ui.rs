@@ -477,7 +477,7 @@ fn macros_change_the_name_of_the_copy() {
 
 /// The page's own report builders, run in Node.js on `files`.
 fn page_report(files: &Value) -> String {
-    let start = PAGE.find("const name = p =>").unwrap();
+    let start = PAGE.find("const plural =").unwrap();
     let end = PAGE.find("// The page has no --keep flag").unwrap();
     let script = format!(
         "{}\nconst files = JSON.parse(require('fs').readFileSync(0, 'utf8'));\nprocess.stdout.write(report(files));",
