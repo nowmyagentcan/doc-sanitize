@@ -273,10 +273,20 @@ impl El {
         }
     }
 
-    /// Removes every element inside that `pick` picks (not looking inside it). One picked
-    /// inside an `mc:Choice` or `mc:Fallback` takes its whole `mc:AlternateContent` with it.
-    /// Gives how many were picked.
+    /// Removes every element inside that `pick` picks (not looking inside it), in every branch
+    /// of an `mc:AlternateContent` alike. Gives how many were picked.
     pub fn prune(&mut self, pick: &impl Fn(&El) -> bool) -> usize {
+        self.prune_in(pick, false)
+    }
+
+    /// Like [`El::prune`] for a whole object: one that stands directly in an `mc:Choice` or
+    /// `mc:Fallback` takes its `mc:AlternateContent` with it, since each branch is that object
+    /// in another form. One deeper in a branch, as in a text box, leaves the rest alone.
+    pub fn prune_whole(&mut self, pick: &impl Fn(&El) -> bool) -> usize {
+        self.prune_in(pick, true)
+    }
+
+    fn prune_in(&mut self, pick: &impl Fn(&El) -> bool, whole: bool) -> usize {
         let mut n = 0;
         self.kids.retain_mut(|k| {
             let Node::El(e) = k else { return true };
@@ -284,14 +294,19 @@ impl El {
                 n += 1;
                 return false;
             }
-            if e.is(MC, "AlternateContent") && e.els().any(|b| b.has(pick)) {
+            if whole && e.is_alternative_of(pick) {
                 n += e.els().map(|b| b.count(pick)).sum::<usize>();
                 return false;
             }
-            n += e.prune(pick);
+            n += e.prune_in(pick, whole);
             true
         });
         n
+    }
+
+    /// Whether this is an `mc:AlternateContent` with a branch that directly holds `pick`.
+    pub fn is_alternative_of(&self, pick: &impl Fn(&El) -> bool) -> bool {
+        self.is(MC, "AlternateContent") && self.els().any(|b| b.els().any(pick))
     }
 
     /// How many elements inside `pick` picks (not looking inside them), this one included.
@@ -407,15 +422,30 @@ mod tests {
     }
 
     #[test]
-    fn pruning_inside_alternate_content_takes_all_of_it() {
+    fn pruning_a_whole_object_takes_the_alternatives_around_it() {
         let mut d = doc(&format!(
             "<a xmlns:mc=\"{MC}\" xmlns:w=\"urn:w\"><mc:AlternateContent><mc:Choice Requires=\"x\"><w:p/></mc:Choice><mc:Fallback><w:p/></mc:Fallback></mc:AlternateContent><w:q/></a>"
         ));
-        assert_eq!(d.root.prune(&|e: &El| e.is(W, "p")), 2);
+        assert_eq!(d.root.prune_whole(&|e: &El| e.is(W, "p")), 2);
         assert_eq!(
             text(&d),
             format!("<a xmlns:mc=\"{MC}\" xmlns:w=\"urn:w\"><w:q/></a>")
         );
+    }
+
+    #[test]
+    fn pruning_inside_a_branch_leaves_the_rest_of_it() {
+        let box_of = "<w:box><w:p/><w:q/></w:box>";
+        let xml = format!(
+            "<a xmlns:mc=\"{MC}\" xmlns:w=\"urn:w\"><mc:AlternateContent><mc:Choice Requires=\"x\">{box_of}</mc:Choice><mc:Fallback>{box_of}</mc:Fallback></mc:AlternateContent></a>"
+        );
+        let kept = xml.replace("<w:p/>", "");
+        let mut d = doc(&xml);
+        assert_eq!(d.root.prune(&|e: &El| e.is(W, "p")), 2);
+        assert_eq!(text(&d), kept);
+        let mut d = doc(&xml);
+        assert_eq!(d.root.prune_whole(&|e: &El| e.is(W, "p")), 2);
+        assert_eq!(text(&d), kept);
     }
 
     #[test]

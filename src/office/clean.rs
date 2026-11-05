@@ -371,6 +371,7 @@ impl Draft {
     pub fn prune_linked(&mut self, part: &str, pick: impl Fn(&El) -> bool) -> Result<usize, Error> {
         self.change(part, |root| root.prune(&pick))
     }
+
     /// Deletes every part that a relationship of type `short` reaches.
     pub fn delete_linked(&mut self, short: &str) -> Result<usize, Error> {
         let links = self.linked(short)?;
@@ -770,7 +771,7 @@ fn macros(d: &mut Draft, kinds: &[&str]) -> Result<(), Error> {
         let controls =
             |e: &El| e.is(ns::W, "control") || e.is(ns::S, "controls") || e.is(ns::P, "controls");
         for part in d.xml_parts() {
-            d.prune_linked(&part, controls)?;
+            d.change(&part, |root| root.prune_whole(&controls))?;
         }
         d.delete_linked("control")?;
     }
@@ -883,7 +884,9 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                         }
                     });
                 }
-                d.prune_linked(&sheet, |e| e.is(ns::S, "oleObjects"))?;
+                d.change(&sheet, |root| {
+                    root.prune_whole(&|e: &El| e.is(ns::S, "oleObjects"))
+                })?;
                 drop_vml_shapes(d, &sheet, |e| {
                     e.attr("", "id").is_some_and(|id| shapes.contains(id))
                 })?;
@@ -1076,7 +1079,9 @@ fn workbook_links(d: &mut Draft) -> Result<bool, Error> {
     let book = d.main.clone();
     let external = d.prune_linked(&book, |e| e.is(ns::S, "externalReferences"))? > 0;
     let ac = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac";
-    d.prune_linked(&book, |e| e.is(ac, "absPath"))?;
+    d.change(&book, |root| {
+        root.prune_whole(&|e: &El| e.is(ac, "absPath"))
+    })?;
     if external {
         d.edit(&book, |root| {
             let linked = |e: &El| {
@@ -1229,7 +1234,8 @@ fn external_links(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                 let linked_only = |e: &El| {
                     e.is(ns::A, "blip") && named(e, "link") && e.attr(ns::R, "embed").is_none()
                 };
-                root.prune(&|e| {
+                let text_box = |e: &El| e.is(ns::W, "txbxContent");
+                root.prune_whole(&|e| {
                     (e.is(ns::A, "hlinkClick")
                         || e.is(ns::A, "hlinkHover")
                         || e.is(ns::S, "hyperlink"))
@@ -1239,6 +1245,7 @@ fn external_links(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                             || e.is(ns::P, "pic")
                             || e.local().ends_with("Anchor"))
                             && e.has(&linked_only)
+                            && !e.has(&text_box)
                 });
                 root.each_mut(&mut |e| {
                     if e.is(ns::A, "blip") && named(e, "link") {

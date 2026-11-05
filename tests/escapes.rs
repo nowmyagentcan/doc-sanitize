@@ -764,3 +764,97 @@ fn every_readme_example_is_a_valid_command() {
     }
     assert!(dir.join("outbox/a.clean.docx").exists());
 }
+
+// Text boxes, which Word writes twice: as DrawingML and as VML for older readers.
+
+/// A Word text box holding `inner`, in both forms, the way Word writes it.
+fn text_box(inner: &str) -> String {
+    format!(
+        "<w:r><mc:AlternateContent><mc:Choice Requires=\"wps\"><w:drawing><wp:anchor><wp:docPr id=\"7\" name=\"Text Box 1\"/><a:graphic><a:graphicData uri=\"wps\"><wps:wsp xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><wps:txbx><w:txbxContent>{inner}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape id=\"b\" style=\"position:absolute\"><v:textbox><w:txbxContent>{inner}</w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>"
+    )
+}
+
+/// `body` cleaned as a Word document with `rels`, as the copy's document part. The box must
+/// still say `KEEPBOX` in both its forms.
+fn box_survives(body: &str, mut pkg: Pkg, rels: &[String]) -> String {
+    for r in rels {
+        pkg = pkg.link("word/document.xml", r.clone());
+    }
+    let (f, copy) = clean("box.docx", &pkg.body(&doc_xml(&para(body))).zip());
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let parts = unzip(&copy.unwrap());
+    let doc = &parts.iter().find(|p| p.0 == "word/document.xml").unwrap().1;
+    let doc = String::from_utf8_lossy(doc).into_owned();
+    assert_eq!(doc.matches("KEEPBOX").count(), 2, "{doc}");
+    doc
+}
+
+#[test]
+fn a_tracked_change_in_a_text_box_keeps_the_box() {
+    let keep = para(&text_run("", "KEEPBOX"));
+    let changed = format!(
+        "{keep}<w:p><w:del w:id=\"1\" {BY_SAM}><w:r><w:delText>GONE</w:delText></w:r></w:del><w:r><w:rPr><w:b/><w:rPrChange w:id=\"2\" {BY_SAM}><w:rPr/></w:rPrChange></w:rPr><w:t>x</w:t></w:r></w:p>"
+    );
+    let doc = box_survives(&text_box(&changed), Pkg::new("docx"), &[]);
+    assert!(!doc.contains("GONE") && !doc.contains("w:del") && !doc.contains("rPrChange"));
+}
+
+#[test]
+fn a_bound_content_control_in_a_text_box_keeps_the_box() {
+    let bound = format!(
+        "<w:sdt><w:sdtPr><w:dataBinding w:xpath=\"/x\" w:storeItemID=\"{{1}}\"/></w:sdtPr><w:sdtContent>{}</w:sdtContent></w:sdt>",
+        para(&text_run("", "KEEPBOX"))
+    );
+    let doc = box_survives(&text_box(&bound), Pkg::new("docx"), &[]);
+    assert!(!doc.contains("dataBinding"));
+}
+
+#[test]
+fn a_comment_and_a_permission_in_a_text_box_keep_the_box() {
+    let marked = format!(
+        "<w:p w:rsidR=\"00112233\"><w:permStart w:id=\"1\" w:edGrp=\"everyone\"/><w:commentRangeStart w:id=\"0\"/>{}<w:commentRangeEnd w:id=\"0\"/><w:r><w:commentReference w:id=\"0\"/></w:r><w:permEnd w:id=\"1\"/></w:p>",
+        text_run("", "KEEPBOX")
+    );
+    let notes = format!("<w:comments xmlns:w=\"{W}\"><w:comment w:id=\"0\"/></w:comments>");
+    let pkg = Pkg::new("docx").part(
+        "word/document.xml",
+        "rId8",
+        "comments",
+        "word/comments.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        notes.as_bytes(),
+    );
+    let doc = box_survives(&text_box(&marked), pkg, &[]);
+    assert!(!doc.contains("commentRange") && !doc.contains("permStart"));
+}
+
+#[test]
+fn a_linked_picture_in_a_text_box_keeps_the_box() {
+    let picture = "<w:r><w:drawing><wp:inline><wp:docPr id=\"8\" name=\"p\"/><a:graphic><a:graphicData uri=\"pic\"><pic:pic><pic:blipFill><a:blip r:link=\"rId9\"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+    let inner = para(&format!("{}{picture}", text_run("", "KEEPBOX")));
+    let doc = box_survives(
+        &text_box(&inner),
+        Pkg::new("docx"),
+        &[external("rId9", "image", "file:///C:/private/a.png")],
+    );
+    assert!(!doc.contains("r:link"));
+}
+
+#[test]
+fn an_object_wrapped_in_alternatives_goes_with_its_wrapper() {
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><sheetData/><mc:AlternateContent><mc:Choice Requires=\"x14\"><oleObjects><oleObject progId=\"Package\" shapeId=\"1\"/></oleObjects></mc:Choice><mc:Fallback><oleObjects><oleObject progId=\"Package\" shapeId=\"1\"/></oleObjects></mc:Fallback></mc:AlternateContent></worksheet>"
+    );
+    let pkg = workbook(&[("One", "visible", &sheet)]).part(
+        "xl/worksheets/sheet1.xml",
+        "rId7",
+        "package",
+        "xl/embeddings/a.bin",
+        "application/vnd.openxmlformats-officedocument.oleObject",
+        b"data",
+    );
+    let (f, copy) = clean("wrapped.xlsx", &pkg.zip());
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(!plain.contains("AlternateContent"), "{plain}");
+}
