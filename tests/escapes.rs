@@ -278,7 +278,6 @@ fn a_value_a_shown_field_inherits_stays_and_its_hidden_sibling_hides_it() {
 }
 
 #[test]
-#[ignore = "known bug: F11"]
 fn a_script_on_a_field_with_kids_is_found_and_removed() {
     let pdf = form(|b| {
         let script = dictionary! {
@@ -299,7 +298,6 @@ fn a_script_on_a_field_with_kids_is_found_and_removed() {
 }
 
 #[test]
-#[ignore = "known bug: F11"]
 fn an_action_whose_type_is_an_indirect_object_is_found_and_removed() {
     let mut b = PdfBuilder::new();
     b.page("BT /F1 12 Tf 72 700 Td (Visible) Tj ET");
@@ -314,7 +312,6 @@ fn an_action_whose_type_is_an_indirect_object_is_found_and_removed() {
 }
 
 #[test]
-#[ignore = "known bug: F11"]
 fn an_action_is_found_wherever_clean_would_cut_it() {
     let secret = format!("SECRET-{}", "script-3");
     let script = |key: &str| {
@@ -344,7 +341,6 @@ fn an_action_is_found_wherever_clean_would_cut_it() {
 }
 
 #[test]
-#[ignore = "known bug: F11"]
 fn a_link_to_a_local_file_held_in_an_object_of_its_own_is_found_and_removed() {
     let mut b = PdfBuilder::new();
     b.page("BT /F1 12 Tf 72 700 Td (Visible) Tj ET");

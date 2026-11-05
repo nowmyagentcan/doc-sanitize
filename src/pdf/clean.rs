@@ -2,7 +2,7 @@
 //! the copy is written as one revision with no encryption and a new /ID, keeping only the
 //! objects the trailer reaches.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
 use hayro::RenderCache;
@@ -260,6 +260,26 @@ impl Copy {
     /// to another file is cut wherever it sits (/OpenAction, /A, /AA, /Next); an action
     /// takes the actions chained after it. Link annotations left with no action go.
     fn actions(&mut self, macros: bool, links: bool) {
+        // The check reads /S and /URI through references, so they are brought in first.
+        let direct: HashMap<ObjectId, Object> = self
+            .doc
+            .objects
+            .keys()
+            .filter_map(|id| {
+                let reference = Object::Reference(*id);
+                let (_, o) = self.doc.dereference(&reference).ok()?;
+                matches!(o, Object::Name(_) | Object::String(..)).then(|| (*id, o.clone()))
+            })
+            .collect();
+        each_dict(&mut self.doc, &mut |d| {
+            for key in [b"S".as_slice(), b"URI"] {
+                if let Ok(Object::Reference(id)) = d.get(key)
+                    && let Some(o) = direct.get(id)
+                {
+                    d.set(key, o.clone());
+                }
+            }
+        });
         let bad = |d: &Dictionary| {
             let s = d.get(b"S").and_then(Object::as_name).unwrap_or_default();
             let file_uri = d
@@ -268,10 +288,15 @@ impl Copy {
                 .and_then(|u| lopdf::decode_text_string(u).ok())
                 .is_some_and(|u| u.to_lowercase().starts_with("file:"));
             (macros
-                && matches!(
-                    s,
-                    b"JavaScript" | b"Launch" | b"ImportData" | b"SubmitForm" | b"RichMediaExecute"
-                ))
+                && (d.has(b"JS")
+                    || matches!(
+                        s,
+                        b"JavaScript"
+                            | b"Launch"
+                            | b"ImportData"
+                            | b"SubmitForm"
+                            | b"RichMediaExecute"
+                    )))
                 || (links && (matches!(s, b"GoToR" | b"GoToE") || (s == b"URI" && file_uri)))
         };
         let ids: HashSet<ObjectId> = self

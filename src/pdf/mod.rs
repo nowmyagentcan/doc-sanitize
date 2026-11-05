@@ -704,59 +704,50 @@ fn embedded_files(c: &Ctx) -> Vec<Finding> {
     found
 }
 
-/// Scripts, risky actions and links to other files, from every place an action can sit.
-fn actions(c: &Ctx) -> Vec<Finding> {
-    let mut roots: Vec<&Object> = vec![];
-    if let Some(cat) = c.catalog() {
-        roots.extend(cat.get(b"OpenAction").ok());
-        roots.extend(triggers(c, cat));
-    }
-    roots.extend(names(c, b"JavaScript").into_iter().map(|(_, v)| v));
-    for (_, page) in c.pages() {
-        roots.extend(triggers(c, page));
-        for (_, a) in c.annots(page) {
-            roots.extend(a.get(b"A").ok());
-            roots.extend(triggers(c, a));
+/// Calls `f` on every dictionary inside `o`, stream dictionaries included.
+fn dicts<'a>(o: &'a Object, f: &mut impl FnMut(&'a Dictionary)) {
+    match o {
+        Object::Array(a) => a.iter().for_each(|o| dicts(o, f)),
+        Object::Dictionary(d) => {
+            f(d);
+            d.iter().for_each(|(_, o)| dicts(o, f));
         }
+        Object::Stream(s) => {
+            f(&s.dict);
+            s.dict.iter().for_each(|(_, o)| dicts(o, f));
+        }
+        _ => {}
     }
-    for field in form_fields(c) {
-        roots.extend(triggers(c, field.dict));
-    }
+}
 
+/// Scripts, risky actions and links to other files, in every dictionary the file reaches:
+/// `clean` cuts them wherever they sit, so the check can't go by a list of places.
+fn actions(c: &Ctx) -> Vec<Finding> {
+    let mut reached: Vec<_> = bytes::reachable(c.doc()).into_iter().collect();
+    reached.sort_unstable();
     // (kind, values) for javascript, action, remote_go_to, file_uri.
     let mut kinds: [Vec<Option<String>>; 4] = Default::default();
-    let mut seen = HashSet::new();
-    while let Some(o) = roots.pop() {
-        if let Ok(id) = o.as_reference()
-            && !seen.insert(id)
-        {
-            continue;
-        }
-        let o = c.resolve(o);
-        if let Object::Array(next) = o {
-            roots.extend(next);
-            continue;
-        }
-        let Some(action) = as_dict(o) else { continue };
-        let text = |key: &[u8]| action.get(key).ok().and_then(|v| c.text(v));
-        match action
-            .get(b"S")
-            .and_then(Object::as_name)
-            .unwrap_or_default()
-        {
-            b"JavaScript" => kinds[0].push(text(b"JS")),
-            b"Launch" | b"ImportData" | b"SubmitForm" | b"RichMediaExecute" => {
-                kinds[1].push(text(b"F"));
-            }
-            b"GoToR" | b"GoToE" => kinds[2].push(text(b"F")),
-            b"URI" => {
-                if let Some(uri) = text(b"URI").filter(|u| u.to_lowercase().starts_with("file:")) {
-                    kinds[3].push(Some(uri));
+    for o in reached.iter().filter_map(|id| c.doc().get_object(*id).ok()) {
+        dicts(o, &mut |action| {
+            let text = |key: &[u8]| action.get(key).ok().and_then(|v| c.text(v));
+            let kind = c.get(action, b"S").and_then(|s| s.as_name().ok());
+            match kind.unwrap_or_default() {
+                b"JavaScript" => kinds[0].push(text(b"JS")),
+                _ if action.has(b"JS") => kinds[0].push(text(b"JS")),
+                b"Launch" | b"ImportData" | b"SubmitForm" | b"RichMediaExecute" => {
+                    kinds[1].push(text(b"F"));
                 }
+                b"GoToR" | b"GoToE" => kinds[2].push(text(b"F")),
+                b"URI" => {
+                    if let Some(uri) =
+                        text(b"URI").filter(|u| u.to_lowercase().starts_with("file:"))
+                    {
+                        kinds[3].push(Some(uri));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        roots.extend(action.get(b"Next").ok());
+        });
     }
     let what = [
         (
@@ -801,13 +792,6 @@ fn actions(c: &Ctx) -> Vec<Finding> {
         .collect()
 }
 
-/// The actions of a dictionary's /AA triggers.
-fn triggers<'a>(c: &Ctx<'a>, d: &'a Dictionary) -> Vec<&'a Object> {
-    c.dict(d, b"AA")
-        .map(|aa| aa.iter().map(|(_, v)| v).collect())
-        .unwrap_or_default()
-}
-
 /// What a field stores and hands down to the fields below it: its value, the default a reset
 /// restores, and its rich text.
 const VALUE_KEYS: [&[u8]; 3] = [b"V", b"DV", b"RV"];
@@ -816,7 +800,6 @@ const VALUE_KEYS: [&[u8]; 3] = [b"V", b"DV", b"RV"];
 /// it.
 struct Field<'a> {
     id: Option<ObjectId>,
-    dict: &'a Dictionary,
     kind: &'a [u8],
     /// What each of [`VALUE_KEYS`] holds, its own or inherited.
     values: [Option<&'a Object>; 3],
@@ -861,7 +844,6 @@ fn form_fields<'a>(c: &Ctx<'a>) -> Vec<Field<'a>> {
             }
             fields.push(Field {
                 id: o.as_reference().ok(),
-                dict,
                 kind,
                 values,
                 widgets: own,
