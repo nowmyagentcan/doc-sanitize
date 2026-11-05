@@ -168,6 +168,36 @@ fn a_prefix_that_only_looks_like_pdfa_is_not_kept() {
     gone("a.pdf", &pdf, "SECRET-xmp-2");
 }
 
+#[test]
+#[ignore = "known bug: F03"]
+fn only_a_packet_holding_nothing_but_pdfa_identification_is_left_alone() {
+    let secret = format!("SECRET-{}", "xmp-3");
+    let in_rdf = |inner: &str| {
+        format!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"{RDF}\">{inner}</rdf:RDF></x:xmpmeta>"
+        )
+    };
+    let id = "<rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" pdfaid:part=\"2\" pdfaid:conformance=\"B\"/>";
+    assert_eq!(
+        check("a.pdf", &with_xmp(&in_rdf(id)))["status"],
+        "none_found"
+    );
+    for xmp in [
+        format!("<a>{secret}"),
+        format!("<a>{secret}</a>"),
+        in_rdf(&format!("<!-- {secret} -->{id}")),
+        in_rdf(&format!("{secret}{id}")),
+        in_rdf(&id.replace("rdf:about=\"\"", &format!("rdf:about=\"{secret}\""))),
+        in_rdf(&id.replace("pdfaid:part=\"2\"", &format!("pdfaid:part=\"{secret}\""))),
+        in_rdf(&id.replace("pdfaid:part=\"2\"", &format!("pdfaid:note=\"{secret}\""))),
+        in_rdf(id).replace("<rdf:RDF", &format!("<rdf:RDF x:tool=\"{secret}\" ")),
+    ] {
+        let pdf = with_xmp(&xmp);
+        assert_eq!(check("a.pdf", &pdf)["status"], "found", "{xmp}");
+        gone("a.pdf", &pdf, &secret);
+    }
+}
+
 /// A form of `fields` (their dictionaries, the first of them the only root).
 fn form(fields: impl FnOnce(&mut PdfBuilder) -> lopdf::ObjectId) -> Vec<u8> {
     let mut b = PdfBuilder::new();
@@ -284,6 +314,50 @@ fn an_action_whose_type_is_an_indirect_object_is_found_and_removed() {
     let pdf = b.bytes();
     assert_eq!(check("a.pdf", &pdf)["status"], "found");
     gone("a.pdf", &pdf, "SECRET-script-2");
+}
+
+#[test]
+#[ignore = "known bug: F11"]
+fn an_action_is_found_wherever_clean_would_cut_it() {
+    let secret = format!("SECRET-{}", "script-3");
+    let script = |key: &str| {
+        dictionary! { "S" => key, "JS" => Object::string_literal(secret.as_str()) }
+    };
+    // A bookmark's action.
+    let mut b = PdfBuilder::new();
+    b.page("BT /F1 12 Tf 72 700 Td (Visible) Tj ET");
+    let action = b.add(script("JavaScript"));
+    let outlines = b.doc.new_object_id();
+    let item = b.add(dictionary! {
+        "Title" => Object::string_literal("Start"), "Parent" => outlines, "A" => action,
+    });
+    let root = dictionary! { "Type" => "Outlines", "First" => item, "Last" => item, "Count" => 1 };
+    b.doc.objects.insert(outlines, root.into());
+    b.catalog.set("Outlines", outlines);
+    let bookmark = b.bytes();
+    // A script on an action of another kind.
+    let mut b = PdfBuilder::new();
+    let mut extra = Dictionary::new();
+    extra.set("AA", dictionary! { "O" => script("Rendition") });
+    b.page_with("BT /F1 12 Tf 72 700 Td (Visible) Tj ET", extra);
+    for pdf in [bookmark, b.bytes()] {
+        assert_eq!(check("a.pdf", &pdf)["status"], "found");
+        gone("a.pdf", &pdf, &secret);
+    }
+}
+
+#[test]
+#[ignore = "known bug: F11"]
+fn a_link_to_a_local_file_held_in_an_object_of_its_own_is_found_and_removed() {
+    let mut b = PdfBuilder::new();
+    b.page("BT /F1 12 Tf 72 700 Td (Visible) Tj ET");
+    let secret = format!("file:///SECRET-{}", "uri-1");
+    let uri = b.add(Object::string_literal(secret.as_str()));
+    let action = b.add(dictionary! { "S" => "URI", "URI" => uri });
+    b.catalog.set("OpenAction", action);
+    let pdf = b.bytes();
+    assert_eq!(check("a.pdf", &pdf)["status"], "found");
+    gone("a.pdf", &pdf, &secret);
 }
 
 #[test]
@@ -541,6 +615,67 @@ fn any_part_clean_reads_as_a_tree_has_the_limit_and_a_workbooks_sheet_does_not()
     );
     let f = check("a.xlsx", &workbook(&[("Sheet1", "visible", &sheet)]).zip());
     assert_eq!(f["error"], Value::Null, "{f}");
+}
+
+/// A workbook whose sheet has a hidden column, padded to `size` with a comment: a comment is
+/// one node, so a test of the limit can't take the memory the limit is there to prevent.
+fn padded_sheet(size: usize) -> Vec<u8> {
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\"><cols><col min=\"2\" max=\"2\" width=\"9\" hidden=\"1\"/></cols><sheetData><row r=\"1\"><c r=\"B1\"><v>7</v></c></row></sheetData><!--{}--></worksheet>",
+        " ".repeat(size)
+    );
+    workbook(&[("Sheet1", "visible", &sheet)]).zip()
+}
+
+#[test]
+#[ignore = "known bug: N01"]
+fn a_workbook_part_too_big_to_edit_is_checked_but_not_cleaned() {
+    let big = padded_sheet(129 << 20);
+    assert_eq!(check("a.xlsx", &big)["status"], "found");
+    let (f, copy) = clean("a.xlsx", &big);
+    assert_eq!(f["error"]["code"], "too_large", "{f}");
+    assert!(
+        f["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too large to clean")
+    );
+    assert!(copy.is_none());
+    let (f, copy) = clean("a.xlsx", &padded_sheet(127 << 20));
+    assert_eq!(f["status"], "cleaned", "{f}");
+    assert!(copy.is_some());
+}
+
+#[test]
+#[ignore = "known bug: N01"]
+fn only_a_part_clean_reads_as_a_tree_is_held_to_the_limit_on_trees() {
+    let secret = format!("SECRET-{}", "custom-1");
+    let docx = |size: usize| {
+        let xml = format!("<a>{secret}<!--{}--></a>", " ".repeat(size));
+        Pkg::new("docx")
+            .part(
+                "word/document.xml",
+                "rId5",
+                "customXml",
+                "customXml/item1.xml",
+                "application/xml",
+                xml.as_bytes(),
+            )
+            .zip()
+    };
+    // Spec: only stories, slides, drawings and charts have 64 MiB; custom XML is streamed, and
+    // clean deletes it unread.
+    let over = docx(129 << 20);
+    assert_eq!(check("a.docx", &over)["status"], "found");
+    gone("a.docx", &over, &secret);
+    // Kept, it is read as a tree like every part that stays.
+    let dir = dir("escapes-kept");
+    put(&dir, &[("a.docx", &over)]);
+    let out = run_in(
+        &dir,
+        &["clean", "a.docx", "--keep", "custom-data", "--json"],
+    );
+    assert_eq!(json(&out)["files"][0]["error"]["code"], "too_large");
 }
 
 #[test]
