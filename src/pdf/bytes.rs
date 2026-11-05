@@ -95,6 +95,9 @@ fn revision_ends(bytes: &[u8], start: usize) -> Vec<usize> {
             continue;
         };
         let target = pdf.get(offset..).unwrap_or_default();
+        if no_objects(target) {
+            continue;
+        }
         if target.starts_with(b"xref") || object_header(target).is_some() {
             ends.push(start + after + eof + 5);
         }
@@ -103,6 +106,18 @@ fn revision_ends(bytes: &[u8], start: usize) -> Vec<usize> {
         ends.remove(0);
     }
     ends
+}
+
+/// A cross-reference section listing no objects, as Office's PDF export ends with: it changes
+/// nothing, so what comes before it is no earlier revision.
+fn no_objects(section: &[u8]) -> bool {
+    let Some(rest) = section.strip_prefix(b"xref") else {
+        return false;
+    };
+    let mut i = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    number(rest, &mut i) == Some(0)
+        && number(rest, &mut i) == Some(0)
+        && rest[i..].starts_with(b"trailer")
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

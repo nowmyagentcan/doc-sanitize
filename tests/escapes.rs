@@ -364,7 +364,6 @@ fn a_page_timestamp_goes_even_when_nothing_else_is_metadata() {
 }
 
 #[test]
-#[ignore = "known bug: T02"]
 fn an_update_section_with_no_objects_is_not_an_earlier_revision() {
     // Office's PDF export ends with `xref 0 0` and a trailer pointing back at the real table.
     let mut pdf = raw(&raw_page(""), "/Root 1 0 R");
