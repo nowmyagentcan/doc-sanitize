@@ -540,7 +540,6 @@ fn a_utf16_part_stays_readable_after_an_edit() {
 }
 
 #[test]
-#[ignore = "known bug: F09"]
 fn names_equal_after_percent_decoding_are_two_versions_of_a_part() {
     let other = doc_xml(&para(&text_run("", "SECRET-alias-1")));
     for alias in ["word/%64ocument.xml", "word%2Fdocument.xml"] {

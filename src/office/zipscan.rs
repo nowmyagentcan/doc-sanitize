@@ -138,7 +138,7 @@ fn read(b: &[u8], p: usize) -> Result<Zip, Error> {
     let mut c = start;
     for _ in 0..count {
         let (entry, span, next) = central(b, c, shift, start)?;
-        if !names.insert(entry.name.to_ascii_lowercase()) {
+        if !names.insert(super::key(&entry.name)) {
             return Err(Error::two_versions(&entry.name));
         }
         entries.push(entry);
