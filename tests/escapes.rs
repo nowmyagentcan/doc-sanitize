@@ -354,7 +354,6 @@ fn a_link_to_a_local_file_held_in_an_object_of_its_own_is_found_and_removed() {
 }
 
 #[test]
-#[ignore = "known bug: F15"]
 fn a_page_timestamp_goes_even_when_nothing_else_is_metadata() {
     let mut b = PdfBuilder::new();
     let mut extra = Dictionary::new();

@@ -385,7 +385,7 @@ fn metadata(c: &Ctx) -> Vec<Finding> {
             own += 1;
             first.get_or_insert(joined(&props));
         }
-        pieces += usize::from(d.has(b"PieceInfo"));
+        pieces += usize::from(d.has(b"PieceInfo") || d.has(b"LastModified"));
         thumbs += usize::from(d.has(b"Thumb") && d.has_type(b"Page"));
     }
     for (kind, count, unit, one, many, value) in [
