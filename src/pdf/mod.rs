@@ -360,7 +360,7 @@ fn metadata(c: &Ctx) -> Vec<Finding> {
         .catalog()
         .map(|d| d.get(b"Metadata").and_then(Object::as_reference))
         && let Some(props) = xmp_of(c.doc().get_object(id).unwrap_or(&Object::Null))
-        && !pdfa_only(&props)
+        && !props.iter().all(pdfa_id)
     {
         found.push(c.finding(
             (ID, "xmp"),
@@ -520,19 +520,14 @@ fn xmp(bytes: &[u8]) -> Vec<(String, String)> {
     props
 }
 
-/// A PDF/A or PDF/UA identification property a copy may keep: a part or a conformance level,
-/// which are one character each.
+/// A PDF/A or PDF/UA identification property, one character long, which a copy keeps and a
+/// packet of nothing else isn't a finding.
 fn pdfa_id((name, value): &(String, String)) -> bool {
     matches!(
         name.as_str(),
         "pdfaid:part" | "pdfaid:conformance" | "pdfuaid:part"
     ) && value.len() == 1
         && value.chars().all(char::is_alphanumeric)
-}
-
-/// Only PDF/A and PDF/UA identification, which a copy keeps and which is never a finding.
-fn pdfa_only(props: &[(String, String)]) -> bool {
-    props.iter().all(pdfa_id)
 }
 
 fn joined(props: &[(String, String)]) -> String {
@@ -732,8 +727,7 @@ fn actions(c: &Ctx) -> Vec<Finding> {
             let text = |key: &[u8]| action.get(key).ok().and_then(|v| c.text(v));
             let kind = c.get(action, b"S").and_then(|s| s.as_name().ok());
             match kind.unwrap_or_default() {
-                b"JavaScript" => kinds[0].push(text(b"JS")),
-                _ if action.has(b"JS") => kinds[0].push(text(b"JS")),
+                s if s == b"JavaScript" || action.has(b"JS") => kinds[0].push(text(b"JS")),
                 b"Launch" | b"ImportData" | b"SubmitForm" | b"RichMediaExecute" => {
                     kinds[1].push(text(b"F"));
                 }

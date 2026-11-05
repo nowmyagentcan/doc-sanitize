@@ -101,13 +101,6 @@ impl Doc {
                     let mut el = open.pop().ok_or_else(|| Error::bad_xml(part))?;
                     // A short list of kids would otherwise keep room for four.
                     el.kids.shrink_to_fit();
-                    if open.is_empty() {
-                        return Ok(Self {
-                            prolog,
-                            root: el,
-                            utf16,
-                        });
-                    }
                     Node::El(el)
                 }
                 Event::Comment(c) => Node::Raw(format!("<!--{}-->", &**c)),
