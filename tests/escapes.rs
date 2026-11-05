@@ -147,7 +147,6 @@ fn with_xmp(xmp: &str) -> Vec<u8> {
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 #[test]
-#[ignore = "known bug: F03"]
 fn xmp_is_read_by_namespace_not_by_prefix() {
     let xmp = format!(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><r:RDF xmlns:r=\"{RDF}\"><r:Description r:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator><r:Seq><r:li>SECRET-xmp-1</r:li></r:Seq></dc:creator></r:Description></r:RDF></x:xmpmeta>"
@@ -158,7 +157,6 @@ fn xmp_is_read_by_namespace_not_by_prefix() {
 }
 
 #[test]
-#[ignore = "known bug: F03"]
 fn a_prefix_that_only_looks_like_pdfa_is_not_kept() {
     let xmp = format!(
         "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"{RDF}\"><rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://example.invalid/not-pdfa/\"><pdfaid:note>SECRET-xmp-2</pdfaid:note></rdf:Description></rdf:RDF></x:xmpmeta>"
@@ -169,7 +167,6 @@ fn a_prefix_that_only_looks_like_pdfa_is_not_kept() {
 }
 
 #[test]
-#[ignore = "known bug: F03"]
 fn only_a_packet_holding_nothing_but_pdfa_identification_is_left_alone() {
     let secret = format!("SECRET-{}", "xmp-3");
     let in_rdf = |inner: &str| {

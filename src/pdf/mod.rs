@@ -13,6 +13,7 @@ use flate2::write::{DeflateDecoder, ZlibDecoder};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
 
+use crate::office::xml;
 use crate::pictures;
 use crate::report::{CheckId, Error, Finding, Where, counted};
 
@@ -424,70 +425,114 @@ fn metadata(c: &Ctx) -> Vec<Finding> {
 /// The properties a metadata stream sets as (name, value), or None when it isn't a stream.
 fn xmp_of(o: &Object) -> Option<Vec<(String, String)>> {
     let Object::Stream(s) = o else { return None };
-    Some(xmp(&s.get_plain_content_with_limit(STREAM_LIMIT).ok()?))
+    Some(match s.get_plain_content_with_limit(STREAM_LIMIT) {
+        Ok(bytes) => xmp(&bytes),
+        Err(_) => vec![unreadable()],
+    })
 }
 
-/// The properties an XMP packet sets, as (qualified name, value): the elements and
-/// attributes inside each rdf:Description, a list item named by its property.
+/// Stands for what can't be read, which is never only PDF/A identification.
+fn unreadable() -> (String, String) {
+    ("unreadable".into(), String::new())
+}
+
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const XMP_META: &str = "adobe:ns:meta/";
+const PDFA_ID: &str = "http://www.aiim.org/pdfa/ns/id/";
+const PDFUA_ID: &str = "http://www.aiim.org/pdfua/ns/id/";
+
+/// A property's name: PDF/A and PDF/UA identification by namespace, under its usual prefix;
+/// any other as written, unless its prefix would pass for one of those.
+fn property(ns: &str, name: &str) -> String {
+    let local = name.rsplit(':').next().unwrap_or(name);
+    match ns {
+        PDFA_ID => format!("pdfaid:{local}"),
+        PDFUA_ID => format!("pdfuaid:{local}"),
+        _ if name.starts_with("pdfaid:") || name.starts_with("pdfuaid:") => local.into(),
+        _ => name.into(),
+    }
+}
+
+/// Everything an XMP packet holds, as (name, value): elements and attributes by namespace, a
+/// list item named by its property. What RDF itself needs isn't a property; anything else is,
+/// a comment or stray text too, and a packet that can't be read ends with [`unreadable`].
 fn xmp(bytes: &[u8]) -> Vec<(String, String)> {
     use quick_xml::events::Event;
-    let Ok(text) = crate::office::xml::decode(bytes, "XMP") else {
-        return vec![];
+    let Ok(text) = xml::decode(bytes, "XMP") else {
+        return vec![unreadable()];
     };
-    let mut reader = quick_xml::Reader::from_str(&text);
-    let (mut names, mut props) = (Vec::<String>::new(), Vec::<(String, String)>::new());
+    let mut reader = xml::Reader::new(&text, "XMP");
+    let mut props = Vec::<(String, String)>::new();
     // A text after an element boundary starts a new item of the current property.
     let mut fresh = true;
     loop {
-        let event = match reader.read_event() {
-            Ok(Event::Eof) | Err(_) => break,
+        let event = match reader.event() {
+            Ok(Event::Eof) => break,
             Ok(e) => e,
+            Err(_) => {
+                props.push(unreadable());
+                break;
+            }
         };
-        let inside = names.iter().any(|n| n == "rdf:Description");
         match &event {
             Event::Start(e) | Event::Empty(e) => {
-                let name = e.name().as_ref().to_string();
-                if name == "rdf:Description" {
-                    for a in e.attributes().flatten() {
-                        let key = a.key.as_ref().to_string();
-                        if !key.starts_with("xmlns") && !key.starts_with("rdf:") {
-                            props.push((key, a.value.to_string()));
-                        }
+                let ns = reader.ns(e).to_string();
+                let frame = ns == RDF || ns == XMP_META;
+                let attrs = reader.raw_attrs(e).unwrap_or_else(|_| {
+                    props.push(unreadable());
+                    vec![]
+                });
+                for (attr_ns, name, value) in attrs {
+                    let syntax = name.starts_with("xmlns")
+                        || value.is_empty()
+                        || name.ends_with(":parseType")
+                        || (frame && name == "xml:lang");
+                    if !syntax {
+                        props.push((property(&attr_ns, &name), value));
                     }
-                } else if inside && !name.starts_with("rdf:") {
-                    props.push((name.clone(), String::new()));
                 }
-                if matches!(event, Event::Start(_)) {
-                    names.push(name);
+                if !frame {
+                    props.push((property(&ns, e.name().as_ref()), String::new()));
                 }
                 fresh = true;
             }
-            Event::End(_) => {
-                names.pop();
-                fresh = true;
+            Event::End(_) => fresh = true,
+            Event::Comment(c) => props.push(("comment".into(), (**c).to_string())),
+            Event::PI(p) if !p.starts_with("xpacket") => {
+                props.push(("instruction".into(), (**p).to_string()));
             }
-            event if inside => {
-                if let (Some(t), Some(last)) = (crate::office::xml::text(event), props.last_mut())
-                    && !t.trim().is_empty()
-                {
-                    if fresh && !last.1.is_empty() {
-                        last.1 += ", ";
-                    }
-                    last.1 += t.trim();
-                    fresh = false;
+            event => {
+                let Some(t) = xml::text(event).filter(|t| !t.trim().is_empty()) else {
+                    continue;
+                };
+                if props.is_empty() {
+                    props.push(("text".into(), String::new()));
                 }
+                let last = props.last_mut().expect("a property to add to");
+                if fresh && !last.1.is_empty() {
+                    last.1 += ", ";
+                }
+                last.1 += t.trim();
+                fresh = false;
             }
-            _ => {}
         }
     }
     props
 }
 
+/// A PDF/A or PDF/UA identification property a copy may keep: a part or a conformance level,
+/// which are one character each.
+fn pdfa_id((name, value): &(String, String)) -> bool {
+    matches!(
+        name.as_str(),
+        "pdfaid:part" | "pdfaid:conformance" | "pdfuaid:part"
+    ) && value.len() == 1
+        && value.chars().all(char::is_alphanumeric)
+}
+
 /// Only PDF/A and PDF/UA identification, which a copy keeps and which is never a finding.
 fn pdfa_only(props: &[(String, String)]) -> bool {
-    props
-        .iter()
-        .all(|(k, _)| k.starts_with("pdfaid:") || k.starts_with("pdfuaid:"))
+    props.iter().all(pdfa_id)
 }
 
 fn joined(props: &[(String, String)]) -> String {

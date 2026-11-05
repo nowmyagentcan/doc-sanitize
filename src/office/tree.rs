@@ -131,7 +131,13 @@ impl Doc {
             None => out.into_bytes(),
             Some(big) => once(0xFEFF)
                 .chain(out.encode_utf16())
-                .flat_map(|u| if big { u.to_be_bytes() } else { u.to_le_bytes() })
+                .flat_map(|u| {
+                    if big {
+                        u.to_be_bytes()
+                    } else {
+                        u.to_le_bytes()
+                    }
+                })
                 .collect(),
         }
     }

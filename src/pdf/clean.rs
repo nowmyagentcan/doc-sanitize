@@ -2,7 +2,7 @@
 //! the copy is written as one revision with no encryption and a new /ID, keeping only the
 //! objects the trailer reaches.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
 use hayro::RenderCache;
@@ -10,7 +10,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
 use super::{
     COMMENTS, Ctx, Pdf, VALUE_KEYS, as_dict, bytes, form_fields, layers, listed_widgets,
-    pages_text, raster, subtype, xmp_of,
+    pages_text, pdfa_id, raster, subtype, xmp_of,
 };
 use crate::pictures;
 use crate::report::{Change, CheckId, Cleaned, Error, Finding, Warning, counted};
@@ -434,18 +434,13 @@ impl Copy {
     /// `metadata`: /Info, every /Metadata, /PieceInfo, /LastModified and page thumbnails. A
     /// PDF/A file keeps a packet with only its PDF/A (and PDF/UA) identification.
     fn metadata(&mut self, c: &Ctx) {
-        let ids: Vec<(String, String)> = c
+        let ids: BTreeMap<String, String> = c
             .catalog()
             .and_then(|cat| c.get(cat, b"Metadata"))
             .and_then(xmp_of)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(k, _)| {
-                matches!(
-                    k.as_str(),
-                    "pdfaid:part" | "pdfaid:conformance" | "pdfuaid:part"
-                )
-            })
+            .filter(pdfa_id)
             .collect();
         self.doc.trailer.remove(b"Info");
         each_dict(&mut self.doc, &mut |d| {
@@ -456,13 +451,10 @@ impl Copy {
                 d.remove(b"Thumb");
             }
         });
-        if !ids.iter().any(|(k, _)| k == "pdfaid:part") {
+        if !ids.contains_key("pdfaid:part") {
             return;
         }
-        let attrs: String = ids
-            .iter()
-            .map(|(k, v)| format!(" {k}=\"{}\"", v.replace(['"', '<', '&'], "")))
-            .collect();
+        let attrs: String = ids.iter().map(|(k, v)| format!(" {k}=\"{v}\"")).collect();
         let packet = format!(
             "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" xmlns:pdfuaid=\"http://www.aiim.org/pdfua/ns/id/\"{attrs}/></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
         );
@@ -476,7 +468,7 @@ impl Copy {
         {
             d.set("Metadata", id);
         }
-        if ids.iter().any(|(k, _)| k == "pdfuaid:part") {
+        if ids.contains_key("pdfuaid:part") {
             self.out.warnings.push(Warning::pdfa_title_removed());
         }
     }
