@@ -521,7 +521,6 @@ fn honest_text(part: &[u8]) -> String {
 }
 
 #[test]
-#[ignore = "known bug: F08"]
 fn a_utf16_part_stays_readable_after_an_edit() {
     for docx in [
         utf16([0xFF, 0xFE], u16::to_le_bytes),

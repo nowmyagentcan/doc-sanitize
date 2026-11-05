@@ -16,33 +16,36 @@ const MAX_DEPTH: usize = 256;
 const MAX_XMLNS: usize = 64;
 const MAX_VALUE: usize = 32 << 20;
 
+/// The UTF-16 text of a part after any byte-order mark, and whether it is big-endian: known
+/// from the mark, or from `<?` without one.
+pub fn utf16(bytes: &[u8]) -> Option<(&[u8], bool)> {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => Some((rest, false)),
+        [0xFE, 0xFF, rest @ ..] => Some((rest, true)),
+        [b'<', 0, b'?', 0, ..] => Some((bytes, false)),
+        [0, b'<', 0, b'?', ..] => Some((bytes, true)),
+        _ => None,
+    }
+}
+
 /// A part's bytes as text: a UTF-8 or UTF-16 byte-order mark is honoured, UTF-16 without one
 /// is recognised from `<?`, and anything that isn't valid UTF-8 or UTF-16 is damage.
 pub fn decode<'b>(bytes: &'b [u8], part: &str) -> Result<Cow<'b, str>, Error> {
-    let utf16 = |b: &[u8], big: bool| {
-        if !b.len().is_multiple_of(2) {
+    if let Some((text, big)) = utf16(bytes) {
+        if !text.len().is_multiple_of(2) {
             return Err(Error::bad_xml(part));
         }
-        let units = b.as_chunks::<2>().0.iter().map(|&pair| {
+        let units = text.as_chunks::<2>().0.iter().map(|&pair| {
             if big {
                 u16::from_be_bytes(pair)
             } else {
                 u16::from_le_bytes(pair)
             }
         });
-        char::decode_utf16(units)
+        return char::decode_utf16(units)
             .collect::<Result<String, _>>()
             .map(Cow::Owned)
-            .map_err(|_| Error::bad_xml(part))
-    };
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        return utf16(rest, false);
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        return utf16(rest, true);
-    }
-    if bytes.starts_with(b"<\0?\0") || bytes.starts_with(b"\0<\0?") {
-        return utf16(bytes, bytes[0] == 0);
+            .map_err(|_| Error::bad_xml(part));
     }
     let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     std::str::from_utf8(body)

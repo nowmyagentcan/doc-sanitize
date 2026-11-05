@@ -1,6 +1,7 @@
 //! A small element tree for the parts `clean` edits: read within the XML limits, edited in
 //! place and written back with every prefix, declaration and attribute as it was.
 
+use std::iter::once;
 use std::rc::Rc;
 
 use quick_xml::events::Event;
@@ -13,6 +14,8 @@ use crate::report::Error;
 pub struct Doc {
     pub prolog: String,
     pub root: El,
+    /// Whether the part is UTF-16, and big-endian: it is written back as it was read.
+    utf16: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +48,7 @@ pub const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/200
 impl Doc {
     pub fn parse(bytes: &[u8], part: &str) -> Result<Self, Error> {
         let text = xml::decode(bytes, part)?;
+        let utf16 = xml::utf16(bytes).map(|(_, big)| big);
         let mut r = Reader::new(&text, part);
         let mut prolog = String::new();
         let mut open: Vec<El> = vec![];
@@ -85,7 +89,11 @@ impl Doc {
                 Event::End(_) => {
                     let el = open.pop().ok_or_else(|| Error::bad_xml(part))?;
                     if open.is_empty() {
-                        return Ok(Self { prolog, root: el });
+                        return Ok(Self {
+                            prolog,
+                            root: el,
+                            utf16,
+                        });
                     }
                     Node::El(el)
                 }
@@ -103,7 +111,13 @@ impl Doc {
                     _ => parent.kids.push(Node::Text(t)),
                 },
                 (Some(parent), node) => parent.kids.push(node),
-                (None, Node::El(root)) => return Ok(Self { prolog, root }),
+                (None, Node::El(root)) => {
+                    return Ok(Self {
+                        prolog,
+                        root,
+                        utf16,
+                    });
+                }
                 (None, Node::Raw(raw)) => prolog += &raw,
                 (None, Node::Text(t)) => prolog += &t,
             }
@@ -113,7 +127,13 @@ impl Doc {
     pub fn write(&self) -> Vec<u8> {
         let mut out = self.prolog.clone();
         self.root.write(&mut out);
-        out.into_bytes()
+        match self.utf16 {
+            None => out.into_bytes(),
+            Some(big) => once(0xFEFF)
+                .chain(out.encode_utf16())
+                .flat_map(|u| if big { u.to_be_bytes() } else { u.to_le_bytes() })
+                .collect(),
+        }
     }
 }
 
