@@ -9,9 +9,10 @@ use quick_xml::events::Event;
 use super::xml::{self, Reader};
 use crate::report::{Error, safe};
 
-/// The most tags and attributes a part read as a tree may hold. A tree takes about 130 bytes
-/// for each, so this keeps a part near 3 GB; text costs little, so bytes wouldn't bound it.
-const MAX_MARKUP: usize = 24_000_000;
+/// The most tags and attributes a part read as a tree may hold. Text costs a tree little, so
+/// bytes wouldn't bound it. Under 2^24, so a list of that many kids doubles once less: past it
+/// `<a/>` repeated takes over 4.5 GB, under it about 3 GB.
+const MAX_MARKUP: usize = 16_000_000;
 
 /// One part as a tree: what comes before the root (the declaration, comments) and the root.
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ impl Doc {
         if bytes.iter().filter(|b| matches!(b, b'<' | b'=')).count() > MAX_MARKUP {
             return Err(Error::too_large_to_clean(
                 &format!("part {}", safe(part)),
-                "24,000,000 tags and attributes",
+                "16,000,000 tags and attributes",
             ));
         }
         let text = xml::decode(bytes, part)?;

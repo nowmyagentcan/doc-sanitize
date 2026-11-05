@@ -625,7 +625,7 @@ fn padded_sheet(tags: usize) -> Vec<u8> {
 
 #[test]
 fn a_workbook_part_too_big_to_edit_is_checked_but_not_cleaned() {
-    let big = padded_sheet(24_000_001);
+    let big = padded_sheet(16_000_001);
     assert_eq!(check("a.xlsx", &big)["status"], "found");
     let (f, copy) = clean("a.xlsx", &big);
     assert_eq!(f["error"]["code"], "too_large", "{f}");
@@ -636,7 +636,7 @@ fn a_workbook_part_too_big_to_edit_is_checked_but_not_cleaned() {
             .contains("too large to clean")
     );
     assert!(copy.is_none());
-    let (f, copy) = clean("a.xlsx", &padded_sheet(23_000_000));
+    let (f, copy) = clean("a.xlsx", &padded_sheet(15_000_000));
     assert_eq!(f["status"], "cleaned", "{f}");
     assert!(copy.is_some());
 }
@@ -665,7 +665,7 @@ fn only_a_part_clean_reads_as_a_tree_is_held_to_the_limit_on_trees() {
     gone("a.docx", &over, &secret);
     // Kept, it is read as a tree like every part that stays.
     let dir = dir("escapes-kept");
-    put(&dir, &[("a.docx", &docx("<".repeat(24_000_001)))]);
+    put(&dir, &[("a.docx", &docx("<".repeat(16_000_001)))]);
     let out = run_in(
         &dir,
         &["clean", "a.docx", "--keep", "custom-data", "--json"],
