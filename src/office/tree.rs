@@ -7,7 +7,11 @@ use std::rc::Rc;
 use quick_xml::events::Event;
 
 use super::xml::{self, Reader};
-use crate::report::Error;
+use crate::report::{Error, safe};
+
+/// The most tags and attributes a part read as a tree may hold. A tree takes about 130 bytes
+/// for each, so this keeps a part near 3 GB; text costs little, so bytes wouldn't bound it.
+const MAX_MARKUP: usize = 24_000_000;
 
 /// One part as a tree: what comes before the root (the declaration, comments) and the root.
 #[derive(Debug, Clone)]
@@ -47,6 +51,12 @@ pub const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/200
 
 impl Doc {
     pub fn parse(bytes: &[u8], part: &str) -> Result<Self, Error> {
+        if bytes.iter().filter(|b| matches!(b, b'<' | b'=')).count() > MAX_MARKUP {
+            return Err(Error::too_large_to_clean(
+                &format!("part {}", safe(part)),
+                "24,000,000 tags and attributes",
+            ));
+        }
         let text = xml::decode(bytes, part)?;
         let utf16 = xml::utf16(bytes).map(|(_, big)| big);
         let mut r = Reader::new(&text, part);
@@ -87,7 +97,9 @@ impl Doc {
                     Node::El(el)
                 }
                 Event::End(_) => {
-                    let el = open.pop().ok_or_else(|| Error::bad_xml(part))?;
+                    let mut el = open.pop().ok_or_else(|| Error::bad_xml(part))?;
+                    // A short list of kids would otherwise keep room for four.
+                    el.kids.shrink_to_fit();
                     if open.is_empty() {
                         return Ok(Self {
                             prolog,

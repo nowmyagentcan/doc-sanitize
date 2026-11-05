@@ -231,8 +231,8 @@ impl<'p> Ctx<'p> {
 /// The most one entry may inflate to, and the whole package.
 const MAX_PART: u64 = 256 << 20;
 const MAX_PACKAGE: u64 = 1 << 30;
-/// The most an XML part may hold when `clean` reads it as a tree, which takes up to 25 times
-/// its size. A workbook's own parts are exempt: its sheets can be big and honest.
+/// The most a Word story, a slide, a drawing or a chart may hold: each is always read as a
+/// tree. Any other part is streamed; `clean` bounds a tree it does read in [`tree::Doc::parse`].
 const MAX_TREE: u64 = 64 << 20;
 
 pub const CONTENT_TYPES: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
@@ -514,7 +514,14 @@ impl<'a> Package<'a> {
         for (e, &size) in pkg.zip.entries.iter().zip(&pkg.sizes) {
             let content_type = pkg.content_type(&e.name).unwrap_or_default();
             let xml = content_type.ends_with("xml");
-            if xml && size > MAX_TREE && !content_type.contains("spreadsheetml") {
+            let story = (*format == Format::Docx && key(&e.name) == key(&part))
+                || content_type
+                    .strip_prefix(word::WML)
+                    .is_some_and(|t| word::STORY_TYPES.contains(&t));
+            let tree = story
+                || content_type.contains("drawing")
+                || content_type.ends_with("presentationml.slide+xml");
+            if tree && size > MAX_TREE {
                 return Err(Error::too_large(
                     &format!("part {}", safe(&e.name)),
                     "64 MiB",

@@ -10,25 +10,26 @@ use super::xml::{self, Reader};
 use super::{Ctx, common, ns};
 use crate::report::{CheckId, Error, Finding, counted, plural};
 
-const WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
+pub const WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
+/// The content types, after [`WML`], of the stories that aren't the main document.
+pub const STORY_TYPES: [&str; 6] = [
+    "header+xml",
+    "footer+xml",
+    "footnotes+xml",
+    "endnotes+xml",
+    "comments+xml",
+    "document.glossary+xml",
+];
 
 /// The parts that hold text: the main document, headers, footers, footnotes, endnotes,
 /// comments and the glossary.
 pub fn stories<'p>(ctx: &Ctx<'p>) -> Vec<&'p str> {
     let pkg = ctx.pkg;
-    let kinds = [
-        "header+xml",
-        "footer+xml",
-        "footnotes+xml",
-        "endnotes+xml",
-        "comments+xml",
-        "document.glossary+xml",
-    ];
     let mut parts = vec![pkg.main.as_str()];
     parts.extend(pkg.parts.iter().map(String::as_str).filter(|p| {
         pkg.content_type(p)
             .and_then(|t| t.strip_prefix(WML))
-            .is_some_and(|t| kinds.contains(&t))
+            .is_some_and(|t| STORY_TYPES.contains(&t))
     }));
     parts
 }

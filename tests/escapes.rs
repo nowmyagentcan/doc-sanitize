@@ -585,10 +585,12 @@ fn a_story_part_over_64_mib_is_too_large_and_one_under_is_read() {
 }
 
 #[test]
-fn any_part_clean_reads_as_a_tree_has_the_limit_and_a_workbooks_sheet_does_not() {
+fn a_part_clean_must_read_as_a_tree_is_bounded_and_one_it_streams_is_not() {
     let filler = |size: usize| format!("<a>{}</a>", "<b/>".repeat(size / 4)).into_bytes();
-    let big = 65 << 20;
+    let big = 100 << 20;
+    // A tracking id, so clean reads every part it keeps.
     let docx = Pkg::new("docx")
+        .body(&doc_xml(TRACKED))
         .part(
             "word/document.xml",
             "rId5",
@@ -598,7 +600,10 @@ fn any_part_clean_reads_as_a_tree_has_the_limit_and_a_workbooks_sheet_does_not()
             &filler(big),
         )
         .zip();
-    refused("a.docx", &docx, "too_large");
+    assert_eq!(check("a.docx", &docx)["error"], Value::Null);
+    let (f, copy) = clean("a.docx", &docx);
+    assert_eq!(f["error"]["code"], "too_large", "{f}");
+    assert!(copy.is_none());
     let row = "<row><c><v>1</v></c></row>";
     let sheet = format!(
         "<worksheet xmlns=\"{S}\"><sheetData>{}</sheetData></worksheet>",
@@ -608,20 +613,21 @@ fn any_part_clean_reads_as_a_tree_has_the_limit_and_a_workbooks_sheet_does_not()
     assert_eq!(f["error"], Value::Null, "{f}");
 }
 
-/// A workbook whose sheet has a hidden column, padded to `size` with a comment: a comment is
-/// one node, so a test of the limit can't take the memory the limit is there to prevent.
-fn padded_sheet(size: usize) -> Vec<u8> {
+const TRACKED: &str = "<w:p w:rsidR=\"00AB12CD\"/>";
+
+/// A workbook whose sheet has a hidden column and a comment of `tags` tag openers: a comment
+/// is one node, so a test of the limit can't take the memory the limit is there to prevent.
+fn padded_sheet(tags: usize) -> Vec<u8> {
     let sheet = format!(
         "<worksheet xmlns=\"{S}\"><cols><col min=\"2\" max=\"2\" width=\"9\" hidden=\"1\"/></cols><sheetData><row r=\"1\"><c r=\"B1\"><v>7</v></c></row></sheetData><!--{}--></worksheet>",
-        " ".repeat(size)
+        "<".repeat(tags)
     );
     workbook(&[("Sheet1", "visible", &sheet)]).zip()
 }
 
 #[test]
-#[ignore = "known bug: N01"]
 fn a_workbook_part_too_big_to_edit_is_checked_but_not_cleaned() {
-    let big = padded_sheet(129 << 20);
+    let big = padded_sheet(24_000_001);
     assert_eq!(check("a.xlsx", &big)["status"], "found");
     let (f, copy) = clean("a.xlsx", &big);
     assert_eq!(f["error"]["code"], "too_large", "{f}");
@@ -632,18 +638,18 @@ fn a_workbook_part_too_big_to_edit_is_checked_but_not_cleaned() {
             .contains("too large to clean")
     );
     assert!(copy.is_none());
-    let (f, copy) = clean("a.xlsx", &padded_sheet(127 << 20));
+    let (f, copy) = clean("a.xlsx", &padded_sheet(23_000_000));
     assert_eq!(f["status"], "cleaned", "{f}");
     assert!(copy.is_some());
 }
 
 #[test]
-#[ignore = "known bug: N01"]
 fn only_a_part_clean_reads_as_a_tree_is_held_to_the_limit_on_trees() {
     let secret = format!("SECRET-{}", "custom-1");
-    let docx = |size: usize| {
-        let xml = format!("<a>{secret}<!--{}--></a>", " ".repeat(size));
+    let docx = |filler: String| {
+        let xml = format!("<a>{secret}<!--{filler}--></a>");
         Pkg::new("docx")
+            .body(&doc_xml(TRACKED))
             .part(
                 "word/document.xml",
                 "rId5",
@@ -654,14 +660,14 @@ fn only_a_part_clean_reads_as_a_tree_is_held_to_the_limit_on_trees() {
             )
             .zip()
     };
-    // Spec: only stories, slides, drawings and charts have 64 MiB; custom XML is streamed, and
+    // Only stories, slides, drawings and charts are held to 64 MiB; custom XML is streamed, and
     // clean deletes it unread.
-    let over = docx(129 << 20);
+    let over = docx(" ".repeat(65 << 20));
     assert_eq!(check("a.docx", &over)["status"], "found");
     gone("a.docx", &over, &secret);
     // Kept, it is read as a tree like every part that stays.
     let dir = dir("escapes-kept");
-    put(&dir, &[("a.docx", &over)]);
+    put(&dir, &[("a.docx", &docx("<".repeat(24_000_001)))]);
     let out = run_in(
         &dir,
         &["clean", "a.docx", "--keep", "custom-data", "--json"],

@@ -497,6 +497,14 @@ impl Error {
         )
     }
 
+    pub fn too_large_to_clean(what: &str, limit: &str) -> Self {
+        Self::new(
+            "too_large",
+            format!("{{name}} is too large to clean ({what} is over {limit})."),
+            "Clean a smaller copy, or split the file.",
+        )
+    }
+
     pub fn internal() -> Self {
         Self::new(
             "internal",
