@@ -807,8 +807,9 @@ fn hidden_objects(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
     for part in parts {
         let mut gone = vec![];
         d.change(&part, |root| {
-            gone = drawing::remove_hidden(root, ctx.pkg.format, ctx.slide_size);
-            gone.len()
+            let (n, ids) = drawing::remove_hidden(root, ctx.pkg.format, ctx.slide_size);
+            gone = ids;
+            n
         })?;
         let named = |t: &El| {
             t.is(ns::P, "timing")

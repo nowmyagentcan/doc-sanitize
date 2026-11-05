@@ -858,3 +858,111 @@ fn an_object_wrapped_in_alternatives_goes_with_its_wrapper() {
     let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
     assert!(!plain.contains("AlternateContent"), "{plain}");
 }
+
+// Hidden shapes, one by one.
+
+#[test]
+fn a_hidden_word_text_box_goes_in_both_its_forms() {
+    let word = text_box(&para(&text_run("", "HIDDENBOX"))).replace(
+        "<wp:docPr id=\"7\" name=\"Text Box 1\"/>",
+        "<wp:docPr id=\"7\" name=\"Text Box 1\" hidden=\"1\"/>",
+    );
+    let word = word.replace("position:absolute", "position:absolute;visibility:hidden");
+    let keep = para(&text_run("", "KEEPBODY"));
+    let pkg = Pkg::new("docx").body(&doc_xml(&format!("{}{keep}", para(&word))));
+    let (f, copy) = clean("shape.docx", &pkg.zip());
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(!plain.contains("HIDDENBOX") && plain.contains("KEEPBODY"));
+}
+
+#[test]
+fn a_hidden_picture_in_a_text_box_leaves_the_box() {
+    let picture = "<w:r><w:drawing><wp:inline><wp:docPr id=\"8\" name=\"p\" hidden=\"1\" descr=\"HIDDENALT\"/></wp:inline></w:drawing></w:r>";
+    let inner = para(&format!("{}{picture}", text_run("", "KEEPBOX")));
+    let doc = box_survives(&text_box(&inner), Pkg::new("docx"), &[]);
+    assert!(!doc.contains("HIDDENALT"));
+}
+
+/// A workbook whose first sheet has a drawing part holding `anchors`.
+fn with_drawing(anchors: &str) -> Vec<u8> {
+    let drawing = format!(
+        "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{anchors}</xdr:wsDr>"
+    );
+    let sheet = format!(
+        "<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\"><sheetData/><drawing r:id=\"rId1\"/></worksheet>"
+    );
+    workbook(&[("One", "visible", &sheet)])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "drawing",
+            "xl/drawings/drawing1.xml",
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+            drawing.as_bytes(),
+        )
+        .zip()
+}
+
+fn excel_shape(id: u32, hidden: &str, text: &str) -> String {
+    format!(
+        "<xdr:sp><xdr:nvSpPr><xdr:cNvPr id=\"{id}\" name=\"s\"{hidden}/><xdr:cNvSpPr/></xdr:nvSpPr><xdr:spPr/><xdr:txBody><a:p><a:r><a:t>{text}</a:t></a:r></a:p></xdr:txBody></xdr:sp>"
+    )
+}
+
+fn excel_group(members: &str) -> String {
+    format!(
+        "<xdr:twoCellAnchor><xdr:from/><xdr:to/><xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id=\"20\" name=\"g\"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr><xdr:grpSpPr/>{members}</xdr:grpSp><xdr:clientData/></xdr:twoCellAnchor>"
+    )
+}
+
+#[test]
+fn a_hidden_shape_in_an_excel_group_leaves_its_visible_siblings() {
+    let hidden = " hidden=\"1\"";
+    let members = excel_shape(2, "", "KEEPSHAPE") + &excel_shape(3, hidden, "HIDDENSHAPE");
+    let (f, copy) = clean("group.xlsx", &with_drawing(&excel_group(&members)));
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(plain.contains("KEEPSHAPE"), "the visible sibling went");
+    assert!(!plain.contains("HIDDENSHAPE"));
+}
+
+#[test]
+fn a_group_with_every_member_hidden_goes_with_its_anchor() {
+    let hidden = " hidden=\"1\"";
+    let members = excel_shape(2, hidden, "HIDDENA") + &excel_shape(3, hidden, "HIDDENB");
+    let (f, copy) = clean("all.xlsx", &with_drawing(&excel_group(&members)));
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(
+        !plain.contains("twoCellAnchor") && !plain.contains("HIDDEN"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn a_hidden_shape_in_a_word_group_leaves_its_visible_siblings() {
+    let member = |hidden: &str, text: &str| {
+        format!(
+            "<wps:wsp><wps:cNvPr id=\"3\" name=\"m\"{hidden}/><wps:spPr/><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wps:wsp>",
+            para(&text_run("", text))
+        )
+    };
+    let group = format!(
+        "<w:r><w:drawing><wp:anchor><wp:docPr id=\"7\" name=\"g\"/><a:graphic><a:graphicData uri=\"wpg\"><wpg:wgp xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\" xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\"><wpg:cNvGrpSpPr/><wpg:grpSpPr/>{}{}</wpg:wgp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>",
+        member("", "KEEPSHAPE"),
+        member(" hidden=\"1\"", "HIDDENSHAPE")
+    );
+    let canvas = group
+        .replace("<wpg:cNvGrpSpPr/><wpg:grpSpPr/>", "")
+        .replace("wpg:wgp", "wpc:wpc")
+        .replace("xmlns:wpg", "xmlns:wpc");
+    for drawing in [&group, &canvas] {
+        let pkg = Pkg::new("docx").body(&doc_xml(&para(drawing)));
+        let (f, copy) = clean("group.docx", &pkg.zip());
+        assert_eq!(f["status"], "cleaned", "{f}");
+        let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+        assert!(plain.contains("KEEPSHAPE"), "the visible sibling went");
+        assert!(!plain.contains("HIDDENSHAPE"));
+    }
+}

@@ -2,7 +2,7 @@
 
 use quick_xml::events::Event;
 
-use super::tree::{El, MC, Node};
+use super::tree::{El, Node};
 use super::{Ctx, common, ns, word, xml};
 use crate::report::{CheckId, Error, Finding, Format, counted, plural};
 
@@ -25,6 +25,20 @@ const OBJECTS: [&str; 10] = [
     "anchor",
     "wsp",
     "wgp",
+];
+
+/// VML elements that are one object on the page.
+const VML_SHAPES: [&str; 10] = [
+    "shape",
+    "rect",
+    "roundrect",
+    "oval",
+    "line",
+    "polyline",
+    "arc",
+    "curve",
+    "image",
+    "group",
 ];
 
 /// The parts whose drawings are checked: Word's text parts, Excel's drawings, the slides with
@@ -343,14 +357,47 @@ fn vml_hidden(e: &El) -> bool {
             .is_some_and(|s| s.replace(' ', "").contains("visibility:hidden"))
 }
 
+/// Whether an element is one object on the page.
+fn object(e: &El) -> bool {
+    match &*e.ns {
+        ns::W => false,
+        VML => VML_SHAPES.contains(&e.local()),
+        _ => OBJECTS.contains(&e.local()),
+    }
+}
+
+/// Whether an element is a group or a drawing canvas, whose members go one by one.
+fn group(e: &El) -> bool {
+    &*e.ns != ns::W && matches!(e.local(), "grpSp" | "wgp" | "wpc" | "group")
+}
+
+/// Whether an object is hidden: marked so itself, or a group with nothing else in it.
+fn object_hidden(e: &El) -> bool {
+    vml_hidden(e)
+        || (object(e) && object_of(e).hidden)
+        || (group(e) && e.els().any(object) && e.els().filter(|c| object(c)).all(object_hidden))
+}
+
+/// Whether what a Word drawing or an Excel anchor shows is hidden. A group is only when all of
+/// it is, and the drawings inside a text box are their own.
+fn shows_hidden(e: &El) -> bool {
+    e.els().any(|c| {
+        !c.is(ns::W, "txbxContent") && (object_hidden(c) || (!group(c) && shows_hidden(c)))
+    })
+}
+
 /// Removes hidden objects (and, on slides, objects off the slide of size `slide`) from a
 /// drawing part: Word removes the `w:drawing` or `w:pict` around them, Excel the anchor,
-/// PowerPoint the shape itself. Gives the `cNvPr` ids of everything removed.
-pub fn remove_hidden(root: &mut El, format: Format, slide: Option<(i64, i64)>) -> Vec<String> {
-    let mut ids = vec![];
-    let mut groups = vec![];
-    walk(root, format, slide, &mut groups, &mut ids);
-    ids
+/// PowerPoint the shape itself, and a hidden member of a group goes alone. Gives how many went
+/// and the `cNvPr` ids of everything removed.
+pub fn remove_hidden(
+    root: &mut El,
+    format: Format,
+    slide: Option<(i64, i64)>,
+) -> (usize, Vec<String>) {
+    let (mut n, mut ids) = (0, vec![]);
+    walk(root, format, slide, &mut vec![], &mut n, &mut ids);
+    (n, ids)
 }
 
 fn walk(
@@ -358,36 +405,35 @@ fn walk(
     format: Format,
     slide: Option<(i64, i64)>,
     groups: &mut Vec<Object>,
+    n: &mut usize,
     ids: &mut Vec<String>,
 ) {
+    let member = group(e);
     let mut kids = Vec::with_capacity(e.kids.len());
     for k in std::mem::take(&mut e.kids) {
         let Node::El(mut c) = k else {
             kids.push(k);
             continue;
         };
-        let hidden_inside = |c: &El| {
-            c.has(&|x: &El| {
-                vml_hidden(x)
-                    || (&*x.ns != ns::W && OBJECTS.contains(&x.local()) && object_of(x).hidden)
-            })
-        };
         let removable = |c: &El| match format {
             Format::Docx => {
                 (c.is(ns::W, "drawing") || c.is(ns::W, "pict") || c.is(ns::W, "object"))
-                    && hidden_inside(c)
+                    && shows_hidden(c)
+                    || member && object_hidden(c)
             }
-            Format::Xlsx => c.local().ends_with("Anchor") && hidden_inside(c),
+            Format::Xlsx => {
+                c.local().ends_with("Anchor") && shows_hidden(c) || member && object_hidden(c)
+            }
             _ => {
-                OBJECTS.contains(&c.local()) && &*c.ns != ns::W && {
+                object(c) && {
                     let o = object_of(c);
-                    o.hidden || (o.leaf && slide.is_some_and(|s| off_slide(s, &o, groups)))
+                    object_hidden(c) || (o.leaf && slide.is_some_and(|s| off_slide(s, &o, groups)))
                 }
             }
         };
-        // One removed inside an alternative takes the whole alternative with it.
-        let whole = removable(&c) || (c.is(MC, "AlternateContent") && c.has(&removable));
-        if whole {
+        // Each branch of an alternative is the same object in another form.
+        if removable(&c) || c.is_alternative_of(&removable) {
+            *n += 1;
             c.each(&mut |x| {
                 if x.local() == "cNvPr" {
                     ids.extend(x.attr("", "id").map(String::from));
@@ -395,12 +441,12 @@ fn walk(
             });
             continue;
         }
-        let group = format == Format::Pptx && c.local() == "grpSp";
-        if group {
+        let nested = format == Format::Pptx && c.local() == "grpSp";
+        if nested {
             groups.push(object_of(&c));
         }
-        walk(&mut c, format, slide, groups, ids);
-        if group {
+        walk(&mut c, format, slide, groups, n, ids);
+        if nested {
             groups.pop();
         }
         kids.push(Node::El(c));
