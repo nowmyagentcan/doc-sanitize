@@ -714,7 +714,6 @@ fn an_entry_name_that_is_not_a_part_name_is_not_printed() {
 const README: &str = include_str!("../README.md");
 
 #[test]
-#[ignore = "known bug: F18"]
 fn the_readme_promises_json_only_where_it_exists() {
     for command in ["ui", "mcp"] {
         assert_eq!(run(&[command, "--json"]).status.code(), Some(2));

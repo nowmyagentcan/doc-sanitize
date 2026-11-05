@@ -67,7 +67,7 @@ filing.pdf → filing.clean.pdf
 
 ### Use with AI agents
 
-`--json` on any command prints one JSON object; errors are `{"error": {"code", "message", "hint"}}`. Found text stays out of the output unless you pass `--show-values`.
+`--json` on a check or `clean` prints one JSON object; errors are `{"error": {"code", "message", "hint"}}`. Found text stays out of the output unless you pass `--show-values`.
 
 ```sh
 doc-sanitize filing.pdf --json                   # is the redaction real? what is hidden?
