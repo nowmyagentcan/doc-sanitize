@@ -2,23 +2,36 @@
 
 Find and remove hidden data in PDF, Word, Excel and PowerPoint files before you send them: a command line tool with JSON output, a local web page, and an MCP server for AI agents. Everything runs on your computer.
 
-![The local page after checking and cleaning a Word file](.github/screenshot.png)
+## Read this before you trust a cleaned file
+
+This is v0.1.0. It hasn't had a full final test round, so check a cleaned file yourself before you share anything sensitive. "Nothing left" means nothing its checks can see, never that a file is safe.
+
+**What `clean` refuses.** For these it writes no copy and fails with `cannot_clean` and the reason. Running it again with the `--keep <check>` its hint names gets past the refusal, and the hidden data then stays.
+- Excel: a Table with a hidden column or a hidden header row.
+- Excel: a hidden sheet that something else still names: a hyperlink, sparkline, table formula, shape linked to a cell or form control.
+- Excel: any chart with a reference touching a hidden row or column. This includes ordinary charts over filtered rows.
+- Excel: a cell with white text among its rich text.
+- Word: hidden fields, links, note references, symbols and objects.
+- PowerPoint: hidden shapes on the notes and handout masters.
+- Also: Word imported chunks; TIFF pictures with metadata; cropped pictures that aren't JPEG or PNG, or that are CMYK or rotated JPEGs; Excel data models, slicers and timelines; dynamic XFA forms; PDF pages too large to turn into a picture; a kind of tracked change it can't accept.
+
+**What isn't guaranteed.** The [known issues](#known-issues) list what else stays in a copy today.
+- White text in Word on a shape with no fill, or a fill it can't read, or in a table whose style paints cells, stays in the copy with the warning `unjudged_text`. Look it over.
+- White body text over a shape anchored behind it may be lost: it can be taken for white text on a white page and deleted, with no warning.
+- Two test copies with edited PowerPoint masters, one with an embedded object turned into a picture, weren't opened in PowerPoint. Open such a copy before you send it.
+
+<img src=".github/screenshot.png" alt="The local page after checking and cleaning a Word file" width="480">
 
 ## Install
 
-Windows (PowerShell, no admin; installs to `%LOCALAPPDATA%\Programs\doc-sanitize` and adds it to your user PATH):
-
 ```powershell
+# Windows, in PowerShell, no admin: installs to %LOCALAPPDATA%\Programs\doc-sanitize, adds it to your user PATH
 irm https://github.com/nowmyagentcan/doc-sanitize/releases/latest/download/install.ps1 | iex
-```
-
-macOS and Linux (installs to `~/.local/bin`):
-
-```sh
+# macOS and Linux: installs to ~/.local/bin
 curl -fsSL https://github.com/nowmyagentcan/doc-sanitize/releases/latest/download/install.sh | sh
 ```
 
-Both scripts check the archive's SHA-256 against `SHA256SUMS` before installing anything. Or download an archive yourself; each holds one `doc-sanitize` binary that needs no runtime:
+Both scripts check the archive's SHA-256 against `SHA256SUMS` before installing anything. Or download an archive yourself; each holds the `doc-sanitize` binary, which needs no runtime:
 
 | System | Download |
 |---|---|
@@ -51,19 +64,11 @@ filing.pdf  found 4 kinds of hidden data
   ✗ hidden-layers    page 14: 1 layer that is switched off, with content on page 14
   ✓ 9 checks found nothing: metadata, embedded-files, macros, external-links, image-metadata, old-revisions, leftover-data, signatures, form-data
   Remove it: doc-sanitize clean filing.pdf
-
-$ doc-sanitize clean filing.pdf
-filing.pdf → filing.clean.pdf
-  removed  comments (1 annotation), hidden-text (88 characters), fake-redactions (137 characters), hidden-layers (1 layer)
-  changed  Pages 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 and 14 are now pictures; their text can't be selected or searched.
-           1 redaction mark was applied: its area is now filled in black.
-           1 annotation is now part of its page's picture.
-  ✓ re-checked: 13 checks, nothing left
 ```
 
-`clean` never changes the original. It writes a copy, checks that copy again, and keeps it only when nothing is left outside what you chose to keep. Removing things has visible effects, and each one is reported: tracked changes are accepted, a PDF page with hidden text becomes a picture, and Excel formulas that read a removed sheet become their saved values. A check that can't look at everything says `incomplete`; "nothing found" always lists the checks that ran, and never means a file is free of risk.
+`clean` never changes the original. It writes a copy, runs every check on that copy again, and keeps it only when those checks find nothing outside what you chose to keep. Removing things has visible effects, and each one is reported: tracked changes are accepted, a PDF page with hidden text becomes a picture, and deleting a sheet or clearing a cell turns the whole Excel workbook into values, so formulas become their saved results and charts hold fixed numbers. A check that can't look at everything says `incomplete`; "nothing found" always lists the checks that ran.
 
-`doc-sanitize ui` opens the same checks as a page in your browser: drop files, untick what to keep, save the cleaned copy. Double-clicking `doc-sanitize.exe` on Windows does the same. Files stay in memory on 127.0.0.1 and are never written to disk.
+`doc-sanitize ui` opens the same checks as a page in your browser: drop files, untick what to keep, save the cleaned copy. Double-clicking `doc-sanitize.exe` on Windows does the same. The server listens on 127.0.0.1, holds files in memory and writes nothing to disk; only your browser saves the copy.
 
 ### Use with AI agents
 
@@ -86,17 +91,14 @@ The MCP server `doc-sanitize mcp` runs on stdio with two tools: `check_document`
 
 ## Supported inputs and limits
 
-It reads `.pdf`, `.docx`, `.xlsx` and `.pptx` files and their macro and template versions (`.docm`, `.dotx`, `.dotm`, `.xlsm`, `.xltx`, `.xltm`, `.pptm`, `.potx`, `.potm`, `.ppsx`, `.ppsm`), up to 256 MiB each. Files are identified by their content, not their name. Encrypted PDFs open with `--password`.
+It reads `.pdf`, `.docx`, `.xlsx` and `.pptx` files and their macro and template versions (`.docm`, `.dotx`, `.dotm`, `.xlsm`, `.xltx`, `.xltm`, `.pptm`, `.potx`, `.potm`, `.ppsx`, `.ppsm`), up to 256 MiB each. Files are identified by their content, not their name. Encrypted PDFs open with `--password`. `clean` refuses an XML part over 16,000,000 tags and attributes (about 2.5 million cells in one sheet); the worst file measured, 13 sheets just under that, took 4.8 GiB of memory and 8 minutes, while `check` stayed near 250 MiB. The text checks on PDFs cover the first 2,000 pages and 120 s of rendering per file; the rest is `incomplete`.
 
 | Check | What it finds |
 |---|---|
-| `metadata` | properties, author names, thumbnails, editing ids |
-| `comments` | comments and annotations, and their authors |
+| `metadata`, `comments` | properties, author names, thumbnails, editing ids; comments and annotations, and their authors |
 | `tracked-changes` | insertions and deletions (with the deleted text), shared-workbook logs |
-| `hidden-text` | hidden, white, tiny, clipped or off-page text |
-| `fake-redactions` | text still under black boxes, images or unapplied redaction marks |
-| `hidden-layers` | PDF layers that are switched off |
-| `hidden-sheets`, `hidden-rows-columns` | hidden and very hidden sheets, hidden rows and columns that hold values |
+| `hidden-text`, `fake-redactions` | hidden, white, tiny, clipped or off-page text; text still under black boxes, images or unapplied redaction marks |
+| `hidden-layers`, `hidden-sheets`, `hidden-rows-columns` | PDF layers switched off; hidden and very hidden sheets; hidden rows and columns that hold values |
 | `hidden-slides`, `speaker-notes`, `hidden-objects` | slides hidden from the show, notes, hidden shapes and shapes off the slide |
 | `embedded-files`, `custom-data` | attachments, OLE objects, chart workbooks; custom XML, document variables, tags, add-in data |
 | `macros`, `external-links` | VBA, ActiveX, Excel 4.0 sheets, DDE fields, PDF scripts and actions; paths to local or network files, templates, data connections |
@@ -105,23 +107,32 @@ It reads `.pdf`, `.docx`, `.xlsx` and `.pptx` files and their macro and template
 | `leftover-data`, `signatures`, `form-data` | unused objects, orphan parts, bytes outside the file; digital signatures; XFA forms and values of hidden form fields |
 
 What it doesn't check:
-
 - Legacy `.doc`, `.xls` and `.ppt`, `.xlsb`, Strict Open XML, ODF, RTF and password-protected Office files: they are refused with a message, never skipped.
 - Files inside embedded files: an embedded workbook is reported and removed, not opened.
 - Covered or same-colour text in PowerPoint, and floating shapes over text in Word.
 - Cropped or covered pictures in PDFs, and glyph-width leaks around real redactions.
-- White text in Word on a shape with no fill or a gradient, or in a table style's painted cells: it stays, with a warning. A workbook with white runs inside a rich-text cell is refused, not cleaned.
+- Excel conditional formats and table styles: they aren't evaluated, so text they hide isn't seen.
 - Bookmarks, protection password hashes, hidden defined names, EMF/WMF descriptions, JPEG 2000 metadata, Office ink and embedded fonts.
 
 Tracked changes are always accepted, never rejected. Signatures can't be kept, because any change breaks them. Encrypted PDFs lose their password in the copy.
 
 It makes no network requests: no update check, no telemetry. `ui` listens on 127.0.0.1 only, and `mcp` speaks only on stdin and stdout.
 
+### Known issues
+
+These stay in a cleaned copy, or behave this way, in v0.1.0. The [release notes](https://github.com/nowmyagentcan/doc-sanitize/releases/tag/v0.1.0) carry the full list.
+
+- Excel: table formulas in visible columns stay in the table part when the workbook becomes values.
+- Excel: under `--keep hidden-rows-columns`, a hidden chart series can become visible when the workbook becomes values.
+- Excel: data validation and conditional format text on a hidden column stay, and filter values on one may stay (not tested). Word: content control titles and tags stay.
+- Word files with malformed XML aren't always refused as damaged.
+- Running out of memory on a very large file aborts the run with no copy and no result, and stops a running `ui` or `mcp` server.
+
 ## How it works
 
 Office files are read as raw ZIP entries first, so overlapping or two-faced packages are refused, then every XML part goes through a limited parser, and a clean edits the parts and rewrites the package. PDF pages are rendered and each glyph is tested against what actually shows, so text under a box or in the page's colour is caught by its pixels, and a page with hidden text is replaced by a picture of itself.
 
-It uses [lopdf](https://github.com/J-F-Liu/lopdf) to read and rewrite PDFs, [hayro](https://github.com/LaurenzV/hayro) to render them, [zip](https://github.com/zip-rs/zip2) and [quick-xml](https://github.com/tafia/quick-xml) for Office files, and [image](https://github.com/image-rs/image) to crop pictures. Icons are from [Phosphor](https://phosphoricons.com) (MIT).
+It uses [lopdf](https://github.com/J-F-Liu/lopdf) to read and rewrite PDFs, [hayro](https://github.com/LaurenzV/hayro) to render them, [zip](https://github.com/zip-rs/zip2) and [quick-xml](https://github.com/tafia/quick-xml) for Office files, and [image](https://github.com/image-rs/image) to crop pictures. Accepting tracked changes follows the rules of [Open-XML-PowerTools](https://github.com/OpenXmlDev/Open-Xml-PowerTools) and [Clippit](https://github.com/sergey-tihon/Clippit), and finding text under boxes follows the method of [x-ray](https://github.com/freelawproject/x-ray); no code was copied from them. Icons are from [Phosphor](https://phosphoricons.com) (MIT).
 
 ## First run on an unsigned build
 
@@ -134,7 +145,5 @@ The install script doesn't trigger it, because curl downloads carry no quarantin
 ## Licence
 
 Apache-2.0, see [LICENSE](LICENSE). Each release archive includes `THIRD-PARTY-LICENSES.txt` for the bundled dependencies.
-
----
 
 [nowmyagentcan.com](https://nowmyagentcan.com) · [x.com/chayp05](https://x.com/chayp05)

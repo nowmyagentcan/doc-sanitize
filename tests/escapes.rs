@@ -722,7 +722,6 @@ fn the_readme_promises_json_only_where_it_exists() {
 }
 
 #[test]
-#[ignore = "known bug: F19"]
 fn the_readme_credits_the_rules_it_ported() {
     for name in ["Open-XML-PowerTools", "Clippit", "x-ray"] {
         assert!(README.contains(name), "{name}");
