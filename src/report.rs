@@ -321,6 +321,16 @@ pub struct Warning {
 }
 
 impl Warning {
+    pub fn unjudged_text(n: u64) -> Self {
+        Self {
+            code: "unjudged_text",
+            message: format!(
+                "{} of white text on a shape or table whose colour can't be told stayed; look it over.",
+                plural(n, "character")
+            ),
+        }
+    }
+
     pub fn repaired() -> Self {
         Self {
             code: "repaired",

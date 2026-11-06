@@ -28,7 +28,7 @@ const OBJECTS: [&str; 10] = [
 ];
 
 /// VML elements that are one object on the page.
-const VML_SHAPES: [&str; 10] = [
+pub const VML_SHAPES: [&str; 10] = [
     "shape",
     "rect",
     "roundrect",

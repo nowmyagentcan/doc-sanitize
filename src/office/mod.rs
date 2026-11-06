@@ -22,7 +22,7 @@ use flate2::CrcWriter;
 use flate2::read::DeflateDecoder;
 use quick_xml::events::Event;
 
-use crate::report::{CheckId, Error, Finding, Format, Where, safe};
+use crate::report::{CheckId, Error, Finding, Format, Warning, Where, safe};
 use zipscan::{Entry, Zip};
 
 /// The namespaces the checks read, by their usual prefixes.
@@ -103,15 +103,18 @@ pub fn checks(format: Format) -> &'static [CheckId] {
     }
 }
 
-/// Runs every check of the package's format.
-pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
+/// Runs every check of the package's format, and says what it couldn't judge.
+pub fn check(pkg: &Package, values: bool) -> Result<(Vec<Finding>, Vec<Warning>), Error> {
     let ctx = Ctx::new(pkg, values)?;
+    let mut warnings = vec![];
     let mut found = common::metadata(&ctx)?;
     found.extend(common::comments(&ctx)?);
     match pkg.format {
         Format::Docx => {
             found.extend(word::tracked_changes(&ctx)?);
-            found.extend(word::hidden_text(&ctx)?);
+            let (text, unjudged) = word::hidden_text(&ctx)?;
+            found.extend(text);
+            warnings.extend((unjudged > 0).then(|| Warning::unjudged_text(unjudged)));
             found.extend(word::story_items(&ctx)?);
         }
         Format::Xlsx => {
@@ -132,7 +135,7 @@ pub fn check(pkg: &Package, values: bool) -> Result<Vec<Finding>, Error> {
     found.extend(common::external_links(&ctx)?);
     found.extend(common::image_metadata(&ctx)?);
     found.extend(common::leftover_data(pkg, values)?);
-    Ok(found)
+    Ok((found, warnings))
 }
 
 /// A sheet of a workbook, in the workbook's order.

@@ -966,3 +966,128 @@ fn a_hidden_shape_in_a_word_group_leaves_its_visible_siblings() {
         assert!(!plain.contains("HIDDENSHAPE"));
     }
 }
+
+// White text is only hidden on what shows white.
+
+const WHITE: &str = "<w:color w:val=\"FFFFFF\"/>";
+
+/// A box of `inner` painted with `fill` (DrawingML) and `vml` (attributes of its VML twin).
+fn painted_box(fill: &str, vml: &str, inner: &str) -> String {
+    text_box(inner)
+        .replace(
+            "<wps:txbx>",
+            &format!("<wps:spPr>{fill}</wps:spPr><wps:txbx>"),
+        )
+        .replace(
+            "style=\"position:absolute\"",
+            &format!("style=\"position:absolute\" {vml}"),
+        )
+}
+
+fn hidden_text_count(f: &Value) -> usize {
+    findings_of(f, "hidden-text").len()
+}
+
+#[test]
+fn white_text_on_a_painted_text_box_stays() {
+    let solid = "<a:solidFill xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:srgbClr val=\"1F497D\"/></a:solidFill>";
+    let changed = solid.replace(
+        "<a:srgbClr val=\"1F497D\"/>",
+        "<a:schemeClr val=\"accent1\"><a:lumMod val=\"75000\"/></a:schemeClr>",
+    );
+    for (fill, vml) in [
+        (solid.to_string(), "fillcolor=\"#1f497d [3215]\""),
+        (changed, "fillcolor=\"#365f91 [2404]\""),
+    ] {
+        let inner = para(&text_run(WHITE, "KEEPBOX"));
+        let body = doc_xml(&para(&painted_box(&fill, vml, &inner)));
+        let pkg = Pkg::new("docx").body(&body).zip();
+        assert_eq!(hidden_text_count(&check("painted.docx", &pkg)), 0);
+    }
+}
+
+#[test]
+fn white_text_on_a_box_with_no_fill_stays_since_a_shape_may_lie_under_it() {
+    let none = "<a:noFill xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"/>";
+    let inner = para(&text_run(WHITE, "KEEPBOX"));
+    let body = doc_xml(&para(&painted_box(none, "filled=\"f\"", &inner)));
+    let doc = Pkg::new("docx").body(&body).zip();
+    let f = check("empty.docx", &doc);
+    assert_eq!(hidden_text_count(&f), 0);
+    assert_eq!(f["warnings"][0]["code"], "unjudged_text", "{f}");
+    let (f, _) = clean("empty.docx", &doc);
+    assert_eq!(f["warnings"][0]["code"], "unjudged_text", "{f}");
+}
+
+#[test]
+fn white_text_with_a_text_fill_of_its_own_stays() {
+    let filled = format!(
+        "<w:p><w:r><w:rPr>{WHITE}<w14:textFill xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\"/></w:rPr><w:t>KEEPFILL</w:t></w:r></w:p>"
+    );
+    let doc = Pkg::new("docx").body(&doc_xml(&filled)).zip();
+    assert_eq!(hidden_text_count(&check("fill.docx", &doc)), 0);
+}
+
+#[test]
+fn white_text_on_a_white_text_box_is_hidden() {
+    let inner = para(&format!(
+        "{}{}",
+        text_run(WHITE, "HIDDENWHITE"),
+        text_run("", "KEEPBOX")
+    ));
+    let white = "<a:solidFill xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:srgbClr val=\"FFFFFF\"/></a:solidFill>";
+    let body = painted_box(white, "fillcolor=\"white\"", &inner);
+    let doc = box_survives(&body, Pkg::new("docx"), &[]);
+    assert!(!doc.contains("HIDDENWHITE"));
+}
+
+fn with_styles(body: &str, styles: &str) -> Vec<u8> {
+    let styles = format!("<w:styles xmlns:w=\"{W}\">{styles}</w:styles>");
+    Pkg::new("docx")
+        .body(&doc_xml(body))
+        .part(
+            "word/document.xml",
+            "rId1",
+            "styles",
+            "word/styles.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+            styles.as_bytes(),
+        )
+        .zip()
+}
+
+#[test]
+fn white_text_on_a_paragraph_style_with_shading_stays() {
+    let styles = "<w:style w:type=\"paragraph\" w:styleId=\"Base\"><w:pPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"1F497D\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Band\"><w:basedOn w:val=\"Base\"/><w:rPr><w:color w:val=\"FFFFFF\"/></w:rPr></w:style>";
+    let body = format!(
+        "<w:p><w:pPr><w:pStyle w:val=\"Band\"/></w:pPr><w:r><w:t>KEEPBAND</w:t></w:r></w:p>"
+    );
+    assert_eq!(
+        hidden_text_count(&check("band.docx", &with_styles(&body, styles))),
+        0
+    );
+    // A paragraph's own "no shading" shows the page again.
+    let bare = body.replace(
+        "<w:pStyle w:val=\"Band\"/>",
+        "<w:pStyle w:val=\"Band\"/><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"auto\"/>",
+    );
+    assert_eq!(
+        hidden_text_count(&check("bare.docx", &with_styles(&bare, styles))),
+        1
+    );
+}
+
+#[test]
+fn white_text_in_a_table_whose_style_paints_cells_stays() {
+    let cell = |style: &str| {
+        format!(
+            "<w:tbl><w:tblPr><w:tblStyle w:val=\"{style}\"/></w:tblPr><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>",
+            para(&text_run(WHITE, "KEEPCELL"))
+        )
+    };
+    let styles = "<w:style w:type=\"table\" w:styleId=\"Painted\"><w:tblStylePr w:type=\"firstRow\"><w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"1F497D\"/></w:tcPr></w:tblStylePr></w:style><w:style w:type=\"table\" w:styleId=\"Plain\"/>";
+    let painted = with_styles(&cell("Painted"), styles);
+    assert_eq!(hidden_text_count(&check("painted.docx", &painted)), 0);
+    let plain = with_styles(&cell("Plain"), styles);
+    assert_eq!(hidden_text_count(&check("plain.docx", &plain)), 1);
+}

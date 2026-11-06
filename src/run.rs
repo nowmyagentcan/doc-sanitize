@@ -90,7 +90,8 @@ fn examine<'b>(
         }
         Kind::Zip => {
             let pkg = Package::open(bytes)?;
-            let findings = office::check(&pkg, options.show_values)?;
+            let (findings, judged) = office::check(&pkg, options.show_values)?;
+            warnings.extend(judged);
             let found = pdf::Found {
                 findings,
                 incomplete: vec![],

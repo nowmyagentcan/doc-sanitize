@@ -7,10 +7,12 @@ use quick_xml::events::{BytesStart, Event};
 use super::colour::{self, Rgb, Theme};
 use super::tree::{El, Node};
 use super::xml::{self, Reader};
-use super::{Ctx, common, ns};
+use super::{Ctx, common, drawing, ns};
 use crate::report::{CheckId, Error, Finding, counted, plural};
 
 pub const WML: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.";
+const VML: &str = "urn:schemas-microsoft-com:vml";
+const WPS: &str = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape";
 /// The content types, after [`WML`], of the stories that aren't the main document.
 pub const STORY_TYPES: [&str; 6] = [
     "header+xml",
@@ -150,6 +152,10 @@ struct Props {
     /// `Some(None)` is `none` or `auto`: nothing behind the text at this level.
     highlight: Option<Option<Rgb>>,
     shading: Option<Option<Rgb>>,
+    /// A paragraph style's shading, as `shading` is the run's.
+    para_shading: Option<Option<Rgb>>,
+    /// A table style that paints some of its cells.
+    paints: bool,
 }
 
 impl Props {
@@ -161,6 +167,8 @@ impl Props {
             colour: self.colour.or(o.colour),
             highlight: self.highlight.or(o.highlight),
             shading: self.shading.or(o.shading),
+            para_shading: self.para_shading.or(o.para_shading),
+            paints: self.paints || o.paints,
         }
     }
 
@@ -217,6 +225,11 @@ fn w_attrs<'e>(r: &'e Reader, e: &'e BytesStart) -> impl Fn(&str) -> Option<Stri
     }
 }
 
+/// Whether the reader stands directly in a `w:rPr`.
+fn in_run_props(r: &Reader) -> bool {
+    r.parent() == Some((ns::W, "rPr"))
+}
+
 /// Character and paragraph styles with their `basedOn` and what they set, the document
 /// defaults and the default paragraph style.
 #[derive(Default)]
@@ -238,6 +251,12 @@ impl Styles {
             let (Event::Start(e) | Event::Empty(e)) = ev else {
                 return Ok(());
             };
+            if xml::local(e) == "textFill"
+                && in_run_props(r)
+                && let Some(st) = current.as_ref().and_then(|c| s.styles.get_mut(c))
+            {
+                st.1.colour = Some(None);
+            }
             if r.ns(e) != ns::W {
                 return Ok(());
             }
@@ -262,6 +281,20 @@ impl Styles {
                 "basedOn" if r.parent() == Some((ns::W, "style")) => {
                     if let Some(st) = current.as_ref().and_then(|c| s.styles.get_mut(c)) {
                         st.0 = val()?;
+                    }
+                }
+                "shd"
+                    if r.within(ns::W, "style")
+                        && (r.within(ns::W, "tblStylePr")
+                            || !matches!(r.parent(), Some((ns::W, "rPr" | "pPr")))) =>
+                {
+                    if let Some(st) = current.as_ref().and_then(|c| s.styles.get_mut(c)) {
+                        st.1.paints |= shading(&w_attrs(r, e)).is_some();
+                    }
+                }
+                "shd" if r.parent() == Some((ns::W, "pPr")) && r.within(ns::W, "style") => {
+                    if let Some(st) = current.as_ref().and_then(|c| s.styles.get_mut(c)) {
+                        st.1.para_shading = Some(shading(&w_attrs(r, e)));
                     }
                 }
                 _ if r.parent() == Some((ns::W, "rPr")) && !r.within(ns::W, "tblStylePr") => {
@@ -289,6 +322,17 @@ impl Styles {
             .or(&self.defaults)
     }
 
+    /// The shading behind a paragraph: its own (`own`, when it sets one), else its style's.
+    fn para_shading(&self, own: Option<Option<Rgb>>, style: Option<&str>) -> Option<Rgb> {
+        let style = style.or(self.paragraph.as_deref());
+        own.or(self.chain(style).para_shading).flatten()
+    }
+
+    /// What a table's own style puts behind its cells.
+    fn table_paint(&self, style: Option<&str>) -> Paint {
+        self.chain(style).paints.then_some(None)
+    }
+
     /// What a style sets through its `basedOn` chain.
     fn chain(&self, id: Option<&str>) -> Props {
         let mut props = Props::default();
@@ -304,27 +348,75 @@ impl Styles {
     }
 }
 
+/// What a table, cell or shape paints behind text: `None` nothing, `Some(None)` something
+/// whose colour can't be told, `Some(Some(c))` the colour `c`.
+type Paint = Option<Option<Rgb>>;
+
+/// Reads into `fill` one element of a shape's `spPr` or `style`, with its parent's name. A
+/// shape with no fill shows what lies under it, which can't be told: designs often put a text
+/// box over a painted shape. Nor can a colour with a change on it, or a style's.
+fn read_fill(
+    fill: &mut Paint,
+    parent: &str,
+    local: &str,
+    attr: &dyn Fn(&str) -> Option<String>,
+    theme: &Theme,
+) {
+    match (parent, local) {
+        ("spPr", "noFill" | "solidFill" | "gradFill" | "pattFill" | "blipFill" | "grpFill") => {
+            *fill = Some(None)
+        }
+        ("solidFill", "srgbClr") => *fill = Some(attr("val").as_deref().and_then(colour::hex)),
+        ("solidFill", "sysClr") => *fill = Some(attr("lastClr").as_deref().and_then(colour::hex)),
+        ("solidFill", "schemeClr") => *fill = Some(attr("val").and_then(|v| theme.named(&v))),
+        ("srgbClr" | "sysClr" | "schemeClr", _) => *fill = Some(None),
+        _ => {}
+    }
+}
+
+/// What a VML shape paints; with no colour of its own, it may take one from its shape type.
+fn vml_fill(attr: &dyn Fn(&str) -> Option<String>) -> Paint {
+    if matches!(attr("filled").as_deref(), Some("f" | "false")) {
+        return Some(None);
+    }
+    let colour = attr("fillcolor").unwrap_or_default();
+    let name = colour.split_whitespace().next().unwrap_or_default();
+    Some(match name {
+        "white" => Some(colour::WHITE),
+        "black" => Some(colour::BLACK),
+        n if n.len() == 7 => n.strip_prefix('#').and_then(colour::hex),
+        _ => None,
+    })
+}
+
 /// Which of [`HIDDEN_RUNS`] a run with text falls under: hidden formatting, under 1 pt, or
 /// coloured like what is behind it (the highlight, the run's shading, the paragraph's, the
-/// nearest cell or table's, the page, white), light or dark.
-fn kind(props: &Props, para: Option<Rgb>, behind: Option<Rgb>, page: Option<Rgb>) -> Option<usize> {
+/// nearest cell, table or shape's, the page, white), light or dark. Text on paint that can't
+/// be told isn't hidden: what shows must stay.
+fn kind(props: &Props, para: Option<Rgb>, behind: Paint, page: Option<Rgb>) -> Option<usize> {
     if props.hidden == Some(true) {
         Some(0)
     } else if props.half_points.is_some_and(|h| h < 2) {
         Some(1)
     } else if let Some(Some(fg)) = props.colour {
-        let bg = props
-            .highlight
-            .flatten()
-            .or(props.shading.flatten())
-            .or(para)
-            .or(behind)
-            .or(page)
-            .unwrap_or(colour::WHITE);
+        let near = props.highlight.flatten().or(props.shading.flatten());
+        let bg = match (near.or(para), behind) {
+            (Some(c), _) | (None, Some(Some(c))) => c,
+            (None, Some(None)) => return None,
+            (None, None) => page.unwrap_or(colour::WHITE),
+        };
         colour::same(fg, bg).then_some(if colour::dark(bg) { 3 } else { 2 })
     } else {
         None
     }
+}
+
+/// Whether a run would be lost on a white page, but stands on paint that can't be told.
+fn white_on_unknown(props: &Props, para: Option<Rgb>, behind: Paint) -> bool {
+    let near = props.highlight.flatten().or(props.shading.flatten());
+    near.or(para).is_none()
+        && behind == Some(None)
+        && matches!(props.colour, Some(Some(fg)) if colour::same(fg, colour::WHITE))
 }
 
 /// A run being read: its own properties, its character style and its text.
@@ -339,7 +431,7 @@ struct Run {
 #[derive(Default)]
 struct Para {
     style: Option<String>,
-    shading: Option<Rgb>,
+    shading: Option<Option<Rgb>>,
 }
 
 /// The hidden-text and fake-redactions kinds of Word text, with their details.
@@ -363,19 +455,45 @@ const HIDDEN_RUNS: [(CheckId, &str, &str); 4] = [
 ];
 
 /// `hidden-text` and `fake-redactions` in a Word document: runs hidden by formatting (also
-/// through styles), smaller than 1 pt, or coloured like what is behind them.
-pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
+/// through styles), smaller than 1 pt, or coloured like what is behind them. Gives too how many
+/// characters of white text stand on paint that can't be told, which stay.
+pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
     let pkg = ctx.pkg;
     let theme = Theme::read(pkg)?;
     let styles = Styles::read(ctx, &theme)?;
     let page = page_colour(ctx)?;
-    let mut found = vec![];
+    let (mut found, mut unjudged) = (vec![], 0);
     for part in pages(ctx) {
         // Per kind: characters, the first group's text and whether that group has ended.
         let mut seen = vec![(0usize, String::new(), false); HIDDEN_RUNS.len()];
-        let (mut paras, mut runs, mut behind) = (vec![Para::default()], vec![], vec![]);
+        let (mut paras, mut behind) = (vec![Para::default()], vec![]);
+        let mut runs: Vec<Run> = vec![];
+        let mut fill = None;
         pkg.walk(part, |r, ev| {
             match ev {
+                Event::Start(e) | Event::Empty(e) if r.ns(e) != ns::W => {
+                    let local = xml::local(e);
+                    let attr = |a: &str| r.attr(e, a).ok().flatten().map(|v| v.into_owned());
+                    if r.ns(e) == VML {
+                        if &*local == "fill" && attr("type").is_some_and(|t| t != "solid") {
+                            fill = Some(None);
+                        } else if drawing::VML_SHAPES.contains(&&*local) {
+                            fill = vml_fill(&attr);
+                        }
+                    } else if r.is(e, WPS, "wsp") {
+                        fill = None;
+                    } else if &*local == "textFill" && in_run_props(r) {
+                        if let Some(run) = runs.last_mut() {
+                            run.props.colour = Some(None);
+                        }
+                    } else if let Some((_, parent)) = r.parent()
+                        && r.within(WPS, "spPr")
+                        && !r.within(ns::A, "ln")
+                        && !r.within(ns::A, "extLst")
+                    {
+                        read_fill(&mut fill, parent, &local, &attr, &theme);
+                    }
+                }
                 Event::Start(e) | Event::Empty(e) if r.ns(e) == ns::W => {
                     let start = matches!(ev, Event::Start(_));
                     let val = || {
@@ -384,16 +502,23 @@ pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     };
                     match (e.local_name().as_ref(), r.parent()) {
                         ("tbl" | "tc", _) if start => behind.push(None),
+                        ("txbxContent", _) if start => behind.push(fill.or(Some(None))),
                         ("p", _) if start => paras.push(Para::default()),
                         ("r", _) if start => runs.push(Run::default()),
-                        ("shd", Some((ns::W, "tcPr" | "tblPr"))) => {
+                        ("tblStyle", Some((ns::W, "tblPr"))) => {
                             if let Some(b) = behind.last_mut() {
-                                *b = shading(&w_attrs(r, e));
+                                *b = styles.table_paint(val()?.as_deref());
+                            }
+                        }
+                        ("shd", Some((ns::W, "tcPr" | "tblPr"))) => {
+                            if let (Some(b), Some(c)) = (behind.last_mut(), shading(&w_attrs(r, e)))
+                            {
+                                *b = Some(Some(c));
                             }
                         }
                         ("shd", Some((ns::W, "pPr"))) => {
                             if let Some(p) = paras.last_mut() {
-                                p.shading = shading(&w_attrs(r, e));
+                                p.shading = Some(shading(&w_attrs(r, e)));
                             }
                         }
                         ("pStyle", Some((ns::W, "pPr"))) => {
@@ -413,7 +538,11 @@ pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                         _ => {}
                     }
                 }
-                Event::End(_) if r.closes(ns::W, "tbl") || r.closes(ns::W, "tc") => {
+                Event::End(_)
+                    if r.closes(ns::W, "tbl")
+                        || r.closes(ns::W, "tc")
+                        || r.closes(ns::W, "txbxContent") =>
+                {
                     behind.pop();
                 }
                 Event::End(_) if r.closes(ns::W, "p") => {
@@ -430,9 +559,11 @@ pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     let props =
                         styles.effective(&run.props, run.style.as_deref(), para.style.as_deref());
                     let behind = behind.iter().rev().flatten().next().copied();
-                    let kind = (n > 0)
-                        .then(|| kind(&props, para.shading, behind, page))
-                        .flatten();
+                    let shade = styles.para_shading(para.shading, para.style.as_deref());
+                    let kind = (n > 0).then(|| kind(&props, shade, behind, page)).flatten();
+                    if kind.is_none() && white_on_unknown(&props, shade, behind) {
+                        unjudged += n as u64;
+                    }
                     for (i, s) in seen.iter_mut().enumerate() {
                         if Some(i) == kind {
                             s.0 += n;
@@ -468,7 +599,7 @@ pub fn hidden_text(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
             }
         }
     }
-    Ok(found)
+    Ok((found, unjudged))
 }
 
 /// The page colour Word shows behind the text: `w:background`, when the settings turn it on.
@@ -706,19 +837,22 @@ impl Look {
         &self,
         e: &mut El,
         para: Option<(Option<String>, Option<Rgb>)>,
-        behind: &mut Vec<Option<Rgb>>,
+        behind: &mut Vec<Paint>,
         hidden: bool,
         dark: bool,
     ) {
         let shd = |e: &El, pr: &str| {
             e.child(ns::W, pr)
                 .and_then(|p| p.child(ns::W, "shd"))
-                .and_then(|s| shading(&|a| s.attr(ns::W, a).map(String::from)))
+                .map(|s| shading(&|a| s.attr(ns::W, a).map(String::from)))
         };
-        let frame = e.is(ns::W, "tbl") || e.is(ns::W, "tc");
-        if frame {
-            let pr = if e.is(ns::W, "tbl") { "tblPr" } else { "tcPr" };
-            behind.push(shd(e, pr));
+        let frame = self.paint_of(e);
+        if let Some(paint) = frame {
+            let own = match e.is(ns::W, "tbl") {
+                true => shd(e, "tblPr"),
+                false => shd(e, "tcPr"),
+            };
+            behind.push(own.flatten().map(Some).or(paint));
         }
         let para = if e.is(ns::W, "p") {
             let style = e
@@ -726,7 +860,8 @@ impl Look {
                 .and_then(|p| p.child(ns::W, "pStyle"))
                 .and_then(|s| s.attr(ns::W, "val"))
                 .map(String::from);
-            Some((style, shd(e, "pPr")))
+            let shade = self.styles.para_shading(shd(e, "pPr"), style.as_deref());
+            Some((style, shade))
         } else {
             para
         };
@@ -749,12 +884,52 @@ impl Look {
             kids.push(Node::El(c));
         }
         e.kids = kids;
-        if frame {
+        if frame.is_some() {
             behind.pop();
         }
         if hidden {
             hidden_marks(e);
         }
+    }
+
+    /// What a table or a shape with a text box paints behind its text, when `e` is one; a cell
+    /// counts too, with nothing of its own but its `w:shd`.
+    fn paint_of(&self, e: &El) -> Option<Paint> {
+        if e.is(ns::W, "tc") {
+            return Some(None);
+        }
+        if e.is(ns::W, "tbl") {
+            let style = e
+                .child(ns::W, "tblPr")
+                .and_then(|p| p.child(ns::W, "tblStyle"))
+                .and_then(|s| s.attr(ns::W, "val"));
+            return Some(self.styles.table_paint(style));
+        }
+        if &*e.ns == VML {
+            return e.child(VML, "textbox").map(|_| {
+                match e.child(VML, "fill").and_then(|f| f.attr("", "type")) {
+                    Some(t) if t != "solid" => Some(None),
+                    _ => vml_fill(&|a| e.attr("", a).map(String::from)),
+                }
+            });
+        }
+        if !e.is(WPS, "wsp") {
+            return None;
+        }
+        fn scan(e: &El, fill: &mut Paint, theme: &Theme) {
+            for c in e.els() {
+                let attr = |a: &str| c.attr("", a).map(String::from);
+                read_fill(fill, e.local(), c.local(), &attr, theme);
+                if matches!(c.local(), "solidFill" | "srgbClr" | "sysClr" | "schemeClr") {
+                    scan(c, fill, theme);
+                }
+            }
+        }
+        let mut fill = None;
+        if let Some(properties) = e.child(WPS, "spPr") {
+            scan(properties, &mut fill, &self.theme);
+        }
+        Some(fill.or(Some(None)))
     }
 
     /// Which of [`HIDDEN_RUNS`] a run falls under, when it has text.
@@ -763,7 +938,7 @@ impl Look {
         run: &El,
         para_style: Option<&str>,
         para_shading: Option<Rgb>,
-        behind: &[Option<Rgb>],
+        behind: &[Paint],
     ) -> Option<usize> {
         let text: String = run
             .els()
@@ -777,6 +952,8 @@ impl Look {
         for p in run.child(ns::W, "rPr").into_iter().flat_map(El::els) {
             if p.is(ns::W, "rStyle") {
                 style = p.attr(ns::W, "val").map(String::from);
+            } else if p.local() == "textFill" {
+                props.colour = Some(None);
             } else if &*p.ns == ns::W {
                 let attr = |a: &str| p.attr(ns::W, a).map(String::from);
                 props.set(p.local(), &attr, &self.theme);

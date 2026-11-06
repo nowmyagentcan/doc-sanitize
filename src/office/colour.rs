@@ -135,10 +135,10 @@ impl Theme {
     /// A colour by the name Word gives it.
     pub fn named(&self, name: &str) -> Option<Rgb> {
         let slot = match name {
-            "dark1" | "text1" => "dk1",
-            "light1" | "background1" => "lt1",
-            "dark2" | "text2" => "dk2",
-            "light2" | "background2" => "lt2",
+            "dark1" | "text1" | "tx1" => "dk1",
+            "light1" | "background1" | "bg1" => "lt1",
+            "dark2" | "text2" | "tx2" => "dk2",
+            "light2" | "background2" | "bg2" => "lt2",
             "hyperlink" => "hlink",
             "followedHyperlink" => "folHlink",
             n => n,
