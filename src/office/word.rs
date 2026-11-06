@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use quick_xml::events::{BytesStart, Event};
 
 use super::colour::{self, Rgb, Theme};
-use super::tree::{El, Node};
+use super::tree::{El, MC, Node};
 use super::xml::{self, Reader};
 use super::{Ctx, common, drawing, ns};
 use crate::report::{CheckId, Error, Finding, counted, plural};
@@ -419,12 +419,32 @@ fn white_on_unknown(props: &Props, para: Option<Rgb>, behind: Paint) -> bool {
         && matches!(props.colour, Some(Some(fg)) if colour::same(fg, colour::WHITE))
 }
 
-/// A run being read: its own properties, its character style and its text.
+/// What a run can hold besides text that its hiding hides too.
+const CARRIED: [&str; 7] = [
+    "instrText",
+    "footnoteReference",
+    "endnoteReference",
+    "sym",
+    "drawing",
+    "pict",
+    "object",
+];
+
+/// How many things a run holds that its hiding hides too, besides text.
+fn carried(run: &El) -> usize {
+    let held =
+        |c: &&El| c.is(MC, "AlternateContent") || (&*c.ns == ns::W && CARRIED.contains(&c.local()));
+    run.els().filter(held).count()
+}
+
+/// A run being read: its own properties, its character style, its text and how many things it
+/// holds besides text.
 #[derive(Default)]
 struct Run {
     props: Props,
     style: Option<String>,
     text: String,
+    carried: usize,
 }
 
 /// A paragraph being read: its style and shading.
@@ -474,6 +494,11 @@ pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
                 Event::Start(e) | Event::Empty(e) if r.ns(e) != ns::W => {
                     let local = xml::local(e);
                     let attr = |a: &str| r.attr(e, a).ok().flatten().map(|v| v.into_owned());
+                    if r.parent() == Some((ns::W, "r"))
+                        && let Some(run) = runs.last_mut()
+                    {
+                        run.carried += usize::from(r.is(e, MC, "AlternateContent"));
+                    }
                     if r.ns(e) == VML {
                         if &*local == "fill" && attr("type").is_some_and(|t| t != "solid") {
                             fill = Some(None);
@@ -505,6 +530,11 @@ pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
                         ("txbxContent", _) if start => behind.push(fill.or(Some(None))),
                         ("p", _) if start => paras.push(Para::default()),
                         ("r", _) if start => runs.push(Run::default()),
+                        (local, Some((ns::W, "r"))) if CARRIED.contains(&local) => {
+                            if let Some(run) = runs.last_mut() {
+                                run.carried += 1;
+                            }
+                        }
                         ("tblStyle", Some((ns::W, "tblPr"))) => {
                             if let Some(b) = behind.last_mut() {
                                 *b = styles.table_paint(val()?.as_deref());
@@ -555,7 +585,7 @@ pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
                     let (Some(run), Some(para)) = (runs.pop(), paras.last()) else {
                         return Ok(());
                     };
-                    let n = run.text.chars().filter(|&c| hides_text(c)).count();
+                    let mut n = run.text.chars().filter(|&c| hides_text(c)).count();
                     let props =
                         styles.effective(&run.props, run.style.as_deref(), para.style.as_deref());
                     let behind = behind.iter().rev().flatten().next().copied();
@@ -564,6 +594,10 @@ pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
                     if kind.is_none() && white_on_unknown(&props, shade, behind) {
                         unjudged += n as u64;
                     }
+                    // Only hidden formatting hides what a run holds besides text.
+                    let hides = props.hidden == Some(true) && run.carried > 0;
+                    n += if hides { run.carried } else { 0 };
+                    let kind = kind.or(hides.then_some(0));
                     for (i, s) in seen.iter_mut().enumerate() {
                         if Some(i) == kind {
                             s.0 += n;
@@ -595,7 +629,7 @@ pub fn hidden_text(ctx: &Ctx) -> Result<(Vec<Finding>, u64), Error> {
                     "characters",
                     detail,
                 );
-                found.push(f.with_value(ctx.values, Some(&text)));
+                found.push(f.with_value(ctx.values, Some(text.as_str()).filter(|t| !t.is_empty())));
             }
         }
     }
@@ -827,10 +861,18 @@ impl Look {
     /// Removes runs with hidden formatting, under 1 pt or coloured like a light background
     /// (`hidden`), and writes █ for each character of runs coloured like a dark background
     /// (`dark`). A paragraph whose mark is hidden goes when no run is left in it (unless it
-    /// is the last of its body, cell or text box), else it loses the mark's hiding.
-    pub fn clean_runs(&self, root: &mut El, hidden: bool, dark: bool) {
-        let mut behind = vec![];
-        self.walk(root, None, &mut behind, hidden, dark);
+    /// is the last of its body, cell or text box), else it loses the mark's hiding. Gives
+    /// whether a hidden field, note reference, object or link was met, which can't be taken out
+    /// on its own, so the file is refused.
+    pub fn clean_runs(&self, root: &mut El, hidden: bool, dark: bool) -> bool {
+        let (mut behind, mut stuck) = (vec![], false);
+        self.walk(root, None, &mut behind, hidden, dark, &mut stuck);
+        stuck
+            || (hidden
+                && root.has(&|e: &El| {
+                    (e.is(ns::W, "hyperlink") || e.is(ns::W, "fldSimple"))
+                        && !e.has(&|r: &El| r.is(ns::W, "r"))
+                }))
     }
 
     fn walk(
@@ -840,6 +882,7 @@ impl Look {
         behind: &mut Vec<Paint>,
         hidden: bool,
         dark: bool,
+        stuck: &mut bool,
     ) {
         let shd = |e: &El, pr: &str| {
             e.child(ns::W, pr)
@@ -875,12 +918,20 @@ impl Look {
                 && let Some((style, shading)) = &para
             {
                 match self.run_kind(&c, style.as_deref(), *shading, behind) {
-                    Some(0..=2) if hidden => continue,
+                    Some(0) if hidden => {
+                        *stuck |= carried(&c) > 0;
+                        continue;
+                    }
+                    Some(1 | 2) if hidden && carried(&c) == 0 => continue,
+                    // Text can be hidden by its look while a picture beside it shows.
+                    Some(1 | 2) if hidden => c
+                        .kids
+                        .retain(|k| !matches!(k, Node::El(t) if t.is(ns::W, "t"))),
                     Some(3) if dark => bar(&mut c),
                     _ => {}
                 }
             }
-            self.walk(&mut c, para.clone(), behind, hidden, dark);
+            self.walk(&mut c, para.clone(), behind, hidden, dark, stuck);
             kids.push(Node::El(c));
         }
         e.kids = kids;
@@ -932,7 +983,8 @@ impl Look {
         Some(fill.or(Some(None)))
     }
 
-    /// Which of [`HIDDEN_RUNS`] a run falls under, when it has text.
+    /// Which of [`HIDDEN_RUNS`] a run falls under, when it has text or holds something its
+    /// hiding hides.
     fn run_kind(
         &self,
         run: &El,
@@ -945,7 +997,8 @@ impl Look {
             .filter(|t| t.is(ns::W, "t"))
             .map(El::text)
             .collect();
-        if !text.chars().any(hides_text) {
+        let has_text = text.chars().any(hides_text);
+        if !has_text && carried(run) == 0 {
             return None;
         }
         let (mut props, mut style) = (Props::default(), None);
@@ -961,7 +1014,10 @@ impl Look {
         }
         let props = self.styles.effective(&props, style.as_deref(), para_style);
         let behind = behind.iter().rev().flatten().next().copied();
-        kind(&props, para_shading, behind, self.page)
+        let kind = has_text
+            .then(|| kind(&props, para_shading, behind, self.page))
+            .flatten();
+        kind.or((props.hidden == Some(true)).then_some(0))
     }
 }
 

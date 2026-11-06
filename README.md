@@ -110,6 +110,7 @@ What it doesn't check:
 - Files inside embedded files: an embedded workbook is reported and removed, not opened.
 - Covered or same-colour text in PowerPoint, and floating shapes over text in Word.
 - Cropped or covered pictures in PDFs, and glyph-width leaks around real redactions.
+- White text in Word on a shape with no fill or a gradient, or in a table style's painted cells: it stays, with a warning. White runs inside a rich-text Excel cell aren't read.
 - Bookmarks, protection password hashes, hidden defined names, EMF/WMF descriptions, JPEG 2000 metadata, Office ink and embedded fonts.
 
 Tracked changes are always accepted, never rejected. Signatures can't be kept, because any change breaks them. Encrypted PDFs lose their password in the copy.

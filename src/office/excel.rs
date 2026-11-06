@@ -10,7 +10,7 @@ use super::colour::{self, Rgb, Theme};
 use super::common::{CELL_SHEETS, targets};
 use super::tree::{Attr, El, Node};
 use super::xml::{self, Reader};
-use super::{Ctx, ns};
+use super::{Ctx, key, ns};
 use crate::report::{CheckId, Error, Finding, Where, counted, plural};
 
 /// `tracked-changes` in a workbook: the revision logs and user list of a shared workbook.
@@ -728,6 +728,119 @@ fn range(r: &str) -> Option<(u32, u32, u32, u32)> {
     Some((c0.min(c1), r0.min(r1), c0.max(c1), r0.max(r1)))
 }
 
+/// Whether a chart reads a cell of a column or row `lines` hides: its cache keeps what the
+/// cell lost, and made literal a hidden series would show.
+pub fn chart_reads_hidden(chart: &El, lines: &HashMap<String, Lines>) -> bool {
+    chart.has(&|e: &El| {
+        e.is(CHART, "f")
+            && areas(&e.text())
+                .iter()
+                .any(|(sheet, area)| lines.get(sheet).is_some_and(|l| l.touch(*area)))
+    })
+}
+
+/// The cell ranges of a chart reference, each with its sheet in lower case; none when any part
+/// can't be read.
+fn areas(formula: &str) -> Vec<(String, (u32, u32, u32, u32))> {
+    let f = formula.trim().trim_start_matches('(').trim_end_matches(')');
+    let (mut out, mut part, mut quoted) = (vec![], String::new(), false);
+    let mut add = |part: &str| {
+        let area = part.rsplit_once('!').and_then(|(sheet, cells)| {
+            let sheet = sheet.trim().trim_matches('\'').replace("''", "'");
+            Some((sheet.to_lowercase(), range(&cells.replace('$', ""))?))
+        });
+        out.push(area);
+    };
+    for c in f.chars() {
+        quoted ^= c == '\'';
+        if c == ',' && !quoted {
+            add(&std::mem::take(&mut part));
+        } else {
+            part.push(c);
+        }
+    }
+    add(&part);
+    out.into_iter()
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// Whether clearing the cells `cleared` of `sheet` breaks one of its tables: Excel refuses a
+/// table whose header cell doesn't say its column's name, and the table part keeps the name and
+/// formulas of the column. A total that went has the same fault.
+pub fn table_loses(d: &Draft, sheet: &str, cleared: &[String]) -> Result<bool, Error> {
+    let cleared: HashSet<(u32, u32)> = cleared.iter().filter_map(|r| cell_ref(r)).collect();
+    for l in d.linked("table")? {
+        if key(&l.source) != key(sheet) {
+            continue;
+        }
+        let Some(doc) = d.doc(&l.part.unwrap_or_default())? else {
+            continue;
+        };
+        let Some((c0, r0, c1, r1)) = doc.root.attr("", "ref").and_then(range) else {
+            continue;
+        };
+        let rows = |a: &str, none: u32| {
+            let v = doc.root.attr("", a);
+            v.and_then(|v| v.parse().ok()).unwrap_or(none)
+        };
+        let (header, total) = (rows("headerRowCount", 1) > 0, rows("totalsRowCount", 0) > 0);
+        let hit = |r: u32| (c0..=c1).any(|c| cleared.contains(&(c, r)));
+        if (header && hit(r0)) || (total && hit(r1)) || (!header && (r0..=r1).any(hit)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A sheet's hidden columns and rows.
+#[derive(Default)]
+pub struct Lines {
+    cols: Vec<(u32, u32)>,
+    rows: HashSet<u32>,
+}
+
+impl Lines {
+    pub fn of(sheet: &El) -> Self {
+        let mut lines = Self::default();
+        for col in sheet.child(ns::S, "cols").into_iter().flat_map(El::els) {
+            let num = |a| col.attr("", a).and_then(|v| v.parse::<f64>().ok());
+            if xml::yes(col.attr("", "hidden").map(Cow::from))
+                || num("width").is_some_and(|w| w < 0.1)
+            {
+                let (lo, hi) = (num("min").unwrap_or(0.0), num("max").unwrap_or(0.0));
+                lines.cols.push((lo as u32, hi as u32));
+            }
+        }
+        let mut row_n = 0;
+        let data = sheet
+            .child(ns::S, "sheetData")
+            .into_iter()
+            .flat_map(El::els);
+        for row in data.filter(|r| r.is(ns::S, "row")) {
+            row_n = row
+                .attr("", "r")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(row_n + 1);
+            let low = xml::yes(row.attr("", "customHeight").map(Cow::from))
+                && row
+                    .attr("", "ht")
+                    .and_then(|h| h.parse::<f64>().ok())
+                    .is_some_and(|h| h < 0.5);
+            if xml::yes(row.attr("", "hidden").map(Cow::from)) || low {
+                lines.rows.insert(row_n);
+            }
+        }
+        lines
+    }
+
+    /// Whether a range has a cell in a hidden column or row.
+    fn touch(&self, (c0, r0, c1, r1): (u32, u32, u32, u32)) -> bool {
+        self.cols.iter().any(|&(lo, hi)| lo <= c1 && c0 <= hi)
+            || self.rows.iter().any(|r| (r0..=r1).contains(r))
+    }
+}
+
 /// Clears the cells `clear` picks in a sheet: their value, formula, inline text and type go,
 /// their reference and style stay; in a merged range the top-left cell decides. Gives the
 /// references of the cleared cells that held something.
@@ -860,10 +973,45 @@ const CHART: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
 /// Whether a formula names one of the sheets `names` (`Name!` or `'Name'!`, any case).
 pub fn names_sheet(formula: &str, names: &[String]) -> bool {
     let f = formula.to_lowercase();
+    let part_of_a_name = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
     names.iter().any(|n| {
         let n = n.to_lowercase();
-        f.contains(&format!("{n}!")) || f.contains(&format!("'{}'!", n.replace('\'', "''")))
+        f.contains(&format!("'{}'!", n.replace('\'', "''")))
+            || f.match_indices(&format!("{n}!"))
+                .any(|(i, _)| !f[..i].chars().next_back().is_some_and(part_of_a_name))
     })
+}
+
+/// The first part of the copy that still names a sheet of `names` outside its cells: a link, a
+/// sparkline, a table formula, a shape linked to a cell.
+pub fn sheet_named_in(d: &Draft, names: &[String]) -> Result<Option<String>, Error> {
+    fn names_in(e: &El, names: &[String]) -> bool {
+        if e.is(ns::S, "sheetData") || e.is(ns::S, "t") || e.is(ns::A, "t") {
+            return false;
+        }
+        e.attrs
+            .iter()
+            .any(|a| !a.declares() && names_sheet(&a.value, names))
+            || e.kids.iter().any(|k| match k {
+                Node::Text(t) => names_sheet(t, names),
+                Node::El(c) => names_in(c, names),
+                Node::Raw(_) => false,
+            })
+    }
+    for l in d.links()? {
+        if names_sheet(&l.rel.target, names) {
+            return Ok(Some(l.source));
+        }
+    }
+    for part in d.xml_parts() {
+        if part.to_ascii_lowercase().starts_with("xl/")
+            && d.bytes(&part).is_some_and(|b| b.contains(&b'!'))
+            && d.doc(&part)?.is_some_and(|doc| names_in(&doc.root, names))
+        {
+            return Ok(Some(part));
+        }
+    }
+    Ok(None)
 }
 
 /// A chart made literal: each cell reference becomes the values cached beside it, series

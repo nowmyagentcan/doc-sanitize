@@ -604,6 +604,20 @@ fn blocking(
                 continue;
             }
         }
+        let on_other_master = |f: &Finding| {
+            f.check == c
+                && f.kind == "hidden_object"
+                && f.place
+                    .part
+                    .as_deref()
+                    .is_some_and(|p| drawing::other_master(ctx, p))
+        };
+        if found.iter().any(on_other_master) {
+            let why = "a hidden shape is on the notes or handout master".to_string();
+            let hint = "Delete the shape in PowerPoint (View › Notes Master or Handout Master), or run clean again with --keep hidden-objects.";
+            out.push((c, why, hint.into()));
+            continue;
+        }
         if c == CheckId::CroppedImages
             && let Some(why) = uncroppable(ctx)?
         {
@@ -687,10 +701,18 @@ pub fn clean(pkg: &Package, found: &[Finding], remove: &[CheckId]) -> Result<Cle
     if (hidden || dark) && d.format == Format::Docx {
         let look = word::Look::read(&ctx)?;
         for part in word::pages(&ctx) {
+            let mut stuck = false;
             d.edit(part, |root| {
-                look.clean_runs(root, hidden, dark);
+                stuck = look.clean_runs(root, hidden, dark);
                 Ok(true)
             })?;
+            if stuck {
+                return Err(Error::cannot_clean(&[(
+                    CheckId::HiddenText,
+                    format!("{} has a hidden field, link, note reference or object", safe(part)),
+                    "Show hidden text in Word and delete it, or run clean again with --keep hidden-text.".into(),
+                )]));
+            }
         }
     }
     if has(CheckId::HiddenObjects) {
@@ -894,8 +916,8 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
             }
         }
         _ => {
-            for slide in ctx.slides.clone() {
-                let Some(mut doc) = d.doc(&slide)? else {
+            for page in drawing::drawing_parts(ctx) {
+                let Some(mut doc) = d.doc(page)? else {
                     continue;
                 };
                 let before = ids(&doc.root);
@@ -904,9 +926,9 @@ fn embedded_files(ctx: &Ctx, d: &mut Draft) -> Result<(), Error> {
                     continue;
                 }
                 (pictures, gone) = (pictures + p, gone + g);
-                d.set(&slide, doc.write());
+                d.set(page, doc.write());
                 for id in before.difference(&ids(&doc.root)) {
-                    d.unlink(&slide, id)?;
+                    d.unlink(page, id)?;
                 }
             }
         }
@@ -1032,15 +1054,15 @@ fn workbook(
     if has(CheckId::ExternalLinks) {
         external = workbook_links(d)?;
     }
-    let (hidden, dark, lines) = (
+    let (hidden, dark, lines_gone) = (
         has(CheckId::HiddenText),
         has(CheckId::FakeRedactions),
         has(CheckId::HiddenRowsColumns),
     );
     // Found cells are cleared, so the values rule applies whenever there are any.
-    let values = !deleted.is_empty() || external || hidden || dark || lines;
-    let clear = (hidden || dark || lines)
-        .then(|| excel::Clear::new(ctx, lines, hidden, dark))
+    let values = !deleted.is_empty() || external || hidden || dark || lines_gone;
+    let clear = (hidden || dark || lines_gone)
+        .then(|| excel::Clear::new(ctx, lines_gone, hidden, dark))
         .transpose()?;
     // One pass over each sheet: clear, keep values, note the shared strings left in use. With
     // none of that and no unused strings to blank, the sheets stay as they are.
@@ -1049,9 +1071,16 @@ fn workbook(
     }
     let (mut replaced, mut empty) = (0, 0);
     let mut used = BTreeSet::new();
+    let mut lines = HashMap::new();
     for sheet in excel::cell_sheets(d)? {
         let mut refs = vec![];
+        let name = ctx
+            .sheets
+            .iter()
+            .find(|s| s.part.as_deref().is_some_and(|p| key(p) == key(&sheet)))
+            .map(|s| s.name.to_lowercase());
         d.edit(&sheet, |root| {
+            lines.extend(name.map(|n| (n, excel::Lines::of(root))));
             if let Some(c) = &clear {
                 refs = excel::clear_cells(root, c);
             }
@@ -1064,12 +1093,43 @@ fn workbook(
             excel::used_in(root, &mut used);
             Ok(!refs.is_empty() || r + e > 0)
         })?;
+        if excel::table_loses(d, &sheet, &refs)? {
+            return Err(Error::cannot_clean(&[(
+                CheckId::HiddenRowsColumns,
+                format!("a table on {} has a hidden column or a hidden header", safe(&sheet)),
+                "Delete the column or show it in Excel, or run clean again with --keep hidden-rows-columns.".into(),
+            )]));
+        }
         if !comments_gone && !refs.is_empty() {
             drop_cell_comments(d, &sheet, &refs)?;
         }
     }
+    if lines_gone {
+        for part in d.names() {
+            if d.content_type(&part).as_deref() == Some(CHART_TYPE)
+                && d.doc(&part)?
+                    .is_some_and(|c| excel::chart_reads_hidden(&c.root, &lines))
+            {
+                return Err(Error::cannot_clean(&[(
+                    CheckId::HiddenRowsColumns,
+                    format!("chart {} reads hidden rows or columns", safe(&part)),
+                    "Change the chart's data in Excel, or run clean again with --keep hidden-rows-columns.".into(),
+                )]));
+            }
+        }
+    }
     if values {
         values_rule(d, &deleted, replaced, empty)?;
+    }
+    if !deleted.is_empty()
+        && let Some(part) = excel::sheet_named_in(d, &deleted)?
+    {
+        return Err(Error::cannot_clean(&[(
+            CheckId::HiddenSheets,
+            format!("{} still reads a hidden sheet", safe(&part)),
+            "Remove that link or formula in Excel, or run clean again with --keep hidden-sheets."
+                .into(),
+        )]));
     }
     excel::blank_strings(d, &used, &unused)
 }

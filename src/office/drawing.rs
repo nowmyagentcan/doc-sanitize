@@ -12,6 +12,10 @@ const LAYOUT_PART: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
 const MASTER_PART: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
+const NOTES_MASTER_PART: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml";
+const HANDOUT_MASTER_PART: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.handoutMaster+xml";
 
 /// Elements that are one object on the page.
 const OBJECTS: [&str; 10] = [
@@ -42,7 +46,7 @@ pub const VML_SHAPES: [&str; 10] = [
 ];
 
 /// The parts whose drawings are checked: Word's text parts, Excel's drawings, the slides with
-/// their layouts and masters.
+/// their layouts and masters, and the notes and handout masters.
 pub fn drawing_parts<'c>(ctx: &'c Ctx) -> Vec<&'c str> {
     let pkg = ctx.pkg;
     match pkg.format {
@@ -54,8 +58,16 @@ pub fn drawing_parts<'c>(ctx: &'c Ctx) -> Vec<&'c str> {
             .map(String::as_str)
             .chain(pkg.typed(LAYOUT_PART))
             .chain(pkg.typed(MASTER_PART))
+            .chain(pkg.typed(NOTES_MASTER_PART))
+            .chain(pkg.typed(HANDOUT_MASTER_PART))
             .collect(),
     }
+}
+
+/// Whether a part is a notes or handout master, whose pages aren't the slide's size.
+pub fn other_master(ctx: &Ctx, part: &str) -> bool {
+    let ct = ctx.pkg.content_type(part).unwrap_or_default();
+    ct == NOTES_MASTER_PART || ct == HANDOUT_MASTER_PART
 }
 
 /// An object being read: its level, whether it is hidden, its text, and its box with the
@@ -144,6 +156,7 @@ pub fn hidden_objects(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                     } else if o.leaf
                         && !around_hidden
                         && pkg.format == Format::Pptx
+                        && !other_master(ctx, part)
                         && ctx.slide_size.is_some_and(|s| off_slide(s, &o, &open))
                     {
                         off.0 += 1;

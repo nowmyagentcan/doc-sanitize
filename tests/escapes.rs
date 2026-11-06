@@ -1091,3 +1091,232 @@ fn white_text_in_a_table_whose_style_paints_cells_stays() {
     let plain = with_styles(&cell("Plain"), styles);
     assert_eq!(hidden_text_count(&check("plain.docx", &plain)), 1);
 }
+
+// Structures a clean refuses rather than get wrong.
+
+fn cannot(name: &str, bytes: &[u8]) {
+    let (f, copy) = clean(name, bytes);
+    assert_eq!(f["error"]["code"], "cannot_clean", "{f}");
+    assert!(!f["error"]["hint"].as_str().unwrap().contains("bug"), "{f}");
+    assert!(copy.is_none());
+}
+
+fn inline(at: &str, text: &str) -> String {
+    format!("<c r=\"{at}\" t=\"inlineStr\"><is><t>{text}</t></is></c>")
+}
+
+const HIDDEN_C: &str = "<cols><col min=\"3\" max=\"3\" width=\"9\" hidden=\"1\"/></cols>";
+
+fn sheet_with(cols: &str, rows: &str, tail: &str) -> String {
+    format!(
+        "<worksheet xmlns=\"{S}\" xmlns:r=\"{R}\">{cols}<sheetData>{rows}</sheetData>{tail}</worksheet>"
+    )
+}
+
+#[test]
+fn a_table_with_a_hidden_column_is_refused() {
+    let rows = format!(
+        "<row r=\"1\">{}{}{}</row><row r=\"2\">{}<c r=\"B2\"><v>2</v></c><c r=\"C2\"><v>7</v></c></row>",
+        inline("A1", "Name"),
+        inline("B1", "Val"),
+        inline("C1", "HIDDENHEADER"),
+        inline("A2", "a"),
+    );
+    let tail = "<tableParts count=\"1\"><tablePart r:id=\"rId1\"/></tableParts>";
+    let table = format!(
+        "<table xmlns=\"{S}\" id=\"1\" name=\"T\" displayName=\"T\" ref=\"A1:C2\"><tableColumns count=\"3\"><tableColumn id=\"1\" name=\"Name\"/><tableColumn id=\"2\" name=\"Val\"/><tableColumn id=\"3\" name=\"HIDDENHEADER\"/></tableColumns></table>"
+    );
+    let doc = workbook(&[("One", "visible", &sheet_with(HIDDEN_C, &rows, tail))])
+        .part(
+            "xl/worksheets/sheet1.xml",
+            "rId1",
+            "table",
+            "xl/tables/table1.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+            table.as_bytes(),
+        )
+        .zip();
+    cannot("table.xlsx", &doc);
+}
+
+/// A visible sheet ending in `tail`, and the hidden sheet it reads.
+fn reads_hidden(tail: &str) -> Vec<u8> {
+    let body = sheet_with(
+        "",
+        &format!("<row r=\"1\">{}</row>", inline("A1", "x")),
+        tail,
+    );
+    workbook(&[
+        ("One", "visible", &body),
+        ("Gone Sheet", "hidden", &sheet_xml("")),
+    ])
+    .zip()
+}
+
+#[test]
+fn a_link_or_sparkline_on_a_hidden_sheet_is_refused() {
+    cannot(
+        "link.xlsx",
+        &reads_hidden(
+            "<hyperlinks><hyperlink ref=\"A1\" location=\"'Gone Sheet'!A1\" display=\"x\"/></hyperlinks>",
+        ),
+    );
+    cannot(
+        "spark.xlsx",
+        &reads_hidden(
+            "<extLst><ext uri=\"{05C60535-1F16-4fd2-B633-F4F36F0B64E0}\"><f>'Gone Sheet'!A1:A2</f></ext></extLst>",
+        ),
+    );
+}
+
+#[test]
+fn a_sheet_whose_name_ends_another_leaves_its_uses() {
+    let body = sheet_with(
+        "",
+        "",
+        "<hyperlinks><hyperlink ref=\"A1\" location=\"Data!A1\"/></hyperlinks>",
+    );
+    let doc = workbook(&[
+        ("One", "visible", &body),
+        ("Data", "visible", &sheet_xml("")),
+        ("ta", "hidden", &sheet_xml("")),
+    ])
+    .zip();
+    let (f, _) = clean("near.xlsx", &doc);
+    assert_eq!(f["status"], "cleaned", "{f}");
+}
+
+#[test]
+fn a_chart_reading_a_hidden_column_is_refused() {
+    let chart = "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:f>One!$C$2:$C$3</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>";
+    let rows = format!("<row r=\"1\">{}</row>", inline("C1", "HIDDENSERIES"));
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>";
+    let doc = workbook(&[(
+        "One",
+        "visible",
+        &sheet_with(HIDDEN_C, &rows, "<drawing r:id=\"rId1\"/>"),
+    )])
+    .part(
+        "xl/worksheets/sheet1.xml",
+        "rId1",
+        "drawing",
+        "xl/drawings/drawing1.xml",
+        "application/vnd.openxmlformats-officedocument.drawing+xml",
+        drawing.as_bytes(),
+    )
+    .part(
+        "xl/drawings/drawing1.xml",
+        "rId1",
+        "chart",
+        "xl/charts/chart1.xml",
+        "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+        chart.as_bytes(),
+    )
+    .zip();
+    cannot("chart.xlsx", &doc);
+}
+
+fn hidden_run(inner: &str) -> String {
+    format!("<w:r><w:rPr><w:vanish/></w:rPr>{inner}</w:r>")
+}
+
+#[test]
+fn a_hidden_field_or_note_reference_is_found_and_refused() {
+    for inner in [
+        "<w:instrText> IF 1 = 2 \"HIDDENFIELD\" \"\" </w:instrText>",
+        "<w:footnoteReference w:id=\"1\"/>",
+    ] {
+        let doc = Pkg::new("docx")
+            .body(&doc_xml(&para(&hidden_run(inner))))
+            .zip();
+        assert_eq!(hidden_text_count(&check("field.docx", &doc)), 1);
+        cannot("field.docx", &doc);
+    }
+}
+
+#[test]
+fn a_hidden_link_is_refused() {
+    let link = format!(
+        "<w:hyperlink r:id=\"rId5\">{}</w:hyperlink>",
+        hidden_run("<w:t>x</w:t>")
+    );
+    let doc = Pkg::new("docx")
+        .body(&doc_xml(&para(&link)))
+        .link(
+            "word/document.xml",
+            external("rId5", "hyperlink", "https://example.com/HIDDENTARGET"),
+        )
+        .zip();
+    cannot("link.docx", &doc);
+}
+
+#[test]
+fn a_picture_in_a_white_run_stays_while_its_text_goes() {
+    let pic =
+        "<w:drawing><wp:inline><wp:docPr id=\"8\" name=\"KEEPPICTURE\"/></wp:inline></w:drawing>";
+    let white = format!("<w:r><w:rPr>{WHITE}</w:rPr><w:t>HIDDENWHITE</w:t>{pic}</w:r>");
+    let doc = Pkg::new("docx").body(&doc_xml(&para(&white))).zip();
+    let (f, copy) = clean("white.docx", &doc);
+    assert_eq!(f["status"], "cleaned", "{f}");
+    let plain = String::from_utf8_lossy(&plain(&copy.unwrap())).into_owned();
+    assert!(plain.contains("KEEPPICTURE") && !plain.contains("HIDDENWHITE"));
+}
+
+#[test]
+fn a_hidden_shape_on_the_notes_or_handout_master_is_refused() {
+    let tree = slide_xml(&shape(3, true, "", "HIDDENMASTER"));
+    let ox = "application/vnd.openxmlformats-officedocument.presentationml.";
+    for (short, name, kind, root) in [
+        (
+            "notesMaster",
+            "ppt/notesMasters/notesMaster1.xml",
+            "notesMaster+xml",
+            "notesMaster",
+        ),
+        (
+            "handoutMaster",
+            "ppt/handoutMasters/handoutMaster1.xml",
+            "handoutMaster+xml",
+            "handoutMaster",
+        ),
+    ] {
+        let body = tree.replace("p:sld", &format!("p:{root}"));
+        let doc = presentation(&[&slide_xml("")])
+            .part(
+                "ppt/presentation.xml",
+                "rId9",
+                short,
+                name,
+                &format!("{ox}{kind}"),
+                body.as_bytes(),
+            )
+            .zip();
+        cannot("masters.pptx", &doc);
+    }
+}
+
+#[test]
+fn an_object_on_a_master_becomes_its_picture() {
+    let frame = "<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id=\"9\" name=\"o\"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"9\" cy=\"9\"/></p:xfrm><a:graphic><a:graphicData uri=\"ole\"><p:oleObj r:id=\"rId1\" progId=\"Package\"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id=\"0\" name=\"\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip/></p:blipFill><p:spPr/></p:pic></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>";
+    let body = slide_xml(frame).replace("p:sld", "p:sldMaster");
+    let ox = "application/vnd.openxmlformats-officedocument.";
+    let doc = presentation(&[&slide_xml("")])
+        .part(
+            "ppt/presentation.xml",
+            "rId9",
+            "slideMaster",
+            "ppt/slideMasters/slideMaster1.xml",
+            &format!("{ox}presentationml.slideMaster+xml"),
+            body.as_bytes(),
+        )
+        .part(
+            "ppt/slideMasters/slideMaster1.xml",
+            "rId1",
+            "package",
+            "ppt/embeddings/a.bin",
+            &format!("{ox}oleObject"),
+            b"HIDDENOBJECT",
+        )
+        .zip();
+    gone("master-object.pptx", &doc, "HIDDENOBJECT");
+}
