@@ -10,14 +10,15 @@ This is v0.1.0. It hasn't had a full final test round, so check a cleaned file y
 - Excel: a Table with a hidden column or a hidden header row.
 - Excel: a hidden sheet that something else still names: a hyperlink, sparkline, table formula, shape linked to a cell or form control.
 - Excel: any chart with a reference touching a hidden row or column. This includes ordinary charts over filtered rows.
-- Excel: a cell with white text among its rich text.
+- Excel: a workbook with white runs inside a rich-text cell, when the cell isn't painted.
 - Word: hidden fields, links, note references, symbols and objects.
 - PowerPoint: hidden shapes on the notes and handout masters.
 - Also: Word imported chunks; TIFF pictures with metadata; cropped pictures that aren't JPEG or PNG, or that are CMYK or rotated JPEGs; Excel data models, slicers and timelines; dynamic XFA forms; PDF pages too large to turn into a picture; a kind of tracked change it can't accept.
 
 **What isn't guaranteed.** The [known issues](#known-issues) list what else stays in a copy today.
 - White text in Word on a shape with no fill, or a fill it can't read, or in a table whose style paints cells, stays in the copy with the warning `unjudged_text`. Look it over.
-- White body text over a shape anchored behind it may be lost: it can be taken for white text on a white page and deleted, with no warning.
+- White body text over a shape anchored behind it may be lost: it can be taken for white text on a white page and deleted, with no warning. This was reasoned, not tested.
+- Excel: white text on a painted cell isn't flagged, because white on a dark fill passes as visible. A white cell style with a black rich run may be cleared, which loses visible text; this was reasoned, not tested.
 - Two test copies with edited PowerPoint masters, one with an embedded object turned into a picture, weren't opened in PowerPoint. Open such a copy before you send it.
 
 <img src=".github/screenshot.png" alt="The local page after checking and cleaning a Word file" width="480">
