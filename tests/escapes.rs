@@ -1221,6 +1221,46 @@ fn hidden_run(inner: &str) -> String {
 }
 
 #[test]
+fn white_rich_text_is_found_and_refused_unless_the_cell_is_painted() {
+    let run = "<r><rPr><color rgb=\"FFFFFFFF\"/></rPr><t>HIDDENRICH</t></r>";
+    let inline_cell = format!("<c r=\"A1\" t=\"inlineStr\"><is>{run}</is></c>");
+    let shared_cell = "<c r=\"A1\" t=\"s\"><v>0</v></c>";
+    let strings = format!("<sst xmlns=\"{S}\"><si>{run}</si></sst>");
+    let book = |cell: &str, s: &str| {
+        let cell = cell.replace("r=\"A1\"", &format!("r=\"A1\"{s}"));
+        let styles = format!(
+            "<styleSheet xmlns=\"{S}\"><fonts count=\"1\"><font/></fonts><fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF1F497D\"/></patternFill></fill></fills><cellXfs count=\"2\"><xf fontId=\"0\" fillId=\"0\"/><xf fontId=\"0\" fillId=\"1\"/></cellXfs></styleSheet>"
+        );
+        let body = sheet_xml(&format!("<row r=\"1\">{cell}</row>"));
+        workbook(&[("One", "visible", &body)])
+            .part(
+                "xl/workbook.xml",
+                "rId8",
+                "styles",
+                "xl/styles.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+                styles.as_bytes(),
+            )
+            .part(
+                "xl/workbook.xml",
+                "rId9",
+                "sharedStrings",
+                "xl/sharedStrings.xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
+                strings.as_bytes(),
+            )
+            .zip()
+    };
+    for cell in [inline_cell.as_str(), shared_cell] {
+        let doc = book(cell, "");
+        assert_eq!(hidden_text_count(&check("rich.xlsx", &doc)), 1);
+        cannot("rich.xlsx", &doc);
+        let painted = book(cell, " s=\"1\"");
+        assert_eq!(hidden_text_count(&check("rich.xlsx", &painted)), 0);
+    }
+}
+
+#[test]
 fn a_hidden_field_or_note_reference_is_found_and_refused() {
     for inner in [
         "<w:instrText> IF 1 = 2 \"HIDDENFIELD\" \"\" </w:instrText>",

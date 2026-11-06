@@ -114,8 +114,9 @@ const CELL_KINDS: [(CheckId, &str, &str); 3] = [
     ),
 ];
 
-/// For each cell style (`cellXfs` index), the [`CELL_KINDS`] index its cells fall under.
-fn cell_styles(ctx: &Ctx) -> Result<Vec<Option<usize>>, Error> {
+/// For each cell style (`cellXfs` index), the [`CELL_KINDS`] index its cells fall under and
+/// whether it paints them.
+fn cell_styles(ctx: &Ctx) -> Result<Vec<(Option<usize>, bool)>, Error> {
     let pkg = ctx.pkg;
     let Some(part) = targets(pkg, "styles").first().copied() else {
         return Ok(vec![]);
@@ -171,8 +172,9 @@ fn cell_styles(ctx: &Ctx) -> Result<Vec<Option<usize>>, Error> {
     let kinds = xfs
         .into_iter()
         .map(|(format, font, fill)| {
+            let painted = matches!(fills.get(fill), Some((true, _)));
             if formats.get(&format).is_some_and(|c| hides(c)) {
-                return Some(0);
+                return (Some(0), painted);
             }
             // Excel's automatic text colour is black, and so is a solid fill's default.
             let fg = fonts
@@ -188,7 +190,8 @@ fn cell_styles(ctx: &Ctx) -> Result<Vec<Option<usize>>, Error> {
                     .unwrap_or(colour::BLACK),
                 _ => colour::WHITE,
             };
-            colour::same(fg, bg).then_some(if colour::dark(bg) { 2 } else { 1 })
+            let kind = colour::same(fg, bg).then_some(if colour::dark(bg) { 2 } else { 1 });
+            (kind, painted)
         })
         .collect();
     Ok(kinds)
@@ -217,6 +220,40 @@ fn shared_strings(ctx: &Ctx) -> Result<Vec<String>, Error> {
         })?;
     }
     Ok(strings)
+}
+
+/// Whether a `color` of a rich-text run shows white.
+fn white_run(r: &Reader, e: &BytesStart, theme: &Theme) -> Result<bool, Error> {
+    let shown = Spec::read(r, e)?.resolve(theme, &[]);
+    Ok(shown.is_some_and(|c| colour::same(c, colour::WHITE)))
+}
+
+/// The shared strings with white text in a rich-text run, by index.
+fn white_strings(ctx: &Ctx, theme: &Theme) -> Result<HashSet<usize>, Error> {
+    let (mut found, mut n, mut white) = (HashSet::new(), 0, false);
+    for part in targets(ctx.pkg, "sharedStrings") {
+        ctx.pkg.walk(part, |r, ev| {
+            match ev {
+                Event::Start(e) | Event::Empty(e) if r.level() == 1 && r.is(e, ns::S, "si") => {
+                    n += 1;
+                }
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "r") => white = false,
+                Event::Start(e) | Event::Empty(e)
+                    if r.is(e, ns::S, "color") && r.parent() == Some((ns::S, "rPr")) =>
+                {
+                    white = white_run(r, e, theme)?;
+                }
+                ev if white && r.parent() == Some((ns::S, "t")) && r.within(ns::S, "r") => {
+                    if xml::text(ev).is_some_and(|t| !t.trim().is_empty()) {
+                        found.insert(n - 1);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+    }
+    Ok(found)
 }
 
 /// A cell's column and row (1-based) from its reference, e.g. `C5` → (3, 5).
@@ -287,6 +324,9 @@ struct OpenCell {
     text: String,
     /// Its `<f>`, when it has one.
     formula: Option<String>,
+    /// Whether the run being read is white, and whether any run with text was.
+    white_run: bool,
+    white: bool,
 }
 
 /// The cell kinds of hidden-rows-columns, with the noun each counts.
@@ -307,6 +347,8 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
     let pkg = ctx.pkg;
     let styles = cell_styles(ctx)?;
     let strings = shared_strings(ctx)?;
+    let theme = Theme::read(pkg)?;
+    let white_shared = white_strings(ctx, &theme)?;
     let mut found = vec![];
     for sheet in &ctx.sheets {
         let Some(part) = sheet.part.as_deref().filter(|p| {
@@ -317,6 +359,7 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
         };
         let mut kinds: Vec<Cells> = (0..CELL_KINDS.len()).map(|_| Cells::default()).collect();
         let mut lines: [Cells; 2] = Default::default();
+        let mut rich = Cells::default();
         let mut hidden_cols: Vec<(u32, u32)> = vec![];
         let mut cell: Option<OpenCell> = None;
         let (mut row, mut col, mut row_hidden) = (0u32, 0u32, false);
@@ -374,6 +417,18 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                         });
                     }
                 }
+                Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "r") => {
+                    if let Some(c) = &mut cell {
+                        c.white_run = false;
+                    }
+                }
+                Event::Start(e) | Event::Empty(e)
+                    if r.is(e, ns::S, "color") && r.parent() == Some((ns::S, "rPr")) =>
+                {
+                    if let Some(c) = &mut cell {
+                        c.white_run = white_run(r, e, &theme)?;
+                    }
+                }
                 Event::Start(e) | Event::Empty(e) if r.is(e, ns::S, "f") => {
                     if let Some(c) = &mut cell {
                         c.formula = Some(String::new());
@@ -387,6 +442,9 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                         return Ok(());
                     };
                     let at = c.at;
+                    let index = c.text.trim().parse::<usize>().ok().filter(|_| c.shared);
+                    let white = c.white || index.is_some_and(|i| white_shared.contains(&i));
+                    let painted = styles.get(c.style).is_some_and(|s| s.1);
                     let text = match c.shared {
                         true => c
                             .text
@@ -403,8 +461,11 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                         true => c.formula.unwrap_or_default(),
                         false => text,
                     };
-                    if let Some(&Some(kind)) = styles.get(c.style) {
+                    if let Some(&(Some(kind), _)) = styles.get(c.style) {
                         kinds[kind].add(at, at.1, &text);
+                    }
+                    if white && !painted {
+                        rich.add(at, at.1, &text);
                     }
                     if row_hidden {
                         lines[0].add(at, at.1, &text);
@@ -418,6 +479,7 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 }
                 ev if matches!(r.parent(), Some((ns::S, "v" | "t"))) => {
                     if let (Some(c), Some(t)) = (&mut cell, xml::text(ev)) {
+                        c.white |= c.white_run && !t.trim().is_empty();
                         c.text += &t;
                     }
                 }
@@ -443,6 +505,20 @@ pub fn cells(ctx: &Ctx) -> Result<Vec<Finding>, Error> {
                 let detail = format!("{} {what}", plural(cells.n as u64, "cell"));
                 add(*check, kind, cells, cells.n, "cells", detail);
             }
+        }
+        if rich.n > 0 {
+            let detail = format!(
+                "{} with white text in rich text",
+                plural(rich.n as u64, "cell")
+            );
+            add(
+                CheckId::HiddenText,
+                "white_rich_text",
+                &rich,
+                rich.n,
+                "cells",
+                detail,
+            );
         }
         for ((kind, unit, one, many), cells) in LINE_KINDS.iter().zip(&lines) {
             let n = cells.lines.len();
@@ -703,7 +779,7 @@ pub fn caches_use_connections(ctx: &Ctx) -> Result<bool, Error> {
 pub struct Clear {
     lines: bool,
     kinds: [bool; 3],
-    styles: Vec<Option<usize>>,
+    styles: Vec<(Option<usize>, bool)>,
 }
 
 impl Clear {
@@ -717,7 +793,7 @@ impl Clear {
     }
 
     fn style_clears(&self, style: usize) -> bool {
-        matches!(self.styles.get(style), Some(&Some(k)) if self.kinds[k])
+        matches!(self.styles.get(style), Some(&(Some(k), _)) if self.kinds[k])
     }
 }
 

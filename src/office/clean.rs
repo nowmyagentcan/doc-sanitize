@@ -625,6 +625,10 @@ fn blocking(
             continue;
         }
         let why = match c {
+            CheckId::HiddenText if kinds.contains(&"white_rich_text") => Some((
+                "a cell has white text among its rich text",
+                "Recolour or delete that text in Excel, or run clean again with --keep hidden-text.",
+            )),
             CheckId::EmbeddedFiles if kinds.contains(&"imported_chunk") => Some((
                 "it holds an imported document (w:altChunk)",
                 "Open and save the file in Word, which turns the imported content into normal text, then run clean again; or use --keep embedded-files.",
