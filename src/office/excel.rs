@@ -243,10 +243,12 @@ fn white_strings(ctx: &Ctx, theme: &Theme) -> Result<HashSet<usize>, Error> {
                 {
                     white = white_run(r, e, theme)?;
                 }
-                ev if white && r.parent() == Some((ns::S, "t")) && r.within(ns::S, "r") => {
-                    if xml::text(ev).is_some_and(|t| !t.trim().is_empty()) {
-                        found.insert(n - 1);
-                    }
+                ev if white
+                    && r.parent() == Some((ns::S, "t"))
+                    && r.within(ns::S, "r")
+                    && xml::text(ev).is_some_and(|t| !t.trim().is_empty()) =>
+                {
+                    found.insert(n - 1);
                 }
                 _ => {}
             }

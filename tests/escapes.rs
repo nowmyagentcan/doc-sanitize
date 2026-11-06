@@ -1058,11 +1058,9 @@ fn with_styles(body: &str, styles: &str) -> Vec<u8> {
 #[test]
 fn white_text_on_a_paragraph_style_with_shading_stays() {
     let styles = "<w:style w:type=\"paragraph\" w:styleId=\"Base\"><w:pPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"1F497D\"/></w:pPr></w:style><w:style w:type=\"paragraph\" w:styleId=\"Band\"><w:basedOn w:val=\"Base\"/><w:rPr><w:color w:val=\"FFFFFF\"/></w:rPr></w:style>";
-    let body = format!(
-        "<w:p><w:pPr><w:pStyle w:val=\"Band\"/></w:pPr><w:r><w:t>KEEPBAND</w:t></w:r></w:p>"
-    );
+    let body = "<w:p><w:pPr><w:pStyle w:val=\"Band\"/></w:pPr><w:r><w:t>KEEPBAND</w:t></w:r></w:p>";
     assert_eq!(
-        hidden_text_count(&check("band.docx", &with_styles(&body, styles))),
+        hidden_text_count(&check("band.docx", &with_styles(body, styles))),
         0
     );
     // A paragraph's own "no shading" shows the page again.
